@@ -1,0 +1,42 @@
+# Rust build output
+/target/
+
+# Cargo publish/package output
+*.crate
+
+# Local runtime state
+/.agent-os/
+/agent-os-state/
+/runs/
+/state.json
+/state.json.lock
+/agent-os.toml
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Coverage and profiling output
+/coverage/
+/tarpaulin-report.html
+/cobertura.xml
+/lcov.info
+/profraw/
+*.profraw
+*.profdata
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
