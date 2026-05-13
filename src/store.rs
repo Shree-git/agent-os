@@ -1,3 +1,4 @@
+use crate::durable_io;
 use crate::migrations::{MigrationError, MigrationReport, migrate_state_value};
 use crate::models::{OperatingSystem, RunId, RunStatus};
 use crate::validation::{RepairReport, ValidationReport, repair_state, validate_state};
@@ -7,9 +8,8 @@ use fs2::FileExt;
 use serde::Serialize;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -124,12 +124,16 @@ impl Store {
     }
 
     pub fn save(&self, os: &OperatingSystem) -> Result<(), StoreError> {
+        self.validate_for_save(os)?;
+        self.save_unchecked(os)
+    }
+
+    pub(crate) fn save_unchecked(&self, os: &OperatingSystem) -> Result<(), StoreError> {
         let _lock = self.lock_exclusive()?;
         self.save_unlocked(os)
     }
 
     pub fn save_validated(&self, os: &OperatingSystem) -> Result<(), StoreError> {
-        self.validate_for_save(os)?;
         self.save(os)
     }
 
@@ -199,6 +203,24 @@ impl Store {
         Ok(destination_path.to_path_buf())
     }
 
+    pub fn preview_export_to_path(&self, destination_path: &Path) -> Result<PathBuf, StoreError> {
+        if path_targets_same_file(&self.path, destination_path) {
+            return Err(StoreError::Io {
+                path: destination_path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "export destination must differ from state path",
+                ),
+            });
+        }
+        let _lock = self.lock_shared()?;
+        fs::read(&self.path).map_err(|source| StoreError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(destination_path.to_path_buf())
+    }
+
     pub fn import_from_path(&self, source_path: &Path) -> Result<OperatingSystem, StoreError> {
         let os = Self::read_state_from_path(source_path)?;
         let report = validate_state(&os);
@@ -232,6 +254,28 @@ impl Store {
             });
         }
         self.save_unlocked(&os)?;
+        Ok((os, report))
+    }
+
+    pub fn preview_import_from_path_checked(
+        &self,
+        source_path: &Path,
+        force: bool,
+    ) -> Result<(OperatingSystem, crate::validation::ValidationReport), StoreError> {
+        let _lock = self.lock_shared()?;
+        if self.path.exists() && !force {
+            return Err(StoreError::AlreadyExists {
+                path: self.path.clone(),
+            });
+        }
+        let os = Self::read_state_from_path(source_path)?;
+        let report = validate_state(&os);
+        if !report.valid {
+            return Err(StoreError::InvalidState {
+                path: source_path.to_path_buf(),
+                issues: report.issues.join("; "),
+            });
+        }
         Ok((os, report))
     }
 
@@ -313,6 +357,30 @@ impl Store {
         Ok((migration, validation))
     }
 
+    pub fn preview_migrate_path(
+        &self,
+        input: &Path,
+    ) -> Result<(MigrationReport, ValidationReport), StoreError> {
+        let _lock = if path_targets_same_file(&self.path, input) {
+            Some(self.lock_shared()?)
+        } else {
+            None
+        };
+        let body = fs::read_to_string(input).map_err(|source| StoreError::Io {
+            path: input.to_path_buf(),
+            source,
+        })?;
+        let (os, migration) = Self::parse_state(&body, input)?;
+        let validation = validate_state(&os);
+        if !validation.valid {
+            return Err(StoreError::InvalidState {
+                path: input.to_path_buf(),
+                issues: validation.issues.join("; "),
+            });
+        }
+        Ok((migration, validation))
+    }
+
     fn parse_state(
         body: &str,
         path: &Path,
@@ -343,6 +411,24 @@ impl Store {
             source,
         })?;
         write_file_atomic_creating_parent(destination_path, &body)?;
+        Ok(destination_path.to_path_buf())
+    }
+
+    pub fn preview_backup_to_path(&self, destination_path: &Path) -> Result<PathBuf, StoreError> {
+        if path_targets_same_file(&self.path, destination_path) {
+            return Err(StoreError::Io {
+                path: destination_path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "backup destination must differ from state path",
+                ),
+            });
+        }
+        let _lock = self.lock_shared()?;
+        fs::read(&self.path).map_err(|source| StoreError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(destination_path.to_path_buf())
     }
 
@@ -512,24 +598,6 @@ fn temp_state_path(path: &Path) -> PathBuf {
     path.with_extension(extension)
 }
 
-fn unique_temp_state_path(path: &Path) -> PathBuf {
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "state".into());
-    let process_id = std::process::id();
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-
-    parent.join(format!(".{file_name}.{process_id}.{nanos}.{counter}.tmp"))
-}
-
 fn path_targets_same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -583,40 +651,13 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
 }
 
 fn write_file_atomic(path: &Path, body: &[u8]) -> Result<(), StoreError> {
-    let temp_path = unique_temp_state_path(path);
-    let mut temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|source| StoreError::Io {
-            path: temp_path.clone(),
-            source,
-        })?;
-    if let Err(source) = temp_file.write_all(body) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(StoreError::Io {
-            path: temp_path,
-            source,
-        });
-    }
-    drop(temp_file);
-    if let Err(source) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
-    Ok(())
+    durable_io::write_file_atomic_creating_parent(path, body).map_err(|error| StoreError::Io {
+        path: error.path,
+        source: error.source,
+    })
 }
 
 fn write_file_atomic_creating_parent(path: &Path, body: &[u8]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
     write_file_atomic(path, body)
 }
 
@@ -763,11 +804,21 @@ mod tests {
         let backup_error = store
             .backup_to_path(store.path())
             .expect_err("backup to state path");
+        let preview_export_error = store
+            .preview_export_to_path(store.path())
+            .expect_err("preview export to state path");
+        let preview_backup_error = store
+            .preview_backup_to_path(store.path())
+            .expect_err("preview backup to state path");
 
         assert!(matches!(export_error, StoreError::Io { .. }));
         assert!(export_error.to_string().contains("must differ"));
         assert!(matches!(backup_error, StoreError::Io { .. }));
         assert!(backup_error.to_string().contains("must differ"));
+        assert!(matches!(preview_export_error, StoreError::Io { .. }));
+        assert!(preview_export_error.to_string().contains("must differ"));
+        assert!(matches!(preview_backup_error, StoreError::Io { .. }));
+        assert!(preview_backup_error.to_string().contains("must differ"));
 
         let canonical_error = store
             .export_to_path(&fs::canonicalize(store.path()).expect("canonical state path"))
@@ -776,11 +827,16 @@ mod tests {
         let normalized_error = store
             .backup_to_path(&normalized_state_path)
             .expect_err("backup to normalized state path");
+        let normalized_preview_error = store
+            .preview_backup_to_path(&normalized_state_path)
+            .expect_err("preview backup to normalized state path");
 
         assert!(matches!(canonical_error, StoreError::Io { .. }));
         assert!(canonical_error.to_string().contains("must differ"));
         assert!(matches!(normalized_error, StoreError::Io { .. }));
         assert!(normalized_error.to_string().contains("must differ"));
+        assert!(matches!(normalized_preview_error, StoreError::Io { .. }));
+        assert!(normalized_preview_error.to_string().contains("must differ"));
         assert_eq!(store.load().expect("load").name, "test-os");
     }
 
@@ -942,7 +998,7 @@ mod tests {
         let mut task = Task::new("Running", "missing assignee", Priority::Normal, vec![]);
         task.status = TaskStatus::Running;
         os.create_task(task);
-        store.save(&os).expect("save invalid state");
+        store.save_unchecked(&os).expect("save invalid state");
 
         let report = store.repair_state().expect("repair report");
 

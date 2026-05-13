@@ -25,9 +25,11 @@ use agent_os::{
     Priority, RunId, RunRecord, RunStatus, Runtime, RuntimeReport, Scheduler, Store, Task, TaskId,
     TaskStatus, TaskUpdate, ToolDefinition, ToolId, ToolInvocation, ToolKind, ToolUpdate, Workflow,
     WorkflowId, WorkflowProgress, build_launchd_service as build_launchd_service_definition,
-    default_launchd_plist_path, metrics_json, metrics_unavailable_json, openapi_schema,
-    repair_state, resolve_launchd_domain, run_launchctl, validate_service_control_inputs,
-    validate_service_label, validate_state, validate_tool_invocation, validate_tool_template,
+    default_launchd_plist_path, install_launchd_service as install_launchd_service_definition,
+    metrics_json, metrics_unavailable_json, openapi_schema, repair_state, resolve_launchd_domain,
+    run_launchctl, uninstall_launchd_service as uninstall_launchd_service_definition,
+    validate_service_control_inputs, validate_state, validate_tool_invocation,
+    validate_tool_template,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -37,6 +39,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tabled::{Table, Tabled, settings::Style};
 
@@ -178,6 +181,8 @@ enum StateCommand {
 struct StateExportArgs {
     #[arg(long, help = "Write exported JSON to this path instead of stdout")]
     output: Option<std::path::PathBuf>,
+    #[arg(long, help = "Report export path without writing a file")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -185,12 +190,16 @@ struct StateImportArgs {
     path: std::path::PathBuf,
     #[arg(long, help = "Overwrite existing state")]
     force: bool,
+    #[arg(long, help = "Validate import without writing state")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
 struct StateBackupArgs {
     #[arg(long, help = "Backup path; defaults next to state.json")]
     output: Option<std::path::PathBuf>,
+    #[arg(long, help = "Report backup path without writing a file")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -202,6 +211,8 @@ struct StateMigrateArgs {
         help = "Write migrated state to this path; defaults to current state"
     )]
     output: Option<std::path::PathBuf>,
+    #[arg(long, help = "Report migration outcome without writing state")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -966,6 +977,11 @@ struct ApiServeArgs {
     token_env: Option<String>,
     #[arg(
         long,
+        help = "Allow serving an unauthenticated API on a non-loopback address"
+    )]
+    unsafe_no_token: bool,
+    #[arg(
+        long,
         help = "Stop after serving this many requests; useful for tests and supervisors"
     )]
     max_requests: Option<usize>,
@@ -1497,7 +1513,18 @@ fn validate_api_serve_inputs(args: &ApiServeArgs) -> Result<()> {
     if let Some(token_env) = &args.token_env {
         validate_env_var_name("token_env", token_env)?;
     }
+    if args.token_env.is_none() && !args.unsafe_no_token && api_bind_requires_token(&args.addr) {
+        bail!("api serve on non-loopback addresses requires --token-env or --unsafe-no-token");
+    }
     Ok(())
+}
+
+fn api_bind_requires_token(addr: &str) -> bool {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return !socket_addr.ip().is_loopback();
+    }
+    let lowercase = addr.to_ascii_lowercase();
+    !(lowercase.starts_with("localhost:") || lowercase.starts_with("[::1]:"))
 }
 
 fn validate_os_name(name: &str) -> Result<()> {
@@ -2125,12 +2152,23 @@ fn handle_state(store: Store, command: StateCommand, json: bool) -> Result<()> {
         StateCommand::Export(args) => {
             if let Some(path) = args.output {
                 validate_path("output", &path)?;
-                let path = store.export_to_path(&path)?;
+                let path = if args.dry_run {
+                    store.preview_export_to_path(&path)?
+                } else {
+                    store.export_to_path(&path)?
+                };
                 if json {
-                    print_json(&serde_json::json!({ "exported": path }))?;
+                    print_json(&serde_json::json!({
+                        "dry_run": args.dry_run,
+                        "exported": path,
+                    }))?;
+                } else if args.dry_run {
+                    println!("Would export state to {}", path.display());
                 } else {
                     println!("Exported state to {}", path.display());
                 }
+            } else if args.dry_run {
+                bail!("--dry-run requires --output");
             } else {
                 let body = store.export_json().context("run `agent-os init` first")?;
                 print!("{body}");
@@ -2138,13 +2176,24 @@ fn handle_state(store: Store, command: StateCommand, json: bool) -> Result<()> {
         }
         StateCommand::Import(args) => {
             validate_path("import path", &args.path)?;
-            let (_os, report) = store.import_from_path_checked(&args.path, args.force)?;
+            let (_os, report) = if args.dry_run {
+                store.preview_import_from_path_checked(&args.path, args.force)?
+            } else {
+                store.import_from_path_checked(&args.path, args.force)?
+            };
             if json {
                 print_json(&serde_json::json!({
+                    "dry_run": args.dry_run,
                     "imported": args.path,
                     "state_path": store.path(),
                     "validation": report,
                 }))?;
+            } else if args.dry_run {
+                println!(
+                    "Would import {} into {}",
+                    args.path.display(),
+                    store.path().display()
+                );
             } else {
                 println!(
                     "Imported {} into {}",
@@ -2156,9 +2205,18 @@ fn handle_state(store: Store, command: StateCommand, json: bool) -> Result<()> {
         StateCommand::Backup(args) => {
             let output = args.output.unwrap_or_else(|| store.default_backup_path());
             validate_path("output", &output)?;
-            let path = store.backup_to_path(&output)?;
+            let path = if args.dry_run {
+                store.preview_backup_to_path(&output)?
+            } else {
+                store.backup_to_path(&output)?
+            };
             if json {
-                print_json(&serde_json::json!({ "backup": path }))?;
+                print_json(&serde_json::json!({
+                    "dry_run": args.dry_run,
+                    "backup": path,
+                }))?;
+            } else if args.dry_run {
+                println!("Would back up state to {}", path.display());
             } else {
                 println!("Backed up state to {}", path.display());
             }
@@ -2168,14 +2226,31 @@ fn handle_state(store: Store, command: StateCommand, json: bool) -> Result<()> {
             let output = args.output.unwrap_or_else(|| store.path().to_path_buf());
             validate_path("input", &input)?;
             validate_path("output", &output)?;
-            let (report, validation) = store.migrate_path_to(&input, &output)?;
+            let (report, validation) = if args.dry_run {
+                store.preview_migrate_path(&input)?
+            } else {
+                store.migrate_path_to(&input, &output)?
+            };
             if json {
                 print_json(&serde_json::json!({
+                    "dry_run": args.dry_run,
                     "input": input,
                     "output": output,
                     "migration": report,
                     "validation": validation,
                 }))?;
+            } else if args.dry_run && report.changed {
+                println!(
+                    "Would migrate state from version {} to {} at {}",
+                    report.from_version,
+                    report.to_version,
+                    output.display()
+                );
+            } else if args.dry_run {
+                println!(
+                    "State already at version {}; no migration needed.",
+                    report.to_version
+                );
             } else if report.changed {
                 println!(
                     "Migrated state from version {} to {} at {}",
@@ -3804,46 +3879,40 @@ fn handle_service(store: Store, command: ServiceCommand, json: bool) -> Result<(
             }
         }
         ServiceCommand::Install(args) => {
-            let (service, plist_path) = build_launchd_service(&store, args)?;
-            Store::write_file_atomic(&plist_path, service.render_plist().as_bytes())
-                .with_context(|| format!("could not write {}", plist_path.display()))?;
+            let installation = install_launchd_service(&store, args)?;
             if json {
                 print_json(&serde_json::json!({
                     "platform": "launchd",
-                    "installed": true,
-                    "plist_path": plist_path,
-                    "service": service,
+                    "installed": installation.installed,
+                    "plist_path": installation.plist_path,
+                    "service": installation.service,
                 }))?;
             } else {
                 println!(
                     "Installed launchd service plist at {}",
-                    plist_path.display()
+                    installation.plist_path.display()
                 );
             }
         }
         ServiceCommand::Uninstall(args) => {
-            validate_service_label(&args.label)?;
-            validate_optional_path("plist_path", args.plist_path.as_deref())?;
-            let plist_path = args
-                .plist_path
-                .unwrap_or_else(|| default_launchd_plist_path(&args.label));
-            let removed = if plist_path.exists() {
-                std::fs::remove_file(&plist_path)
-                    .with_context(|| format!("could not remove {}", plist_path.display()))?;
-                true
-            } else {
-                false
-            };
+            let removal = uninstall_launchd_service_definition(&args.label, args.plist_path)
+                .map_err(anyhow::Error::from)?;
             if json {
                 print_json(&serde_json::json!({
                     "platform": "launchd",
-                    "removed": removed,
-                    "plist_path": plist_path,
+                    "removed": removal.removed,
+                    "plist_path": removal.plist_path,
                 }))?;
-            } else if removed {
-                println!("Removed launchd service plist at {}", plist_path.display());
+            } else if removal.removed {
+                println!(
+                    "Removed launchd service plist at {}",
+                    removal.plist_path.display()
+                );
             } else {
-                println!("No launchd service plist found at {}", plist_path.display());
+                println!(
+                    "No launchd service plist found at {}",
+                    removal.plist_path.display()
+                );
             }
         }
         ServiceCommand::Start(args) => {
@@ -3967,7 +4036,20 @@ fn build_launchd_service(
     store: &Store,
     args: ServiceLaunchdArgs,
 ) -> Result<(LaunchdService, std::path::PathBuf)> {
-    let options = LaunchdServiceOptions {
+    build_launchd_service_definition(store.path(), launchd_service_options(args))
+        .map_err(anyhow::Error::from)
+}
+
+fn install_launchd_service(
+    store: &Store,
+    args: ServiceLaunchdArgs,
+) -> Result<agent_os::LaunchdServiceInstall> {
+    install_launchd_service_definition(store.path(), launchd_service_options(args))
+        .map_err(anyhow::Error::from)
+}
+
+fn launchd_service_options(args: ServiceLaunchdArgs) -> LaunchdServiceOptions {
+    LaunchdServiceOptions {
         label: args.label,
         program: args.bin_path,
         interval_ms: args.interval_ms,
@@ -3976,8 +4058,7 @@ fn build_launchd_service(
         recover_stale_seconds: args.recover_stale_seconds,
         no_logs: args.no_logs,
         plist_path: args.plist_path,
-    };
-    build_launchd_service_definition(store.path(), options).map_err(anyhow::Error::from)
+    }
 }
 
 fn handle_api(store: Store, config_path: std::path::PathBuf, command: ApiCommand) -> Result<()> {

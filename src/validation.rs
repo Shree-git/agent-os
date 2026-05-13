@@ -489,6 +489,14 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
         os.provider.model = default_provider.model.clone();
         os.touch();
     }
+    if os.provider.request_timeout_seconds == 0 {
+        repairs.push(format!(
+            "reset provider request_timeout_seconds to {}",
+            default_provider.request_timeout_seconds
+        ));
+        os.provider.request_timeout_seconds = default_provider.request_timeout_seconds;
+        os.touch();
+    }
     if os.provider.api_key_env.trim().is_empty() {
         repairs.push(format!(
             "reset provider api_key_env to {}",
@@ -1373,6 +1381,9 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
     if matches!(os.provider.kind, ProviderKind::OpenAiCompatible) && os.provider.endpoint.is_none()
     {
         issues.push("provider endpoint is required for openai-compatible provider".into());
+    }
+    if os.provider.request_timeout_seconds == 0 {
+        issues.push("provider request_timeout_seconds must be greater than 0".into());
     }
     if has_empty_entry(&os.policy.allowed_commands) {
         issues.push("policy allowed_commands contains an empty value".into());

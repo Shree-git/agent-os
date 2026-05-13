@@ -1,3 +1,4 @@
+use crate::durable_io;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -47,6 +48,11 @@ pub enum ServiceError {
     InvalidRecoverStaleSeconds,
     #[error("could not determine current exe")]
     CurrentExe { source: std::io::Error },
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("could not run {path}: {source}")]
     CommandIo {
         path: PathBuf,
@@ -79,6 +85,19 @@ pub struct LaunchctlCommandOutput {
     pub status: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LaunchdServiceInstall {
+    pub service: LaunchdService,
+    pub plist_path: PathBuf,
+    pub installed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LaunchdServiceUninstall {
+    pub plist_path: PathBuf,
+    pub removed: bool,
 }
 
 impl LaunchdService {
@@ -181,6 +200,47 @@ pub fn build_launchd_service(
         },
         plist_path,
     ))
+}
+
+pub fn install_launchd_service(
+    state_path: &Path,
+    options: LaunchdServiceOptions,
+) -> Result<LaunchdServiceInstall, ServiceError> {
+    let (service, plist_path) = build_launchd_service(state_path, options)?;
+    let plist = service.render_plist();
+    durable_io::write_file_atomic_creating_parent(&plist_path, plist.as_bytes()).map_err(
+        |error| ServiceError::Io {
+            path: error.path,
+            source: error.source,
+        },
+    )?;
+    Ok(LaunchdServiceInstall {
+        service,
+        plist_path,
+        installed: true,
+    })
+}
+
+pub fn uninstall_launchd_service(
+    label: &str,
+    plist_path: Option<PathBuf>,
+) -> Result<LaunchdServiceUninstall, ServiceError> {
+    validate_service_label(label)?;
+    validate_optional_path("plist_path", plist_path.as_deref())?;
+    let plist_path = plist_path.unwrap_or_else(|| default_launchd_plist_path(label));
+    let removed = if plist_path.exists() {
+        std::fs::remove_file(&plist_path).map_err(|source| ServiceError::Io {
+            path: plist_path.clone(),
+            source,
+        })?;
+        true
+    } else {
+        false
+    };
+    Ok(LaunchdServiceUninstall {
+        plist_path,
+        removed,
+    })
 }
 
 pub fn default_launchd_plist_path(label: &str) -> PathBuf {
@@ -377,6 +437,42 @@ mod tests {
         )
         .expect_err("empty label should fail");
         assert_eq!(error.to_string(), "service label must not be empty");
+    }
+
+    #[test]
+    fn install_and_uninstall_launchd_service_manage_plist_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state_path = directory.path().join("state.json");
+        let plist_path = directory.path().join("com.example.agent-os.plist");
+        let options = LaunchdServiceOptions {
+            label: "com.example.agent-os".into(),
+            program: Some(PathBuf::from("/usr/local/bin/agent-os")),
+            interval_ms: 500,
+            limit: 2,
+            execute: true,
+            recover_stale_seconds: Some(30),
+            no_logs: true,
+            plist_path: Some(plist_path.clone()),
+        };
+
+        let installation =
+            install_launchd_service(&state_path, options).expect("service should install");
+
+        assert!(installation.installed);
+        assert_eq!(installation.plist_path, plist_path);
+        let plist = std::fs::read_to_string(&installation.plist_path).expect("plist");
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(plist.contains("/usr/local/bin/agent-os"));
+
+        let removal = uninstall_launchd_service("com.example.agent-os", Some(plist_path.clone()))
+            .expect("service should uninstall");
+        assert!(removal.removed);
+        assert_eq!(removal.plist_path, plist_path);
+        assert!(!removal.plist_path.exists());
+
+        let removal = uninstall_launchd_service("com.example.agent-os", Some(removal.plist_path))
+            .expect("missing service should be ok");
+        assert!(!removal.removed);
     }
 
     #[test]

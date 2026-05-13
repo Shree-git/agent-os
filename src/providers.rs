@@ -4,6 +4,7 @@ use crate::models::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -171,6 +172,7 @@ pub struct OpenAiCompatibleProvider {
     pub endpoint: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub request_timeout: Duration,
 }
 
 impl OpenAiCompatibleProvider {
@@ -194,6 +196,7 @@ impl OpenAiCompatibleProvider {
             endpoint,
             model: settings.model.clone(),
             api_key,
+            request_timeout: Duration::from_secs(settings.request_timeout_seconds),
         })
     }
 }
@@ -226,8 +229,14 @@ impl AgentProvider for OpenAiCompatibleProvider {
             "temperature": 0.2
         });
 
-        let mut request_builder =
-            ureq::post(&self.endpoint).set("content-type", "application/json");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(self.request_timeout)
+            .timeout_read(self.request_timeout)
+            .timeout_write(self.request_timeout)
+            .build();
+        let mut request_builder = agent
+            .post(&self.endpoint)
+            .set("content-type", "application/json");
         if let Some(api_key) = &self.api_key {
             request_builder = request_builder.set("authorization", &format!("Bearer {api_key}"));
         }
@@ -642,6 +651,7 @@ mod tests {
             endpoint: format!("http://{addr}/v1/chat/completions"),
             model: "test-model".into(),
             api_key: Some("test-key".into()),
+            request_timeout: Duration::from_secs(5),
         };
         let task = Task::new(
             "External provider",
@@ -710,6 +720,7 @@ mod tests {
             endpoint: format!("http://{addr}/v1/chat/completions"),
             model: "global-model".into(),
             api_key: Some("test-key".into()),
+            request_timeout: Duration::from_secs(5),
         };
         let agent = Agent::new(
             "planner",

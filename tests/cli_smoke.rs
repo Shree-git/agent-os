@@ -1,10 +1,11 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -3934,6 +3935,51 @@ fn state_export_backup_import_and_validate_round_trip() {
         .stdout(predicate::str::contains("Exported state"));
     assert!(export_path.exists());
 
+    let dry_run_export_path = dir.path().join("dry-run-export.json");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            source_arg,
+            "state",
+            "export",
+            "--output",
+            dry_run_export_path.to_str().expect("dry-run export path"),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would export state"));
+    assert!(
+        !dry_run_export_path.exists(),
+        "dry-run export should not write a file"
+    );
+
+    let source_state_file = source_state.join("state.json");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            source_arg,
+            "state",
+            "export",
+            "--output",
+            source_state_file.to_str().expect("source state file"),
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "export destination must differ from state path",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", source_arg, "state", "export", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--dry-run requires --output"));
+
     Command::cargo_bin("agent-os")
         .expect("binary")
         .args(["--state", source_arg, "state", "export", "--output", "   "])
@@ -3958,6 +4004,43 @@ fn state_export_backup_import_and_validate_round_trip() {
         .failure()
         .stderr(predicate::str::contains("output must not be empty"));
 
+    let dry_run_backup_path = dir.path().join("dry-run-backup.json");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            source_arg,
+            "state",
+            "backup",
+            "--output",
+            dry_run_backup_path.to_str().expect("dry-run backup path"),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would back up state"));
+    assert!(
+        !dry_run_backup_path.exists(),
+        "dry-run backup should not write a file"
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            source_arg,
+            "state",
+            "backup",
+            "--output",
+            source_state_file.to_str().expect("source state file"),
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "backup destination must differ from state path",
+        ));
+
     Command::cargo_bin("agent-os")
         .expect("binary")
         .args(["--state", source_arg, "state", "validate"])
@@ -3973,6 +4056,24 @@ fn state_export_backup_import_and_validate_round_trip() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("import path must not be empty"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            target_arg,
+            "state",
+            "import",
+            export_arg,
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would import"));
+    assert!(
+        !target_state.join("state.json").exists(),
+        "dry-run import should not create target state"
+    );
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -4028,7 +4129,7 @@ fn api_can_backup_state_to_requested_path() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "2",
+            "4",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -4052,6 +4153,25 @@ fn api_can_backup_state_to_requested_path() {
     assert!(invalid.contains("HTTP/1.1 400 Bad Request"), "{invalid}");
     assert!(invalid.contains("output must not be empty"), "{invalid}");
 
+    let dry_run_body = serde_json::json!({
+        "output": backup_path.display().to_string(),
+        "dry_run": true
+    })
+    .to_string();
+    let dry_run = http_request(addr, "POST", "/state/backup", &dry_run_body, &auth);
+    assert!(dry_run.contains("HTTP/1.1 200 OK"), "{dry_run}");
+    let dry_run_response: Value =
+        serde_json::from_str(http_body(&dry_run)).expect("backup dry-run body");
+    assert_eq!(dry_run_response["dry_run"], true);
+    assert_eq!(
+        dry_run_response["backup"].as_str(),
+        Some(backup_path.to_str().expect("backup path"))
+    );
+    assert!(
+        !backup_path.exists(),
+        "dry-run backup should not write a file"
+    );
+
     let backup_body = serde_json::json!({
         "output": backup_path.display().to_string()
     })
@@ -4063,6 +4183,7 @@ fn api_can_backup_state_to_requested_path() {
         backup_response["backup"].as_str(),
         Some(backup_path.to_str().expect("backup path"))
     );
+    assert_eq!(backup_response["dry_run"], false);
     assert!(backup_path.exists());
 
     let backed_up: Value =
@@ -4070,8 +4191,37 @@ fn api_can_backup_state_to_requested_path() {
             .expect("backup state");
     assert_eq!(backed_up["tasks"].as_object().expect("tasks").len(), 1);
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    let default_backup = http_request(addr, "POST", "/state/backup", "", &auth);
+    assert!(
+        default_backup.contains("HTTP/1.1 200 OK"),
+        "{default_backup}"
+    );
+    let default_backup_response: Value =
+        serde_json::from_str(http_body(&default_backup)).expect("default backup body");
+    assert_eq!(default_backup_response["dry_run"], false);
+    let default_backup_path = std::path::PathBuf::from(
+        default_backup_response["backup"]
+            .as_str()
+            .expect("default backup path"),
+    );
+    assert_eq!(default_backup_path.parent(), Some(state.as_path()));
+    let default_backup_name = default_backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("default backup filename");
+    assert!(default_backup_name.starts_with("state.backup-"));
+    assert!(default_backup_name.ends_with(".json"));
+    assert!(default_backup_path.exists());
+    let default_backed_up: Value = serde_json::from_str(
+        &std::fs::read_to_string(&default_backup_path).expect("default backup json"),
+    )
+    .expect("default backup state");
+    assert_eq!(
+        default_backed_up["tasks"].as_object().expect("tasks").len(),
+        1
+    );
+
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -4134,7 +4284,7 @@ fn api_can_import_state_with_force() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "5",
+            "4",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -4169,6 +4319,24 @@ fn api_can_import_state_with_force() {
     assert!(conflict.contains("HTTP/1.1 409 Conflict"), "{conflict}");
     assert!(conflict.contains("state conflict"), "{conflict}");
 
+    let dry_run_body = serde_json::json!({
+        "path": export_path.display().to_string(),
+        "force": true,
+        "dry_run": true
+    })
+    .to_string();
+    let dry_run = http_request(addr, "POST", "/state/import", &dry_run_body, &auth);
+    assert!(dry_run.contains("HTTP/1.1 200 OK"), "{dry_run}");
+    let dry_run_body: Value = serde_json::from_str(http_body(&dry_run)).expect("import dry-run");
+    assert_eq!(dry_run_body["dry_run"], true);
+    assert_eq!(dry_run_body["validation"]["valid"], true);
+    let target_before_import =
+        std::fs::read_to_string(target_state.join("state.json")).expect("target before import");
+    assert!(
+        !target_before_import.contains("Import me"),
+        "dry-run import should not overwrite target state"
+    );
+
     let forced_body = serde_json::json!({
         "path": export_path.display().to_string(),
         "force": true
@@ -4177,14 +4345,14 @@ fn api_can_import_state_with_force() {
     let imported = http_request(addr, "POST", "/state/import", &forced_body, &auth);
     assert!(imported.contains("HTTP/1.1 200 OK"), "{imported}");
     let imported_body: Value = serde_json::from_str(http_body(&imported)).expect("import body");
+    assert_eq!(imported_body["dry_run"], false);
     assert_eq!(
         imported_body["imported"].as_str(),
         Some(export_path.to_str().expect("export path"))
     );
     assert_eq!(imported_body["validation"]["valid"], true);
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -4246,7 +4414,7 @@ fn api_can_migrate_state_paths() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "3",
+            "5",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -4286,6 +4454,40 @@ fn api_can_migrate_state_paths() {
         "{invalid_output}"
     );
 
+    let active_noop = http_request(addr, "POST", "/state/migrate", "", &auth);
+    assert!(active_noop.contains("HTTP/1.1 200 OK"), "{active_noop}");
+    let active_noop_body: Value =
+        serde_json::from_str(http_body(&active_noop)).expect("active migrate body");
+    assert_eq!(active_noop_body["dry_run"], false);
+    assert_eq!(
+        active_noop_body["input"].as_str(),
+        Some(state.join("state.json").to_str().expect("state path"))
+    );
+    assert_eq!(
+        active_noop_body["output"].as_str(),
+        Some(state.join("state.json").to_str().expect("state path"))
+    );
+    assert_eq!(active_noop_body["migration"]["changed"], false);
+    assert_eq!(active_noop_body["validation"]["valid"], true);
+
+    let dry_run_body = serde_json::json!({
+        "input": legacy_path.display().to_string(),
+        "output": migrated_path.display().to_string(),
+        "dry_run": true
+    })
+    .to_string();
+    let dry_run = http_request(addr, "POST", "/state/migrate", &dry_run_body, &auth);
+    assert!(dry_run.contains("HTTP/1.1 200 OK"), "{dry_run}");
+    let dry_run_body: Value = serde_json::from_str(http_body(&dry_run)).expect("migrate dry-run");
+    assert_eq!(dry_run_body["dry_run"], true);
+    assert_eq!(dry_run_body["migration"]["from_version"], 0);
+    assert_eq!(dry_run_body["migration"]["to_version"], 3);
+    assert_eq!(dry_run_body["validation"]["valid"], true);
+    assert!(
+        !migrated_path.exists(),
+        "dry-run should not write migrated output"
+    );
+
     let migrate_body = serde_json::json!({
         "input": legacy_path.display().to_string(),
         "output": migrated_path.display().to_string()
@@ -4294,12 +4496,12 @@ fn api_can_migrate_state_paths() {
     let migrated = http_request(addr, "POST", "/state/migrate", &migrate_body, &auth);
     assert!(migrated.contains("HTTP/1.1 200 OK"), "{migrated}");
     let migrated_body: Value = serde_json::from_str(http_body(&migrated)).expect("migrate body");
+    assert_eq!(migrated_body["dry_run"], false);
     assert_eq!(migrated_body["migration"]["from_version"], 0);
     assert_eq!(migrated_body["migration"]["to_version"], 3);
     assert_eq!(migrated_body["validation"]["valid"], true);
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     let migrated_state: Value =
         serde_json::from_str(&std::fs::read_to_string(&migrated_path).expect("migrated state"))
@@ -4346,7 +4548,7 @@ fn api_can_export_state_snapshot() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "3",
+            "4",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -4370,6 +4572,25 @@ fn api_can_export_state_snapshot() {
     assert!(invalid.contains("HTTP/1.1 400 Bad Request"), "{invalid}");
     assert!(invalid.contains("output must not be empty"), "{invalid}");
 
+    let dry_run_body = serde_json::json!({
+        "output": export_path.display().to_string(),
+        "dry_run": true
+    })
+    .to_string();
+    let dry_run = http_request(addr, "POST", "/state/export", &dry_run_body, &auth);
+    assert!(dry_run.contains("HTTP/1.1 200 OK"), "{dry_run}");
+    let dry_run_response: Value =
+        serde_json::from_str(http_body(&dry_run)).expect("export dry-run body");
+    assert_eq!(dry_run_response["dry_run"], true);
+    assert_eq!(
+        dry_run_response["exported"].as_str(),
+        Some(export_path.to_str().expect("export path"))
+    );
+    assert!(
+        !export_path.exists(),
+        "dry-run export should not write a file"
+    );
+
     let export_body = serde_json::json!({
         "output": export_path.display().to_string()
     })
@@ -4385,6 +4606,7 @@ fn api_can_export_state_snapshot() {
         exported_to_path_body["exported"].as_str(),
         Some(export_path.to_str().expect("export path"))
     );
+    assert_eq!(exported_to_path_body["dry_run"], false);
     assert!(export_path.exists());
     let exported_file: Value =
         serde_json::from_str(&std::fs::read_to_string(&export_path).expect("exported file"))
@@ -4398,8 +4620,7 @@ fn api_can_export_state_snapshot() {
     assert!(exported_body["tasks"].to_string().contains("Export me"));
     assert!(exported_body["events"].as_array().expect("events").len() >= 2);
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -6052,6 +6273,28 @@ fn state_migrate_upgrades_legacy_state_without_version() {
         .failure()
         .stderr(predicate::str::contains("output must not be empty"));
 
+    let before_dry_run = std::fs::read_to_string(&legacy).expect("legacy before dry-run");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "state",
+            "migrate",
+            "--input",
+            legacy_arg,
+            "--output",
+            legacy_arg,
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Would migrate state from version 0 to 3",
+        ));
+    let after_dry_run = std::fs::read_to_string(&legacy).expect("legacy after dry-run");
+    assert_eq!(after_dry_run, before_dry_run);
+
     Command::cargo_bin("agent-os")
         .expect("binary")
         .args([
@@ -6060,6 +6303,7 @@ fn state_migrate_upgrades_legacy_state_without_version() {
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains("\"dry_run\": false"))
         .stdout(predicate::str::contains("\"from_version\": 0"))
         .stdout(predicate::str::contains("\"to_version\": 3"));
 
@@ -6246,7 +6490,7 @@ fn api_can_prune_old_finished_runs_and_events() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "2",
+            "3",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -6265,6 +6509,23 @@ fn api_can_prune_old_finished_runs_and_events() {
         .parse::<SocketAddr>()
         .expect("listening addr");
     let auth = [("authorization", "Bearer prune-token")];
+
+    let default_prune = http_request(addr, "POST", "/state/prune", "", &auth);
+    assert!(default_prune.contains("HTTP/1.1 200 OK"), "{default_prune}");
+    let default_prune_body: Value =
+        serde_json::from_str(http_body(&default_prune)).expect("default prune body");
+    assert_eq!(default_prune_body["dry_run"], false);
+    assert_eq!(
+        default_prune_body["removed_runs"]
+            .as_array()
+            .expect("default removed runs")
+            .len(),
+        0
+    );
+    assert_eq!(default_prune_body["removed_events"], 0);
+    let after_default_prune =
+        std::fs::read_to_string(state.join("state.json")).expect("state after default prune");
+    assert_eq!(after_default_prune, before_dry_run);
 
     let dry_run = http_request(
         addr,
@@ -6305,8 +6566,7 @@ fn api_can_prune_old_finished_runs_and_events() {
         2
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     let output = Command::cargo_bin("agent-os")
         .expect("binary")
@@ -6612,7 +6872,7 @@ fn tool_secret_arg_resolves_from_env_and_is_redacted() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .env("AGENT_TOOL_SECRET", "dummy-tool-secret")
+        .env("AGENT_TOOL_SECRET", "qz")
         .args(["--state", state_arg, "run", "--execute"])
         .assert()
         .success()
@@ -6627,7 +6887,7 @@ fn tool_secret_arg_resolves_from_env_and_is_redacted() {
             .assert()
             .success()
             .stdout(predicate::str::contains("[redacted]"))
-            .stdout(predicate::str::contains("dummy-tool-secret").not());
+            .stdout(predicate::str::contains("qz").not());
     }
 }
 
@@ -7754,6 +8014,72 @@ fn daemon_run_ticks_and_persists_status() {
 }
 
 #[test]
+fn daemon_soak_processes_multiple_ticks_and_tasks() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force"])
+        .assert()
+        .success();
+
+    for index in 0..4 {
+        Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args([
+                "--state",
+                state_arg,
+                "task",
+                "create",
+                &format!("Daemon soak task {index}"),
+                "--need",
+                "rust",
+                "--command",
+                &format!("printf soak-{index}"),
+            ])
+            .assert()
+            .success();
+    }
+
+    let daemon_run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "daemon",
+            "run",
+            "--execute",
+            "--limit",
+            "2",
+            "--max-ticks",
+            "5",
+            "--interval-ms",
+            "5",
+        ])
+        .output()
+        .expect("daemon soak");
+    assert!(daemon_run.status.success(), "daemon soak failed");
+    let daemon_run: Value = serde_json::from_slice(&daemon_run.stdout).expect("daemon soak json");
+    assert_eq!(daemon_run["tick_count"], 5);
+    assert_eq!(daemon_run["totals"]["assigned"], 4);
+    assert_eq!(daemon_run["totals"]["executed"], 4);
+    assert_eq!(daemon_run["totals"]["errors"], 0);
+    assert_eq!(daemon_run["daemon"]["status"], "stopped");
+    assert_eq!(daemon_run["daemon"]["ticks"], 5);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tasks_complete\": 4"))
+        .stdout(predicate::str::contains("\"runs\": 4"));
+}
+
+#[test]
 fn daemon_stop_requests_running_daemon_to_exit() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -7893,8 +8219,7 @@ fn api_can_read_and_stop_daemon() {
     assert!(stop.contains("HTTP/1.1 200 OK"), "{stop}");
     assert!(stop.contains("\"stop_requested\":true"), "{stop}");
 
-    let api_status = api.wait().expect("api wait");
-    assert!(api_status.success(), "api process failed with {api_status}");
+    wait_for_api_success(&mut api);
 
     let daemon_status = daemon.wait().expect("daemon wait");
     assert!(
@@ -8455,11 +8780,62 @@ fn readme_filter_synopses_document_accepted_aliases() {
 #[test]
 fn readme_state_repair_documents_workflow_drift() {
     let readme = include_str!("../README.md");
+    let export_synopsis = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os state export "))
+        .expect("README state export synopsis");
+    let import_synopsis = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os state import "))
+        .expect("README state import synopsis");
+    let backup_synopsis = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os state backup "))
+        .expect("README state backup synopsis");
+    let migrate_synopsis = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os state migrate "))
+        .expect("README state migrate synopsis");
+    let state_notes = readme
+        .lines()
+        .find(|line| line.starts_with("- State can be exported"))
+        .expect("README state maintenance notes");
     let repair_notes = readme
         .lines()
         .find(|line| line.starts_with("- `state repair` fixes"))
         .expect("README state repair notes");
 
+    assert!(export_synopsis.contains("[--dry-run]"), "{export_synopsis}");
+    assert!(import_synopsis.contains("[--dry-run]"), "{import_synopsis}");
+    assert!(backup_synopsis.contains("[--dry-run]"), "{backup_synopsis}");
+    assert!(
+        migrate_synopsis.contains("[--dry-run]"),
+        "{migrate_synopsis}"
+    );
+    assert!(
+        state_notes
+            .contains(r#"POST /state/export` accepts `{"output":"state.json","dry_run":true}`"#),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains(
+            r#"POST /state/import` accepts `{"path":"state.json","force":true,"dry_run":true}`"#
+        ),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains(r#"POST /state/migrate` accepts `{"input":"legacy.json","output":"state.json","dry_run":true}`"#),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes
+            .contains(r#"POST /state/backup` accepts `{"output":"backup.json","dry_run":true}`"#),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains(r#"POST /state/repair` accepts `{"dry_run":true}`"#),
+        "{state_notes}"
+    );
     assert!(repair_notes.contains("OS name drift"), "{repair_notes}");
     assert!(
         repair_notes.contains("workflow stage/task drift"),
@@ -8481,6 +8857,270 @@ fn readme_state_repair_documents_workflow_drift() {
         repair_notes.contains("run command/cwd/exit-code drift"),
         "{repair_notes}"
     );
+}
+
+#[test]
+fn crate_manifest_documents_release_metadata() {
+    let manifest: toml::Value = include_str!("../Cargo.toml")
+        .parse()
+        .expect("Cargo.toml parses");
+    let package = manifest["package"]
+        .as_table()
+        .expect("Cargo.toml package table");
+    assert_eq!(
+        package["name"].as_str(),
+        Some("agent_os"),
+        "crate name is part of the published package identity"
+    );
+    assert_eq!(
+        package["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "manifest version should match the compiled package version"
+    );
+    assert!(
+        package["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("AI agents")),
+        "crate description should be useful on crates.io"
+    );
+    assert_eq!(package["readme"].as_str(), Some("README.md"));
+    assert_eq!(package["license"].as_str(), Some("MIT"));
+    assert_eq!(
+        package["documentation"].as_str(),
+        Some("https://docs.rs/agent_os")
+    );
+    assert_manifest_string_array_contains(package, "keywords", "agents");
+    assert_manifest_string_array_contains(package, "keywords", "scheduler");
+    assert_manifest_string_array_contains(package, "categories", "command-line-utilities");
+    assert_manifest_string_array_contains(package, "categories", "development-tools");
+
+    let binaries = manifest["bin"].as_array().expect("Cargo.toml bin table");
+    assert!(
+        binaries.iter().any(|binary| {
+            binary["name"].as_str() == Some("agent-os")
+                && binary["path"].as_str() == Some("src/main.rs")
+        }),
+        "published package should expose the documented agent-os binary"
+    );
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        manifest_dir.join("README.md").is_file(),
+        "README.md missing"
+    );
+    let license = std::fs::read_to_string(manifest_dir.join("LICENSE")).expect("LICENSE");
+    assert!(
+        license.contains("MIT License"),
+        "LICENSE should match Cargo.toml license metadata"
+    );
+}
+
+#[test]
+fn ci_script_uses_locked_dependency_resolution() {
+    let ci = include_str!("../scripts/ci.sh");
+    for command in [
+        "cargo test --locked",
+        "cargo doc --locked --no-deps",
+        "cargo clippy --locked --all-targets",
+        "cargo publish --dry-run --locked --allow-dirty",
+        "cargo package --locked --allow-dirty",
+    ] {
+        assert!(
+            ci.contains(command),
+            "scripts/ci.sh should keep `{command}` pinned to Cargo.lock"
+        );
+    }
+    for command in [
+        "cargo test\n",
+        "cargo doc --no-deps",
+        "cargo clippy --all-targets",
+        "cargo publish --dry-run --allow-dirty",
+        "cargo package --allow-dirty",
+    ] {
+        assert!(
+            !ci.contains(command),
+            "scripts/ci.sh should not use unlocked `{}`",
+            command.trim()
+        );
+    }
+}
+
+#[test]
+fn github_ci_matches_manifest_rust_version_and_runs_canonical_ci() {
+    let manifest: toml::Value = include_str!("../Cargo.toml")
+        .parse()
+        .expect("Cargo.toml parses");
+    let rust_version = manifest["package"]["rust-version"]
+        .as_str()
+        .expect("package rust-version");
+    let ci = include_str!("../.github/workflows/ci.yml");
+    assert!(
+        ci.contains(&format!("dtolnay/rust-toolchain@{rust_version}.0")),
+        "GitHub CI should install the Cargo.toml rust-version"
+    );
+    assert!(
+        ci.contains("components: rustfmt, clippy"),
+        "GitHub CI should install rustfmt and clippy components"
+    );
+    assert!(
+        ci.contains("run: ./scripts/ci.sh"),
+        "GitHub CI should run the canonical local CI script"
+    );
+}
+
+#[test]
+fn api_smoke_tests_use_bounded_api_waits() {
+    let source = include_str!("cli_smoke.rs");
+    assert!(
+        !source.contains(".wait().expect(\"api wait\")"),
+        "API smoke tests should use wait_for_api_success so request-count drift fails fast"
+    );
+}
+
+#[test]
+fn readme_api_endpoint_list_matches_openapi_contract() {
+    let readme = include_str!("../README.md");
+    let documented = documented_readme_api_operations(readme);
+    let schema = agent_os::openapi_schema();
+    let expected = openapi_documented_operations(&schema);
+
+    assert_eq!(documented, expected);
+}
+
+#[test]
+fn readme_command_list_matches_top_level_cli_help() {
+    let readme = include_str!("../README.md");
+    let documented = documented_readme_top_level_commands(readme);
+    let help = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--help"])
+        .output()
+        .expect("help");
+    assert!(help.status.success(), "agent-os --help failed");
+    let help = String::from_utf8(help.stdout).expect("help utf8");
+    let actual = top_level_commands_from_help(&help);
+
+    assert_eq!(documented, actual);
+}
+
+#[test]
+fn readme_documents_global_cli_options_and_env_vars() {
+    let readme = include_str!("../README.md");
+    let help = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--help"])
+        .output()
+        .expect("help");
+    assert!(help.status.success(), "agent-os --help failed");
+    let help = String::from_utf8(help.stdout).expect("help utf8");
+    let options = global_long_options_from_help(&help);
+
+    assert_eq!(
+        options,
+        BTreeSet::from([
+            "--config".to_owned(),
+            "--json".to_owned(),
+            "--state".to_owned()
+        ])
+    );
+    for option in options {
+        assert!(
+            readme.contains(&format!("`{option}`")),
+            "README should document global option `{option}`"
+        );
+    }
+    for env_var in ["AGENT_OS_HOME", "AGENT_OS_CONFIG"] {
+        assert!(
+            readme.contains(&format!("`{env_var}`")),
+            "README should document {env_var}"
+        );
+    }
+}
+
+#[test]
+fn readme_subcommand_lists_match_cli_help() {
+    let readme = include_str!("../README.md");
+    for command in [
+        "config", "state", "agent", "task", "tool", "memory", "runs", "daemon", "service", "api",
+        "workflow",
+    ] {
+        let documented = documented_readme_subcommands(readme, command);
+        let help = Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args([command, "--help"])
+            .output()
+            .unwrap_or_else(|error| panic!("agent-os {command} --help failed: {error}"));
+        assert!(help.status.success(), "agent-os {command} --help failed");
+        let help = String::from_utf8(help.stdout).expect("help utf8");
+        let actual = commands_from_help(&help);
+
+        assert_eq!(
+            documented, actual,
+            "README drift for `{command}` subcommands"
+        );
+    }
+}
+
+#[test]
+fn readme_command_synopses_include_cli_help_options() {
+    let readme = include_str!("../README.md");
+    for synopsis in readme_command_synopsis_lines(readme) {
+        let command_path = readme_synopsis_command_path(synopsis);
+        let mut args = command_path.clone();
+        args.push("--help".to_owned());
+        let help = Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args(&args)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("agent-os {} --help failed: {error}", command_path.join(" "))
+            });
+        assert!(
+            help.status.success(),
+            "agent-os {} --help failed",
+            command_path.join(" ")
+        );
+        let help = String::from_utf8(help.stdout).expect("help utf8");
+        let help_options = local_long_options_from_help(&help);
+        let documented_options = documented_long_options_from_synopsis(synopsis);
+
+        assert_eq!(
+            documented_options, help_options,
+            "README synopsis `{synopsis}` local options drifted from CLI help"
+        );
+    }
+}
+
+#[test]
+fn readme_completions_shells_match_cli_help() {
+    let readme = include_str!("../README.md");
+    let documented = documented_readme_completion_shells(readme);
+    let help = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["completions", "--help"])
+        .output()
+        .expect("completions help");
+    assert!(help.status.success(), "agent-os completions --help failed");
+    let help = String::from_utf8(help.stdout).expect("completions help utf8");
+    let actual = possible_values_from_help(&help, "<SHELL>");
+
+    assert_eq!(documented, actual);
+
+    for shell in actual {
+        let output = Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args(["completions", &shell])
+            .output()
+            .unwrap_or_else(|error| panic!("agent-os completions {shell} failed: {error}"));
+        assert!(
+            output.status.success(),
+            "agent-os completions {shell} failed"
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "agent-os completions {shell} should emit a completion script"
+        );
+    }
 }
 
 #[test]
@@ -8823,6 +9463,229 @@ fn workflow_run_advances_next_ready_stage() {
 }
 
 #[test]
+fn end_to_end_operator_workflow_covers_cli_api_daemon_tools_memory_and_run_logs() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace_arg = workspace.to_str().expect("workspace");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "memory",
+            "add",
+            "release-context",
+            "Use the durable workflow smoke path.",
+            "--tag",
+            "release",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "tool",
+            "add",
+            "write-handoff",
+            "--kind",
+            "file-write",
+            "--need",
+            "rust",
+            "--cwd",
+            workspace_arg,
+            "--command-template",
+            "{name}.txt",
+        ])
+        .assert()
+        .success();
+
+    let workflow = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "create",
+            "Prove planner builder reviewer release loop",
+            "--execute",
+        ])
+        .output()
+        .expect("workflow create");
+    assert!(workflow.status.success(), "workflow create failed");
+    let workflow: Value = serde_json::from_slice(&workflow.stdout).expect("workflow json");
+    let workflow_id = workflow["id"].as_str().expect("workflow id");
+    let plan_run_id = workflow["runs"][0]["id"].as_str().expect("plan run id");
+
+    let mut api = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("AGENT_OS_API_TOKEN", "e2e-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-env",
+            "AGENT_OS_API_TOKEN",
+            "--max-requests",
+            "4",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    let stdout = api.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+    let auth = [("authorization", "Bearer e2e-token")];
+
+    let memory = http_get(addr, "/memory?query=release-context&tag=release", &auth);
+    assert!(memory.contains("HTTP/1.1 200 OK"), "{memory}");
+    assert!(memory.contains("durable workflow smoke"), "{memory}");
+
+    let run_workflow = http_request(
+        addr,
+        "POST",
+        &format!("/workflows/{workflow_id}/run"),
+        r#"{"all":true}"#,
+        &auth,
+    );
+    assert!(run_workflow.contains("HTTP/1.1 200 OK"), "{run_workflow}");
+    let run_workflow_body: Value =
+        serde_json::from_str(http_body(&run_workflow)).expect("run workflow body");
+    assert_eq!(run_workflow_body["progress"]["tasks_complete"], 3);
+    assert_eq!(
+        run_workflow_body["errors"]
+            .as_array()
+            .expect("errors")
+            .len(),
+        0
+    );
+
+    let workflow_status = http_get(addr, &format!("/workflows/{workflow_id}/status"), &auth);
+    assert!(
+        workflow_status.contains("HTTP/1.1 200 OK"),
+        "{workflow_status}"
+    );
+    assert!(
+        workflow_status.contains("\"tasks_complete\":3"),
+        "{workflow_status}"
+    );
+
+    let api_logs = http_get(
+        addr,
+        &format!("/runs/{plan_run_id}/logs?tail_bytes=4096"),
+        &auth,
+    );
+    assert!(api_logs.contains("HTTP/1.1 200 OK"), "{api_logs}");
+    assert!(api_logs.contains("provider:"), "{api_logs}");
+    wait_for_api_success(&mut api);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Write daemon handoff",
+            "--need",
+            "rust",
+            "--tool",
+            "write-handoff",
+            "--arg",
+            "name=handoff",
+            "--arg",
+            "body=daemon-note",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "daemon",
+            "run",
+            "--execute",
+            "--limit",
+            "1",
+            "--interval-ms",
+            "10",
+            "--max-ticks",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tick 1 assigned 1 executed 1"))
+        .stdout(predicate::str::contains("tick 2 assigned 0 executed 0"));
+
+    let handoff = std::fs::read_to_string(workspace.join("handoff.txt")).expect("handoff file");
+    assert_eq!(handoff, "daemon-note");
+
+    let daemon_status = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "daemon", "status"])
+        .output()
+        .expect("daemon status");
+    assert!(daemon_status.status.success(), "daemon status failed");
+    let daemon_status: Value =
+        serde_json::from_slice(&daemon_status.stdout).expect("daemon status json");
+    assert_eq!(daemon_status["daemon"]["status"], "stopped");
+    assert_eq!(daemon_status["daemon"]["ticks"], 2);
+
+    let runs = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state", state_arg, "--json", "runs", "list", "--limit", "1",
+        ])
+        .output()
+        .expect("runs list");
+    assert!(runs.status.success(), "runs list failed");
+    let runs: Value = serde_json::from_slice(&runs.stdout).expect("runs json");
+    let daemon_run_id = runs[0]["id"].as_str().expect("daemon run id");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "logs", daemon_run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("file-write"))
+        .stdout(predicate::str::contains("[wrote]"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "replay", daemon_run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("events:"))
+        .stdout(predicate::str::contains("log:"));
+}
+
+#[test]
 fn task_recover_requeues_stale_running_tasks() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -8940,7 +9803,7 @@ fn api_can_recover_stale_running_tasks() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "3",
+            "5",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -8973,6 +9836,31 @@ fn api_can_recover_stale_running_tasks() {
         "{invalid}"
     );
 
+    let default_recovery = http_request(addr, "POST", "/tasks/recover", "", &auth);
+    assert!(
+        default_recovery.contains("HTTP/1.1 200 OK"),
+        "{default_recovery}"
+    );
+    let default_recovery_body: Value =
+        serde_json::from_str(http_body(&default_recovery)).expect("default recover body");
+    assert_eq!(default_recovery_body["older_than_seconds"], 1800);
+    assert_eq!(
+        default_recovery_body["recovered"]
+            .as_array()
+            .expect("default recovered ids")
+            .len(),
+        0
+    );
+    let status_after_default = http_get(addr, "/status", &auth);
+    assert!(
+        status_after_default.contains("HTTP/1.1 200 OK"),
+        "{status_after_default}"
+    );
+    assert!(
+        status_after_default.contains("\"tasks_running\":1"),
+        "{status_after_default}"
+    );
+
     let recovered = http_request(
         addr,
         "POST",
@@ -8996,8 +9884,7 @@ fn api_can_recover_stale_running_tasks() {
     assert!(status.contains("\"tasks_pending\":1"), "{status}");
     assert!(status.contains("\"tasks_running\":0"), "{status}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -9895,8 +10782,7 @@ fn api_can_manually_assign_task() {
         "{delete_running}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10001,9 +10887,10 @@ fn api_serve_exposes_status_json() {
     let schema = http_get(addr, "/openapi.json", &[]);
     assert!(schema.contains("HTTP/1.1 200 OK"), "{schema}");
     assert!(schema.contains("Agent OS Local API"), "{schema}");
+    let live_schema: Value = serde_json::from_str(http_body(&schema)).expect("live schema json");
+    assert_eq!(live_schema, agent_os::openapi_schema());
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10079,6 +10966,9 @@ fn api_health_reports_state_load_errors() {
     assert!(schema.contains("HTTP/1.1 200 OK"), "{schema}");
     assert!(schema.contains("Agent OS Local API"), "{schema}");
     assert!(schema.contains("\"/health\""), "{schema}");
+    let live_schema: Value =
+        serde_json::from_str(http_body(&schema)).expect("unavailable live schema json");
+    assert_eq!(live_schema, agent_os::openapi_schema());
 
     let status_response = http_get(addr, "/status", &[]);
     assert!(
@@ -10090,8 +10980,7 @@ fn api_health_reports_state_load_errors() {
         "{status_response}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10150,8 +11039,7 @@ fn api_health_reports_config_validation() {
     assert!(health.contains("\"config_valid\":false"), "{health}");
     assert!(health.contains("OS name must not be empty"), "{health}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10231,8 +11119,7 @@ parallel = 1
     assert!(validation.contains("\"config_valid\":true"), "{validation}");
     assert!(validation.contains("\"config_issues\":[]"), "{validation}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10273,7 +11160,7 @@ fn api_can_write_default_config() {
         .parse::<SocketAddr>()
         .expect("listening addr");
 
-    let written = http_request(addr, "POST", "/config", "{}", &[]);
+    let written = http_request(addr, "POST", "/config", "", &[]);
     assert!(written.contains("HTTP/1.1 201 Created"), "{written}");
     assert!(written.contains("\"written\":true"), "{written}");
     assert!(written.contains("\"name\":\"Agent OS\""), "{written}");
@@ -10293,8 +11180,7 @@ fn api_can_write_default_config() {
     assert!(loaded.contains("\"exists\":true"), "{loaded}");
     assert!(loaded.contains("\"name\":\"Agent OS\""), "{loaded}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10314,7 +11200,7 @@ fn api_can_render_launchd_service() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "2",
+            "3",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -10332,6 +11218,40 @@ fn api_can_render_launchd_service() {
         .expect("listening prefix")
         .parse::<SocketAddr>()
         .expect("listening addr");
+
+    let default_rendered = http_request(addr, "POST", "/service/launchd", "", &[]);
+    assert!(
+        default_rendered.contains("HTTP/1.1 200 OK"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"label\":\"com.infinite-apps.agent-os\""),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"interval_ms\":1000"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"limit\":1"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"execute\":false"),
+        "{default_rendered}"
+    );
+    assert!(
+        !default_rendered.contains("--execute"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("daemon.out.log"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("com.infinite-apps.agent-os.plist"),
+        "{default_rendered}"
+    );
 
     let body = serde_json::json!({
         "label": "com.example.agent-os",
@@ -10372,19 +11292,24 @@ fn api_can_render_launchd_service() {
         "{invalid}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
 fn api_can_install_and_uninstall_launchd_service() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("missing-state");
+    let home = dir.path().join("home");
+    let default_plist_path = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.infinite-apps.agent-os.plist");
     let bin_path = dir.path().join("bin").join("agent-os");
     let plist_path = dir.path().join("LaunchAgents").join("agent-os.plist");
     let state_arg = state.to_str().expect("state");
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("HOME", &home)
         .args([
             "--state",
             state_arg,
@@ -10393,7 +11318,7 @@ fn api_can_install_and_uninstall_launchd_service() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "3",
+            "5",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -10411,6 +11336,32 @@ fn api_can_install_and_uninstall_launchd_service() {
         .expect("listening prefix")
         .parse::<SocketAddr>()
         .expect("listening addr");
+
+    let default_installed = http_request(addr, "POST", "/service/launchd/install", "", &[]);
+    assert!(
+        default_installed.contains("HTTP/1.1 200 OK"),
+        "{default_installed}"
+    );
+    assert!(
+        default_installed.contains("\"installed\":true"),
+        "{default_installed}"
+    );
+    assert!(
+        default_installed.contains("com.infinite-apps.agent-os.plist"),
+        "{default_installed}"
+    );
+    assert!(default_plist_path.exists());
+
+    let default_removed = http_request(addr, "POST", "/service/launchd/uninstall", "", &[]);
+    assert!(
+        default_removed.contains("HTTP/1.1 200 OK"),
+        "{default_removed}"
+    );
+    assert!(
+        default_removed.contains("\"removed\":true"),
+        "{default_removed}"
+    );
+    assert!(!default_plist_path.exists());
 
     let body = serde_json::json!({
         "label": "com.example.agent-os",
@@ -10456,19 +11407,28 @@ fn api_can_install_and_uninstall_launchd_service() {
     assert!(missing.contains("HTTP/1.1 200 OK"), "{missing}");
     assert!(missing.contains("\"removed\":false"), "{missing}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
 fn api_can_control_launchd_service_with_launchctl() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("missing-state");
+    let home = dir.path().join("home");
+    let default_plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.infinite-apps.agent-os.plist");
     let plist = dir.path().join("com.example.agent-os.plist");
-    let fake_launchctl = dir.path().join("launchctl");
+    let fake_bin = dir.path().join("bin");
+    let fake_launchctl = fake_bin.join("launchctl");
     let failing_launchctl = dir.path().join("launchctl-fail");
     let log = dir.path().join("launchctl.log");
+    std::fs::create_dir_all(default_plist.parent().expect("default plist parent"))
+        .expect("default plist parent");
     std::fs::write(&plist, "<plist/>").expect("plist");
+    std::fs::write(&default_plist, "<plist/>").expect("default plist");
+    std::fs::create_dir_all(&fake_bin).expect("fake launchctl bin");
     std::fs::write(
         &fake_launchctl,
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_LAUNCHCTL_LOG\"\nif [ \"$1\" = \"print\" ]; then echo 'state = running'; fi\nexit 0\n",
@@ -10492,9 +11452,16 @@ fn api_can_control_launchd_service_with_launchctl() {
 
     let state_arg = state.to_str().expect("state");
     let log_arg = log.to_str().expect("log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("HOME", &home)
         .env("AGENT_OS_LAUNCHCTL_LOG", log_arg)
+        .env("PATH", path)
         .args([
             "--state",
             state_arg,
@@ -10503,7 +11470,7 @@ fn api_can_control_launchd_service_with_launchctl() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "5",
+            "8",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -10521,6 +11488,44 @@ fn api_can_control_launchd_service_with_launchctl() {
         .expect("listening prefix")
         .parse::<SocketAddr>()
         .expect("listening addr");
+
+    let default_started = http_request(addr, "POST", "/service/launchd/start", "", &[]);
+    assert!(
+        default_started.contains("HTTP/1.1 200 OK"),
+        "{default_started}"
+    );
+    assert!(
+        default_started.contains("\"label\":\"com.infinite-apps.agent-os\""),
+        "{default_started}"
+    );
+    assert!(
+        default_started.contains("\"domain\":\"gui/"),
+        "{default_started}"
+    );
+
+    let default_status = http_request(addr, "POST", "/service/launchd/status", "", &[]);
+    assert!(
+        default_status.contains("HTTP/1.1 200 OK"),
+        "{default_status}"
+    );
+    assert!(
+        default_status.contains("\"loaded\":true"),
+        "{default_status}"
+    );
+    assert!(
+        default_status.contains("state = running"),
+        "{default_status}"
+    );
+
+    let default_stopped = http_request(addr, "POST", "/service/launchd/stop", "", &[]);
+    assert!(
+        default_stopped.contains("HTTP/1.1 200 OK"),
+        "{default_stopped}"
+    );
+    assert!(
+        default_stopped.contains("\"stopped\":true"),
+        "{default_stopped}"
+    );
 
     let body = serde_json::json!({
         "label": "com.example.agent-os",
@@ -10577,8 +11582,7 @@ fn api_can_control_launchd_service_with_launchctl() {
         "{invalid}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     let calls = std::fs::read_to_string(log).expect("launchctl log");
     let plist_arg = plist.to_str().expect("plist");
@@ -10645,8 +11649,7 @@ fn api_doctor_reports_state_and_config_preflight() {
     assert!(doctor.contains("\"config_valid\":false"), "{doctor}");
     assert!(doctor.contains("OS name must not be empty"), "{doctor}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -10705,7 +11708,7 @@ parallel = 1
     assert!(invalid.contains("HTTP/1.1 400 Bad Request"), "{invalid}");
     assert!(invalid.contains("OS name must not be empty"), "{invalid}");
 
-    let initialized = http_request(addr, "POST", "/init", "{}", &[]);
+    let initialized = http_request(addr, "POST", "/init", "", &[]);
     assert!(
         initialized.contains("HTTP/1.1 201 Created"),
         "{initialized}"
@@ -10730,8 +11733,7 @@ parallel = 1
     assert!(forced.contains("HTTP/1.1 201 Created"), "{forced}");
     assert!(forced.contains("\"name\":\"Forced API OS\""), "{forced}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -10757,11 +11759,25 @@ fn api_schema_command_prints_contract() {
         .expect("api schema");
     assert!(output.status.success(), "api schema failed");
     let schema: Value = serde_json::from_slice(&output.stdout).expect("schema json");
+    assert_eq!(schema, agent_os::openapi_schema());
     assert_schema_refs_resolve(&schema);
+    assert_optional_bearer_security_declared(&schema);
+    assert_component_schemas_are_reachable(&schema);
+    assert_operations_and_responses_have_descriptions(&schema);
+    assert_parameters_are_documented(&schema);
     assert_path_parameters_declared(&schema);
+    assert_query_parameters_match_runtime_filters(&schema);
+    assert_request_bodies_match_http_methods(&schema);
     assert_success_responses_have_json_schemas(&schema);
+    assert_error_responses_have_json_schemas(&schema);
+    assert_mutation_operations_declare_unsupported_media_type(&schema);
     assert_create_post_success_statuses(&schema);
+    assert_content_uses_only_application_json(&schema);
     assert_json_content_entries_have_schemas(&schema);
+    assert_request_body_requirements(&schema);
+    assert_array_schemas_declare_items(&schema);
+    assert_component_object_schemas_are_closed(&schema);
+    assert_non_request_object_schemas_require_declared_properties(&schema);
     assert_operation_ids_present_and_unique(&schema);
     assert_operation_tags_present_and_declared(&schema);
     assert_standard_response_headers_declared(&schema);
@@ -10847,6 +11863,16 @@ fn api_schema_command_prints_contract() {
         "GET, POST, DELETE, OPTIONS"
     );
     assert_eq!(
+        schema["paths"]["/status"]["get"]["responses"]["200"]["headers"]["Cache-Control"]["schema"]
+            ["example"],
+        "no-store"
+    );
+    assert_eq!(
+        schema["paths"]["/status"]["get"]["responses"]["200"]["headers"]["X-Content-Type-Options"]
+            ["schema"]["example"],
+        "nosniff"
+    );
+    assert_eq!(
         schema["paths"]["/status"]["options"]["responses"]["204"]["headers"]["Access-Control-Allow-Headers"]
             ["schema"]["example"],
         "authorization, content-type"
@@ -10867,6 +11893,10 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["paths"]["/tasks"]["post"]["responses"]["413"]["description"],
         "Request body too large"
+    );
+    assert_eq!(
+        schema["paths"]["/tasks"]["post"]["responses"]["415"]["description"],
+        "Unsupported media type"
     );
     assert_eq!(
         schema["paths"]["/runs/{id}/cancel"]["post"]["responses"]["500"]["content"]["application/json"]
@@ -10910,6 +11940,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/InitRequest"
     );
     assert_eq!(
+        schema["paths"]["/init"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/init"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
             ["$ref"],
         "#/components/schemas/InitResponse"
@@ -10923,6 +11957,10 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/config"]["post"]["requestBody"]["content"]["application/json"]["schema"]
             ["$ref"],
         "#/components/schemas/WriteConfigRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/config"]["post"]["requestBody"]["required"],
+        false
     );
     assert_eq!(
         schema["paths"]["/config"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
@@ -11199,6 +12237,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/LaunchdServiceRequest"
     );
     assert_eq!(
+        schema["paths"]["/service/launchd"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/service/launchd"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/LaunchdServiceResponse"
@@ -11233,6 +12275,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/LaunchdServiceRequest"
     );
     assert_eq!(
+        schema["paths"]["/service/launchd/install"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/service/launchd/install"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/InstallLaunchdServiceResponse"
@@ -11241,6 +12287,10 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/service/launchd/uninstall"]["post"]["requestBody"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/UninstallLaunchdServiceRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/service/launchd/uninstall"]["post"]["requestBody"]["required"],
+        false
     );
     assert_eq!(
         schema["paths"]["/service/launchd/uninstall"]["post"]["responses"]["200"]["content"]["application/json"]
@@ -11271,6 +12321,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/LaunchdServiceControlRequest"
     );
     assert_eq!(
+        schema["paths"]["/service/launchd/start"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/service/launchd/start"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/LaunchdServiceStartResponse"
@@ -11281,9 +12335,17 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/LaunchdServiceStopResponse"
     );
     assert_eq!(
+        schema["paths"]["/service/launchd/stop"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/service/launchd/status"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/LaunchdServiceStatusResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/launchd/status"]["post"]["requestBody"]["required"],
+        false
     );
     assert_eq!(
         schema["components"]["schemas"]["LaunchdServiceControlRequest"]["properties"]["launchctl_path"]
@@ -11390,8 +12452,16 @@ fn api_schema_command_prints_contract() {
         r".*\S.*"
     );
     assert_eq!(
+        schema["components"]["schemas"]["ExportStateRequest"]["properties"]["dry_run"]["default"],
+        false
+    );
+    assert_eq!(
         schema["components"]["schemas"]["ExportStateResponse"]["required"],
-        serde_json::json!(["exported"])
+        serde_json::json!(["dry_run", "exported"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ExportStateResponse"]["properties"]["dry_run"]["type"],
+        "boolean"
     );
     assert_eq!(
         schema["components"]["schemas"]["ImportStateRequest"]["required"],
@@ -11400,6 +12470,18 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["ImportStateRequest"]["properties"]["path"]["pattern"],
         r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ImportStateRequest"]["properties"]["dry_run"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ImportStateResponse"]["required"],
+        serde_json::json!(["dry_run", "imported", "state_path", "validation"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ImportStateResponse"]["properties"]["dry_run"]["type"],
+        "boolean"
     );
     assert_eq!(
         schema["components"]["schemas"]["ImportStateResponse"]["properties"]["validation"]["$ref"],
@@ -11412,6 +12494,18 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["MigrateStateRequest"]["properties"]["output"]["pattern"],
         r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MigrateStateRequest"]["properties"]["dry_run"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MigrateStateResponse"]["required"],
+        serde_json::json!(["dry_run", "input", "output", "migration", "validation"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MigrateStateResponse"]["properties"]["dry_run"]["type"],
+        "boolean"
     );
     assert_eq!(
         schema["components"]["schemas"]["MigrateStateResponse"]["properties"]["migration"]["$ref"],
@@ -11536,6 +12630,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/RunWorkflowRequest"
     );
     assert_eq!(
+        schema["paths"]["/workflows/{id}/run"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
         schema["paths"]["/workflows/{id}/cancel"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/WorkflowCancelResponse"
@@ -11544,6 +12642,10 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/workflows/{id}/cancel"]["post"]["requestBody"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/FinishTaskRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/cancel"]["post"]["requestBody"]["required"],
+        false
     );
     assert_eq!(
         schema["components"]["schemas"]["RunWorkflowRequest"]["properties"]["all"]["default"],
@@ -12667,6 +13769,12 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/tasks/{id}/complete"]["post"]["requestBody"]["required"],
         false
     );
+    for endpoint in ["fail", "block", "cancel", "retry", "unblock"] {
+        assert_eq!(
+            schema["paths"][format!("/tasks/{{id}}/{endpoint}")]["post"]["requestBody"]["required"],
+            false
+        );
+    }
     assert_eq!(
         schema["paths"]["/state/repair"]["post"]["requestBody"]["required"],
         false
@@ -12697,7 +13805,15 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["components"]["schemas"]["BackupStateResponse"]["required"],
-        serde_json::json!(["backup"])
+        serde_json::json!(["dry_run", "backup"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["BackupStateRequest"]["properties"]["dry_run"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["BackupStateResponse"]["properties"]["dry_run"]["type"],
+        "boolean"
     );
     assert_eq!(
         schema["paths"]["/state/prune"]["post"]["requestBody"]["required"],
@@ -13134,6 +14250,24 @@ fn api_serve_can_require_bearer_token() {
             "API token from token_env must not be empty",
         ));
 
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "0.0.0.0:0",
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "non-loopback addresses requires --token-env or --unsafe-no-token",
+        ));
+
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
         .env("AGENT_OS_API_TOKEN", "test-token")
         .args([
@@ -13146,7 +14280,7 @@ fn api_serve_can_require_bearer_token() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "2",
+            "4",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -13179,12 +14313,30 @@ fn api_serve_can_require_bearer_token() {
         "unauthorized"
     );
 
-    let authorized = http_get(addr, "/status", &[("authorization", "Bearer test-token")]);
+    let wrong_token = http_get(addr, "/status", &[("authorization", "Bearer wrong-token")]);
+    assert!(
+        wrong_token.contains("HTTP/1.1 401 Unauthorized"),
+        "{wrong_token}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(http_body(&wrong_token)).expect("wrong token json")["error"],
+        "unauthorized"
+    );
+
+    let authorized = http_get(addr, "/status", &[("Authorization", "Bearer test-token")]);
     assert!(authorized.contains("HTTP/1.1 200 OK"), "{authorized}");
     assert!(authorized.contains("\"tasks_pending\""), "{authorized}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    let health = http_get(addr, "/health", &[("authorization", "Bearer test-token")]);
+    assert!(health.contains("HTTP/1.1 200 OK"), "{health}");
+    assert!(health.contains("cache-control: no-store"), "{health}");
+    assert!(
+        health.contains("x-content-type-options: nosniff"),
+        "{health}"
+    );
+    assert!(health.contains("\"ok\":true"), "{health}");
+
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -13254,8 +14406,7 @@ fn api_serve_allows_browser_preflight() {
         "{response}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -13279,7 +14430,7 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "6",
+            "9",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -13371,6 +14522,49 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
         "{unsupported_method}"
     );
 
+    let unsupported_media_type = http_raw_request(
+        addr,
+        "POST /tasks HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\n{}",
+    );
+    assert!(
+        unsupported_media_type.contains("HTTP/1.1 415 Unsupported Media Type"),
+        "{unsupported_media_type}"
+    );
+    assert!(
+        unsupported_media_type.contains("\"error\":\"unsupported media type\""),
+        "{unsupported_media_type}"
+    );
+    assert!(
+        unsupported_media_type.contains("application/json"),
+        "{unsupported_media_type}"
+    );
+
+    let missing_content_type = http_raw_request(
+        addr,
+        "POST /tasks HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\n\r\n{}",
+    );
+    assert!(
+        missing_content_type.contains("HTTP/1.1 415 Unsupported Media Type"),
+        "{missing_content_type}"
+    );
+    assert!(
+        missing_content_type.contains("missing content-type"),
+        "{missing_content_type}"
+    );
+
+    let json_with_charset = http_raw_request(
+        addr,
+        "POST /tasks/recover HTTP/1.1\r\nhost: localhost\r\ncontent-length: 24\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"older_than_seconds\":0}",
+    );
+    assert!(
+        json_with_charset.contains("HTTP/1.1 200 OK"),
+        "{json_with_charset}"
+    );
+    assert!(
+        json_with_charset.contains("\"older_than_seconds\":0"),
+        "{json_with_charset}"
+    );
+
     let status_response = http_get(addr, "/status", &[]);
     assert!(
         status_response.contains("HTTP/1.1 200 OK"),
@@ -13381,8 +14575,7 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
         "{status_response}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -13486,8 +14679,7 @@ fn api_path_ids_must_be_valid() {
         "{status_response}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -13545,7 +14737,7 @@ fn api_can_validate_and_repair_state() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "3",
+            "5",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -13573,13 +14765,7 @@ fn api_can_validate_and_repair_state() {
         "{invalid}"
     );
 
-    let dry_run = http_request(
-        addr,
-        "POST",
-        "/state/repair",
-        r#"{"dry_run":true}"#,
-        &auth,
-    );
+    let dry_run = http_request(addr, "POST", "/state/repair", r#"{"dry_run":true}"#, &auth);
     assert!(dry_run.contains("HTTP/1.1 200 OK"), "{dry_run}");
     assert!(dry_run.contains("\"dry_run\":true"), "{dry_run}");
     assert!(dry_run.contains("\"changed\":true"), "{dry_run}");
@@ -13587,18 +14773,16 @@ fn api_can_validate_and_repair_state() {
     assert!(dry_run.contains("added running task"), "{dry_run}");
 
     let still_invalid = http_get(addr, "/state/validate", &auth);
-    assert!(
-        still_invalid.contains("HTTP/1.1 200 OK"),
-        "{still_invalid}"
-    );
+    assert!(still_invalid.contains("HTTP/1.1 200 OK"), "{still_invalid}");
     assert!(still_invalid.contains("\"valid\":false"), "{still_invalid}");
     assert!(
         still_invalid.contains("missing from agent current tasks"),
         "{still_invalid}"
     );
 
-    let repair = http_request(addr, "POST", "/state/repair", "{}", &auth);
+    let repair = http_request(addr, "POST", "/state/repair", "", &auth);
     assert!(repair.contains("HTTP/1.1 200 OK"), "{repair}");
+    assert!(repair.contains("\"dry_run\":false"), "{repair}");
     assert!(repair.contains("\"changed\":true"), "{repair}");
     assert!(repair.contains("\"persisted\":true"), "{repair}");
     assert!(repair.contains("added running task"), "{repair}");
@@ -13607,8 +14791,7 @@ fn api_can_validate_and_repair_state() {
     assert!(valid.contains("HTTP/1.1 200 OK"), "{valid}");
     assert!(valid.contains("\"valid\":true"), "{valid}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -13700,8 +14883,7 @@ fn api_state_repair_reports_conflict_for_unrepairable_state() {
     assert!(response.contains("\"valid\":false"), "{response}");
     assert!(response.contains("missing an assigned agent"), "{response}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     let after: Value =
         serde_json::from_str(&std::fs::read_to_string(&state_file).expect("state body"))
@@ -13733,7 +14915,7 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "95",
+            "99",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -14463,6 +15645,45 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
     assert_eq!(workflow_status_body["tasks_complete"], 1);
     assert_eq!(workflow_status_body["current_stage"], "build");
 
+    let default_run_workflow = http_request(
+        addr,
+        "POST",
+        "/workflows",
+        r#"{"objective":"Default API workflow run","priority":"high","execute":true}"#,
+        &auth,
+    );
+    assert!(
+        default_run_workflow.contains("HTTP/1.1 201 Created"),
+        "{default_run_workflow}"
+    );
+    let default_run_workflow_body: Value =
+        serde_json::from_str(http_body(&default_run_workflow)).expect("default run workflow body");
+    let default_run_workflow_id = default_run_workflow_body["id"]
+        .as_str()
+        .expect("default run workflow id");
+    let default_workflow_run = http_request(
+        addr,
+        "POST",
+        &format!("/workflows/{default_run_workflow_id}/run"),
+        "",
+        &auth,
+    );
+    assert!(
+        default_workflow_run.contains("HTTP/1.1 200 OK"),
+        "{default_workflow_run}"
+    );
+    let default_workflow_run_body: Value =
+        serde_json::from_str(http_body(&default_workflow_run)).expect("default workflow run body");
+    assert_eq!(default_workflow_run_body["progress"]["tasks_complete"], 2);
+    assert_eq!(
+        default_workflow_run_body["progress"]["current_stage"],
+        "review"
+    );
+    assert_eq!(
+        default_workflow_run_body["runs"][0]["task_id"],
+        default_run_workflow_body["tasks"]["build"]
+    );
+
     let workflow_run = http_request(
         addr,
         "POST",
@@ -14523,6 +15744,49 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
     assert_eq!(workflow_cancel_body["progress"]["tasks_complete"], 1);
     assert_eq!(workflow_cancel_body["progress"]["tasks_cancelled"], 2);
     assert_eq!(workflow_cancel_body["progress"]["current_stage"], "build");
+
+    let default_cancel_workflow = http_request(
+        addr,
+        "POST",
+        "/workflows",
+        r#"{"objective":"Default API workflow cancel","priority":"high","execute":true}"#,
+        &auth,
+    );
+    assert!(
+        default_cancel_workflow.contains("HTTP/1.1 201 Created"),
+        "{default_cancel_workflow}"
+    );
+    let default_cancel_workflow_body: Value =
+        serde_json::from_str(http_body(&default_cancel_workflow))
+            .expect("default cancel workflow body");
+    let default_cancel_workflow_id = default_cancel_workflow_body["id"]
+        .as_str()
+        .expect("default cancel workflow id");
+    let default_workflow_cancel = http_request(
+        addr,
+        "POST",
+        &format!("/workflows/{default_cancel_workflow_id}/cancel"),
+        "",
+        &auth,
+    );
+    assert!(
+        default_workflow_cancel.contains("HTTP/1.1 200 OK"),
+        "{default_workflow_cancel}"
+    );
+    let default_workflow_cancel_body: Value =
+        serde_json::from_str(http_body(&default_workflow_cancel))
+            .expect("default workflow cancel body");
+    assert_eq!(
+        default_workflow_cancel_body["cancelled_tasks"],
+        serde_json::json!([
+            default_cancel_workflow_body["tasks"]["build"],
+            default_cancel_workflow_body["tasks"]["review"]
+        ])
+    );
+    assert_eq!(
+        default_workflow_cancel_body["progress"]["tasks_cancelled"],
+        2
+    );
 
     let delete_workflow = http_request(
         addr,
@@ -14969,8 +16233,7 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
     let delete_tool = http_request(addr, "DELETE", "/tools/api-printf", "", &auth);
     assert!(delete_tool.contains("HTTP/1.1 200 OK"), "{delete_tool}");
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -14997,7 +16260,7 @@ fn api_run_endpoint_schedules_and_executes_work() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "11",
+            "12",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -15016,6 +16279,33 @@ fn api_run_endpoint_schedules_and_executes_work() {
         .parse::<SocketAddr>()
         .expect("listening addr");
     let auth = [("authorization", "Bearer run-token")];
+
+    let default_run = http_request(addr, "POST", "/run", "", &auth);
+    assert!(default_run.contains("HTTP/1.1 200 OK"), "{default_run}");
+    let default_run_body: Value =
+        serde_json::from_str(http_body(&default_run)).expect("default run body");
+    assert_eq!(default_run_body["dry_run"], false);
+    assert_eq!(
+        default_run_body["scheduler"]["assignments"]
+            .as_array()
+            .expect("default assignments")
+            .len(),
+        0
+    );
+    assert_eq!(
+        default_run_body["runs"]
+            .as_array()
+            .expect("default runs")
+            .len(),
+        0
+    );
+    assert_eq!(
+        default_run_body["errors"]
+            .as_array()
+            .expect("default errors")
+            .len(),
+        0
+    );
 
     let agent = http_request(
         addr,
@@ -15128,8 +16418,7 @@ fn api_run_endpoint_schedules_and_executes_work() {
         "{delete_task_with_run}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -15267,8 +16556,7 @@ fn api_run_endpoint_respects_expired_agent_lease() {
         "{run}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -15430,8 +16718,7 @@ fn api_exposes_run_logs_and_replay_with_explicit_missing_log_errors() {
         "{missing_replay}"
     );
 
-    let status = child.wait().expect("api wait");
-    assert!(status.success(), "api process failed with {status}");
+    wait_for_api_success(&mut child);
 }
 
 #[test]
@@ -15640,6 +16927,114 @@ fn runs_cancel_stops_running_shell_command() {
 }
 
 #[test]
+fn concurrent_cli_and_api_mutations_survive_running_execution() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Concurrent mutation command",
+            "--need",
+            "rust",
+            "--command",
+            "printf started; sleep 1; printf finished",
+        ])
+        .assert()
+        .success();
+
+    let mut run = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args(["--state", state_arg, "run", "--execute"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+    let run_id = wait_for_first_run_id(state_arg);
+    wait_for_run_tail_contains(state_arg, &run_id, "started");
+
+    let mut api = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--max-requests",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+    let stdout = api.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let api_memory = http_request(
+        addr,
+        "POST",
+        "/memory",
+        r#"{"topic":"api-concurrent","body":"api mutation while run active","tags":["race"]}"#,
+        &[],
+    );
+    assert!(api_memory.contains("HTTP/1.1 201 Created"), "{api_memory}");
+    wait_for_api_success(&mut api);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "memory",
+            "add",
+            "cli-concurrent",
+            "cli mutation while run active",
+            "--tag",
+            "race",
+        ])
+        .assert()
+        .success();
+
+    wait_for_child_exit(&mut run);
+    wait_for_run_status(state_arg, &run_id, "success");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "memory", "list", "--tag", "race"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api-concurrent"))
+        .stdout(predicate::str::contains("cli-concurrent"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "logs", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("finished"));
+}
+
+#[test]
 fn runs_tail_reads_shell_log_before_completion() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -15777,8 +17172,7 @@ fn api_can_cancel_running_shell_command() {
     assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("\"cancel_requested\":true"), "{response}");
 
-    let api_status = api_child.wait().expect("api wait");
-    assert!(api_status.success(), "api process failed with {api_status}");
+    wait_for_api_success(&mut api_child);
 
     wait_for_child_exit(&mut run_child);
     wait_for_run_status(state_arg, &run_id, "cancelled");
@@ -15828,8 +17222,7 @@ fn api_can_cancel_running_shell_command() {
         "{terminal_cancel}"
     );
 
-    let api_status = api_child.wait().expect("api wait");
-    assert!(api_status.success(), "api process failed with {api_status}");
+    wait_for_api_success(&mut api_child);
 }
 
 fn connect_with_retry(addr: SocketAddr) -> TcpStream {
@@ -15889,6 +17282,29 @@ fn http_body(response: &str) -> &str {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .expect("http body")
+}
+
+fn wait_for_api_success(child: &mut Child) {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "api process failed with {status}");
+                return;
+            }
+            Ok(None) if start.elapsed() < Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let status = child.wait().expect("api wait after kill");
+                panic!(
+                    "api process did not exit within 5s after expected requests; killed with {status}"
+                );
+            }
+            Err(error) => panic!("api wait failed: {error}"),
+        }
+    }
 }
 
 fn wait_for_daemon_status(state_arg: &str, expected: &str) {
@@ -16012,6 +17428,335 @@ fn first_task_id(state_arg: &str) -> String {
     tasks[0]["id"].as_str().expect("task id").to_owned()
 }
 
+fn documented_readme_api_operations(readme: &str) -> BTreeSet<(String, String)> {
+    let mut in_api_section = false;
+    let mut in_code_block = false;
+    let mut operations = BTreeSet::new();
+    for line in readme.lines() {
+        if line.starts_with("The local API serves JSON") {
+            in_api_section = true;
+            continue;
+        }
+        if !in_api_section {
+            continue;
+        }
+        if line.starts_with("```") {
+            if in_code_block {
+                break;
+            }
+            in_code_block = true;
+            continue;
+        }
+        if !in_code_block {
+            continue;
+        }
+        let Some((method, path)) = parse_readme_api_operation(line) else {
+            continue;
+        };
+        operations.insert((method, path));
+    }
+    assert!(
+        !operations.is_empty(),
+        "README local API endpoint list should not be empty"
+    );
+    operations
+}
+
+fn parse_readme_api_operation(line: &str) -> Option<(String, String)> {
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    if !matches!(method, "GET" | "POST" | "DELETE") {
+        return None;
+    }
+    let path = parts.next()?.split('?').next()?;
+    Some((method.to_owned(), normalize_readme_api_path(path)))
+}
+
+fn normalize_readme_api_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.ends_with("_ID") {
+                "{id}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn openapi_documented_operations(schema: &Value) -> BTreeSet<(String, String)> {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    let mut operations = BTreeSet::new();
+    for (path, endpoint) in paths {
+        let methods = endpoint.as_object().expect("OpenAPI path item");
+        for method in methods.keys() {
+            if matches!(method.as_str(), "get" | "post" | "delete") {
+                operations.insert((method.to_ascii_uppercase(), path.to_owned()));
+            }
+        }
+    }
+    operations
+}
+
+fn documented_readme_top_level_commands(readme: &str) -> BTreeSet<String> {
+    let mut in_commands_block = false;
+    let mut in_code_block = false;
+    let mut commands = BTreeSet::new();
+    for line in readme.lines() {
+        if line == "## Commands" {
+            in_commands_block = true;
+            continue;
+        }
+        if !in_commands_block {
+            continue;
+        }
+        if line.starts_with("```") {
+            if in_code_block {
+                break;
+            }
+            in_code_block = true;
+            continue;
+        }
+        if !in_code_block {
+            continue;
+        }
+        let Some(command) = line
+            .strip_prefix("agent-os ")
+            .and_then(|command| command.split_whitespace().next())
+        else {
+            continue;
+        };
+        commands.insert(command.to_owned());
+    }
+    assert!(
+        !commands.is_empty(),
+        "README command synopsis list should not be empty"
+    );
+    commands
+}
+
+fn documented_readme_subcommands(readme: &str, command: &str) -> BTreeSet<String> {
+    let mut commands = BTreeSet::new();
+    let prefix = format!("agent-os {command} ");
+    for line in readme_command_synopsis_lines(readme) {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(subcommand) = rest.split_whitespace().next() else {
+            continue;
+        };
+        commands.insert(subcommand.to_owned());
+    }
+    assert!(
+        !commands.is_empty(),
+        "README command synopsis list for `{command}` should not be empty"
+    );
+    commands
+}
+
+fn documented_readme_completion_shells(readme: &str) -> BTreeSet<String> {
+    let prefix = "agent-os completions ";
+    let Some(shells) = readme_command_synopsis_lines(readme)
+        .into_iter()
+        .find_map(|line| line.strip_prefix(prefix))
+    else {
+        panic!("README command synopsis should document `{prefix}<SHELL>`");
+    };
+    let shells = shells
+        .split('|')
+        .map(str::trim)
+        .filter(|shell| !shell.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !shells.is_empty(),
+        "README completions synopsis should list supported shells"
+    );
+    shells
+}
+
+fn assert_manifest_string_array_contains(
+    package: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    expected: &str,
+) {
+    let values = package[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("Cargo.toml package.{field} should be an array"));
+    assert!(
+        values.iter().any(|value| value.as_str() == Some(expected)),
+        "Cargo.toml package.{field} should contain {expected}"
+    );
+}
+
+fn readme_command_synopsis_lines(readme: &str) -> Vec<&str> {
+    let mut in_commands_block = false;
+    let mut in_code_block = false;
+    let mut lines = Vec::new();
+    for line in readme.lines() {
+        if line == "## Commands" {
+            in_commands_block = true;
+            continue;
+        }
+        if !in_commands_block {
+            continue;
+        }
+        if line.starts_with("```") {
+            if in_code_block {
+                break;
+            }
+            in_code_block = true;
+            continue;
+        }
+        if in_code_block {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn readme_synopsis_command_path(synopsis: &str) -> Vec<String> {
+    let mut parts = synopsis.split_whitespace();
+    assert_eq!(parts.next(), Some("agent-os"), "README synopsis prefix");
+    let mut command_path = Vec::new();
+    for part in parts {
+        let part = part.trim_matches(|character| character == '[' || character == ']');
+        if part.starts_with("--")
+            || part.contains('|')
+            || part.chars().any(|character| character.is_ascii_uppercase())
+        {
+            break;
+        }
+        command_path.push(part.to_owned());
+        if command_path.len() == 2 {
+            break;
+        }
+    }
+    assert!(
+        !command_path.is_empty(),
+        "README synopsis should include a command path: {synopsis}"
+    );
+    command_path
+}
+
+fn documented_long_options_from_synopsis(synopsis: &str) -> BTreeSet<String> {
+    synopsis
+        .split_whitespace()
+        .filter_map(|part| {
+            let option = part.trim_matches(|character| character == '[' || character == ']');
+            option.starts_with("--").then(|| option.to_owned())
+        })
+        .collect()
+}
+
+fn top_level_commands_from_help(help: &str) -> BTreeSet<String> {
+    commands_from_help(help)
+}
+
+fn global_long_options_from_help(help: &str) -> BTreeSet<String> {
+    let options = long_options_from_help(help);
+    assert!(
+        !options.is_empty(),
+        "CLI global option list should not be empty"
+    );
+    options
+}
+
+fn local_long_options_from_help(help: &str) -> BTreeSet<String> {
+    long_options_from_help(help)
+        .into_iter()
+        .filter(|option| !matches!(option.as_str(), "--state" | "--json" | "--config"))
+        .collect()
+}
+
+fn long_options_from_help(help: &str) -> BTreeSet<String> {
+    let mut in_options = false;
+    let mut options = BTreeSet::new();
+    for line in help.lines() {
+        if line == "Options:" {
+            in_options = true;
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || !trimmed.starts_with('-') {
+            continue;
+        }
+        for part in trimmed.split_whitespace() {
+            let option = part.trim_end_matches(',');
+            if matches!(option, "--help" | "--version") {
+                break;
+            }
+            if option.starts_with("--") {
+                options.insert(option.to_owned());
+                break;
+            }
+            if !option.starts_with('-') {
+                break;
+            }
+        }
+    }
+    options
+}
+
+fn possible_values_from_help(help: &str, argument: &str) -> BTreeSet<String> {
+    for line in help.lines() {
+        let line = line.trim_start();
+        if !line.starts_with(argument) {
+            continue;
+        }
+        let Some(values) = line
+            .split_once("[possible values: ")
+            .and_then(|(_, rest)| rest.split_once(']').map(|(values, _)| values))
+        else {
+            continue;
+        };
+        let values = values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !values.is_empty(),
+            "CLI help possible values for `{argument}` should not be empty"
+        );
+        return values;
+    }
+    panic!("CLI help should document possible values for `{argument}`");
+}
+
+fn commands_from_help(help: &str) -> BTreeSet<String> {
+    let mut in_commands = false;
+    let mut commands = BTreeSet::new();
+    for line in help.lines() {
+        if line == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        let Some(command) = line.split_whitespace().next() else {
+            continue;
+        };
+        if command != "help" {
+            commands.insert(command.to_owned());
+        }
+    }
+    assert!(
+        !commands.is_empty(),
+        "CLI help command list should not be empty"
+    );
+    commands
+}
+
 fn assert_schema_refs_resolve(schema: &Value) {
     let mut refs = Vec::new();
     collect_schema_refs(schema, &mut refs);
@@ -16045,6 +17790,133 @@ fn collect_schema_refs(value: &Value, refs: &mut Vec<String>) {
     }
 }
 
+fn assert_optional_bearer_security_declared(schema: &Value) {
+    assert_eq!(
+        schema["components"]["securitySchemes"]["bearerAuth"]["type"],
+        "http"
+    );
+    assert_eq!(
+        schema["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+        "bearer"
+    );
+    assert_eq!(
+        schema["security"],
+        serde_json::json!([{}, { "bearerAuth": [] }])
+    );
+}
+
+fn assert_component_schemas_are_reachable(schema: &Value) {
+    let schemas = schema["components"]["schemas"]
+        .as_object()
+        .expect("OpenAPI schemas");
+    let mut reachable = BTreeSet::new();
+    collect_reachable_component_schemas(&schema["paths"], schemas, &mut reachable);
+
+    let mut unreachable = schemas
+        .keys()
+        .filter(|schema_name| !reachable.contains(*schema_name))
+        .cloned()
+        .collect::<Vec<_>>();
+    unreachable.sort();
+    assert!(
+        unreachable.is_empty(),
+        "OpenAPI component schemas are not reachable from paths: {unreachable:?}"
+    );
+}
+
+fn collect_reachable_component_schemas(
+    value: &Value,
+    schemas: &serde_json::Map<String, Value>,
+    reachable: &mut BTreeSet<String>,
+) {
+    let mut refs = Vec::new();
+    collect_schema_refs(value, &mut refs);
+    for reference in refs {
+        let Some(schema_name) = reference.strip_prefix("#/components/schemas/") else {
+            continue;
+        };
+        if !reachable.insert(schema_name.to_owned()) {
+            continue;
+        }
+        let component = schemas
+            .get(schema_name)
+            .unwrap_or_else(|| panic!("missing OpenAPI schema component for {reference}"));
+        collect_reachable_component_schemas(component, schemas, reachable);
+    }
+}
+
+fn assert_operations_and_responses_have_descriptions(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for (method, operation) in operations {
+            if !matches!(method.as_str(), "get" | "post" | "delete" | "options") {
+                continue;
+            }
+            assert!(
+                operation["summary"]
+                    .as_str()
+                    .is_some_and(|summary| !summary.trim().is_empty()),
+                "{method} {path} missing operation summary"
+            );
+            let responses = operation["responses"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{method} {path} missing responses"));
+            for (status, response) in responses {
+                assert!(
+                    response["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{method} {path} response {status} missing response description"
+                );
+            }
+        }
+    }
+}
+
+fn assert_parameters_are_documented(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for (method, operation) in operations {
+            if !matches!(method.as_str(), "get" | "post" | "delete" | "options") {
+                continue;
+            }
+            let Some(parameters) = operation.get("parameters").and_then(Value::as_array) else {
+                continue;
+            };
+            for parameter in parameters {
+                let name = parameter["name"]
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| panic!("{method} {path} parameter missing name"));
+                let location = parameter["in"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} parameter {name} missing location"));
+                assert!(
+                    matches!(location, "path" | "query"),
+                    "{method} {path} parameter {name} has unsupported location {location}"
+                );
+                assert!(
+                    parameter["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{method} {path} parameter {name} missing description"
+                );
+                assert!(
+                    parameter["schema"].is_object(),
+                    "{method} {path} parameter {name} missing schema"
+                );
+                assert_eq!(
+                    parameter["required"].as_bool(),
+                    Some(location == "path"),
+                    "{method} {path} parameter {name} has incorrect required flag"
+                );
+            }
+        }
+    }
+}
+
 fn assert_path_parameters_declared(schema: &Value) {
     let paths = schema["paths"].as_object().expect("OpenAPI paths");
     for (path, endpoint) in paths {
@@ -16073,6 +17945,123 @@ fn assert_path_parameters_declared(schema: &Value) {
     }
 }
 
+fn assert_query_parameters_match_runtime_filters(schema: &Value) {
+    let expected = [
+        ("/events", &["limit", "kind", "since", "until", "query"][..]),
+        (
+            "/agents",
+            &[
+                "status",
+                "kind",
+                "capability",
+                "since",
+                "until",
+                "query",
+                "limit",
+            ][..],
+        ),
+        (
+            "/tasks",
+            &[
+                "status",
+                "priority",
+                "agent",
+                "tool",
+                "after",
+                "capability",
+                "since",
+                "until",
+                "query",
+                "limit",
+            ][..],
+        ),
+        (
+            "/workflows",
+            &["priority", "task", "since", "until", "query", "limit"][..],
+        ),
+        (
+            "/tools",
+            &["kind", "capability", "since", "until", "query", "limit"][..],
+        ),
+        ("/memory", &["query", "tag", "since", "until", "limit"][..]),
+        (
+            "/runs",
+            &[
+                "status", "task", "agent", "since", "until", "query", "limit",
+            ][..],
+        ),
+        ("/runs/{id}/logs", &["tail_bytes"][..]),
+        ("/runs/{id}/replay", &["tail_bytes"][..]),
+    ];
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let Some(operation) = endpoint.get("get") else {
+            continue;
+        };
+        let actual = query_parameter_names(operation);
+        let expected = expected
+            .iter()
+            .find_map(|(expected_path, parameters)| {
+                (*expected_path == path).then(|| {
+                    parameters
+                        .iter()
+                        .map(|parameter| (*parameter).to_owned())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "OpenAPI query parameters drifted for GET {path}"
+        );
+    }
+}
+
+fn query_parameter_names(operation: &Value) -> Vec<String> {
+    operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|parameter| parameter["in"].as_str() == Some("query"))
+        .map(|parameter| {
+            parameter["name"]
+                .as_str()
+                .expect("query parameter name")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_request_bodies_match_http_methods(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    let mut bodyless_posts = BTreeSet::new();
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for (method, operation) in operations {
+            if !matches!(method.as_str(), "get" | "post" | "delete" | "options") {
+                continue;
+            }
+            let has_request_body = operation.get("requestBody").is_some();
+            if method == "post" {
+                if !has_request_body {
+                    bodyless_posts.insert(path.to_owned());
+                }
+                continue;
+            }
+            assert!(
+                !has_request_body,
+                "{method} {path} should not declare a request body"
+            );
+        }
+    }
+
+    assert_eq!(
+        bodyless_posts,
+        BTreeSet::from(["/daemon/stop".to_owned(), "/runs/{id}/cancel".to_owned()])
+    );
+}
+
 fn assert_success_responses_have_json_schemas(schema: &Value) {
     let paths = schema["paths"].as_object().expect("OpenAPI paths");
     for (path, endpoint) in paths {
@@ -16093,6 +18082,52 @@ fn assert_success_responses_have_json_schemas(schema: &Value) {
                     "{method} {path} response {status} missing JSON schema"
                 );
             }
+        }
+    }
+}
+
+fn assert_error_responses_have_json_schemas(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for (method, operation) in operations {
+            if !matches!(method.as_str(), "get" | "post" | "delete") {
+                continue;
+            }
+            let responses = operation["responses"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{method} {path} missing responses"));
+            for (status, response) in responses {
+                if !matches!(status.as_bytes().first(), Some(b'4' | b'5')) {
+                    continue;
+                }
+                assert!(
+                    response["content"]["application/json"]["schema"].is_object(),
+                    "{method} {path} response {status} missing JSON error schema"
+                );
+            }
+        }
+    }
+}
+
+fn assert_mutation_operations_declare_unsupported_media_type(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for method in ["post", "delete"] {
+            let Some(operation) = operations.get(method) else {
+                continue;
+            };
+            let response = &operation["responses"]["415"];
+            assert_eq!(
+                response["description"], "Unsupported media type",
+                "{method} {path} missing unsupported media type response"
+            );
+            assert_eq!(
+                response["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse",
+                "{method} {path} 415 response should use ErrorResponse"
+            );
         }
     }
 }
@@ -16121,6 +18156,43 @@ fn assert_create_post_success_statuses(schema: &Value) {
     }
 }
 
+fn assert_content_uses_only_application_json(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for (method, operation) in operations {
+            if !matches!(method.as_str(), "get" | "post" | "delete" | "options") {
+                continue;
+            }
+            if let Some(request_body) = operation.get("requestBody") {
+                assert_content_media_types(
+                    &request_body["content"],
+                    &format!("{method} {path} request body"),
+                );
+            }
+            if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
+                for (status, response) in responses {
+                    assert_content_media_types(
+                        &response["content"],
+                        &format!("{method} {path} response {status}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assert_content_media_types(content: &Value, context: &str) {
+    let Some(content) = content.as_object() else {
+        return;
+    };
+    let media_types = content.keys().cloned().collect::<BTreeSet<_>>();
+    assert!(
+        media_types.is_empty() || media_types == BTreeSet::from(["application/json".to_owned()]),
+        "{context} advertises unsupported media types: {media_types:?}"
+    );
+}
+
 fn assert_json_content_entries_have_schemas(schema: &Value) {
     let paths = schema["paths"].as_object().expect("OpenAPI paths");
     for (path, endpoint) in paths {
@@ -16144,6 +18216,162 @@ fn assert_json_content_entries_have_schemas(schema: &Value) {
                 }
             }
         }
+    }
+}
+
+fn assert_request_body_requirements(schema: &Value) {
+    let paths = schema["paths"].as_object().expect("OpenAPI paths");
+    let mut actual = Vec::new();
+    for (path, endpoint) in paths {
+        let operations = endpoint.as_object().expect("OpenAPI path item");
+        for method in ["get", "post", "delete"] {
+            let Some(operation) = operations.get(method) else {
+                continue;
+            };
+            let Some(request_body) = operation.get("requestBody") else {
+                continue;
+            };
+            actual.push((
+                path.to_owned(),
+                method.to_owned(),
+                request_body["required"]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{method} {path} requestBody.required missing")),
+            ));
+        }
+    }
+    actual.sort();
+
+    let mut expected = [
+        ("/agents", "post", true),
+        ("/agents/{id}", "post", true),
+        ("/agents/{id}/claim", "post", false),
+        ("/agents/{id}/heartbeat", "post", false),
+        ("/config", "post", false),
+        ("/init", "post", false),
+        ("/memory", "post", true),
+        ("/memory/{id}", "post", true),
+        ("/run", "post", false),
+        ("/service/launchd", "post", false),
+        ("/service/launchd/install", "post", false),
+        ("/service/launchd/start", "post", false),
+        ("/service/launchd/status", "post", false),
+        ("/service/launchd/stop", "post", false),
+        ("/service/launchd/uninstall", "post", false),
+        ("/state/backup", "post", false),
+        ("/state/export", "post", true),
+        ("/state/import", "post", true),
+        ("/state/migrate", "post", false),
+        ("/state/prune", "post", false),
+        ("/state/repair", "post", false),
+        ("/tasks", "post", true),
+        ("/tasks/recover", "post", false),
+        ("/tasks/{id}", "post", true),
+        ("/tasks/{id}/assign", "post", true),
+        ("/tasks/{id}/block", "post", false),
+        ("/tasks/{id}/cancel", "post", false),
+        ("/tasks/{id}/complete", "post", false),
+        ("/tasks/{id}/dependencies", "post", true),
+        ("/tasks/{id}/fail", "post", false),
+        ("/tasks/{id}/plan", "post", true),
+        ("/tasks/{id}/priority", "post", true),
+        ("/tasks/{id}/retry", "post", false),
+        ("/tasks/{id}/unblock", "post", false),
+        ("/tools", "post", true),
+        ("/tools/{id}", "post", true),
+        ("/workflows", "post", true),
+        ("/workflows/{id}/cancel", "post", false),
+        ("/workflows/{id}/run", "post", false),
+    ]
+    .into_iter()
+    .map(|(path, method, required)| (path.to_owned(), method.to_owned(), required))
+    .collect::<Vec<_>>();
+    expected.sort();
+
+    assert_eq!(actual, expected);
+}
+
+fn assert_component_object_schemas_are_closed(schema: &Value) {
+    let schemas = schema["components"]["schemas"]
+        .as_object()
+        .expect("OpenAPI schemas");
+    for (schema_name, schema_value) in schemas {
+        if schema_name == "OpenApiDocument" {
+            assert_eq!(
+                schema_value["additionalProperties"], true,
+                "OpenApiDocument should remain an intentionally loose recursive schema"
+            );
+            continue;
+        }
+        if schema_value["type"] == "object" {
+            assert_eq!(
+                schema_value["additionalProperties"], false,
+                "{schema_name} should explicitly reject undeclared object properties"
+            );
+        }
+    }
+}
+
+fn assert_non_request_object_schemas_require_declared_properties(schema: &Value) {
+    let schemas = schema["components"]["schemas"]
+        .as_object()
+        .expect("OpenAPI schemas");
+    for (schema_name, schema_value) in schemas {
+        if schema_name == "ErrorResponse"
+            || schema_name == "OpenApiDocument"
+            || schema_name.ends_with("Request")
+            || schema_name.ends_with("Config")
+            || schema_value["type"] != "object"
+        {
+            continue;
+        }
+        let properties = schema_value["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} missing object properties"));
+        let mut property_names = properties.keys().cloned().collect::<Vec<_>>();
+        property_names.sort();
+        let mut required = schema_value["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{schema_name} missing required properties"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{schema_name} has non-string required property"))
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        required.sort();
+        assert_eq!(
+            required, property_names,
+            "{schema_name} should require every declared output property"
+        );
+    }
+}
+
+fn assert_array_schemas_declare_items(schema: &Value) {
+    assert_array_schemas_declare_items_in(schema, "$");
+}
+
+fn assert_array_schemas_declare_items_in(value: &Value, context: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("array") {
+                assert!(
+                    object.get("items").is_some_and(Value::is_object),
+                    "{context} declares an array schema without object items"
+                );
+            }
+            for (key, child) in object {
+                assert_array_schemas_declare_items_in(child, &format!("{context}.{key}"));
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                assert_array_schemas_declare_items_in(child, &format!("{context}[{index}]"));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -16172,11 +18400,51 @@ fn assert_operation_ids_present_and_unique(schema: &Value) {
             let operation_id = operation["operationId"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{method} {path} missing operationId"));
+            assert_eq!(
+                operation_id,
+                expected_operation_id(method, path),
+                "{method} {path} has non-standard operationId"
+            );
             assert!(
                 operation_ids.insert(operation_id.to_owned()),
                 "duplicate OpenAPI operationId {operation_id}"
             );
         }
+    }
+}
+
+fn expected_operation_id(method: &str, path: &str) -> String {
+    let mut operation_id = method.to_owned();
+    for segment in path.trim_matches('/').split('/') {
+        let segment = segment.trim_matches(|character| character == '{' || character == '}');
+        push_pascal_words_for_operation_id(&mut operation_id, segment);
+    }
+    operation_id
+}
+
+fn push_pascal_words_for_operation_id(operation_id: &mut String, segment: &str) {
+    let mut word = String::new();
+    for character in segment.chars() {
+        if character.is_ascii_alphanumeric() {
+            word.push(character);
+        } else if !word.is_empty() {
+            push_pascal_word_for_operation_id(operation_id, &word);
+            word.clear();
+        }
+    }
+    if !word.is_empty() {
+        push_pascal_word_for_operation_id(operation_id, &word);
+    }
+}
+
+fn push_pascal_word_for_operation_id(operation_id: &mut String, word: &str) {
+    let mut characters = word.chars();
+    let Some(first) = characters.next() else {
+        return;
+    };
+    operation_id.push(first.to_ascii_uppercase());
+    for character in characters {
+        operation_id.push(character.to_ascii_lowercase());
     }
 }
 
@@ -16186,10 +18454,17 @@ fn assert_operation_tags_present_and_declared(schema: &Value) {
         .expect("OpenAPI top-level tags")
         .iter()
         .map(|tag| {
-            tag["name"]
+            let name = tag["name"]
                 .as_str()
-                .unwrap_or_else(|| panic!("OpenAPI tag missing name: {tag:?}"))
-                .to_owned()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| panic!("OpenAPI tag missing name: {tag:?}"));
+            assert!(
+                tag["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "OpenAPI tag {name} missing description"
+            );
+            name.to_owned()
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert!(
@@ -16197,6 +18472,7 @@ fn assert_operation_tags_present_and_declared(schema: &Value) {
         "OpenAPI schema should declare top-level tags"
     );
 
+    let mut used_tags = std::collections::BTreeSet::new();
     let paths = schema["paths"].as_object().expect("OpenAPI paths");
     for (path, endpoint) in paths {
         let operations = endpoint.as_object().expect("OpenAPI path item");
@@ -16216,9 +18492,14 @@ fn assert_operation_tags_present_and_declared(schema: &Value) {
                     declared_tags.contains(tag),
                     "{method} {path} uses undeclared OpenAPI tag {tag}"
                 );
+                used_tags.insert(tag.to_owned());
             }
         }
     }
+    assert_eq!(
+        used_tags, declared_tags,
+        "OpenAPI top-level tags should all be used by operations"
+    );
 }
 
 fn assert_standard_response_headers_declared(schema: &Value) {
@@ -16235,10 +18516,18 @@ fn assert_standard_response_headers_declared(schema: &Value) {
             for (status, response) in responses {
                 for header in [
                     "Allow",
+                    "Cache-Control",
+                    "X-Content-Type-Options",
                     "Access-Control-Allow-Origin",
                     "Access-Control-Allow-Methods",
                     "Access-Control-Allow-Headers",
                 ] {
+                    assert!(
+                        response["headers"][header]["description"]
+                            .as_str()
+                            .is_some_and(|description| !description.trim().is_empty()),
+                        "{method} {path} response {status} missing {header} response header description"
+                    );
                     assert!(
                         response["headers"][header]["schema"].is_object(),
                         "{method} {path} response {status} missing {header} response header schema"

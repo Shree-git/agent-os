@@ -1,7 +1,7 @@
 use crate::models::{
     Agent, AgentId, AgentKind, AgentStatus, DaemonStatus, EventKind, OperatingSystem, Priority,
-    Task, TaskId, TaskStatus, ToolDefinition, ToolId, ToolInvocation, ToolKind, WorkflowId,
-    normalize_list,
+    RunStatus, Task, TaskId, TaskStatus, ToolDefinition, ToolId, ToolInvocation, ToolKind,
+    WorkflowId, normalize_list,
 };
 use crate::scheduler::{Assignment, Scheduler};
 use crate::tools::{validate_tool_invocation, validate_tool_template};
@@ -198,6 +198,34 @@ mod tests {
                 .iter()
                 .any(|event| event.message.contains("expired lease for agent"))
         );
+    }
+
+    #[test]
+    fn recovery_marks_active_runs_failed() {
+        let mut os = OperatingSystem::new("test");
+        let agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        let agent_id = agent.id.clone();
+        os.register_agent(agent);
+        let mut task = Task::new("Build", "build", Priority::Normal, vec!["rust".into()]);
+        let task_id = task.id.clone();
+        task.status = TaskStatus::Running;
+        task.assigned_to = Some(agent_id.clone());
+        os.create_task(task);
+        os.agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .current_tasks
+            .push(task_id.clone());
+        let run = RunRecord::new(task_id.clone(), Some(agent_id), "sleep 60", ".");
+        let run_id = run.id.clone();
+        os.runs.insert(run_id.clone(), run);
+
+        let recovered = Runtime::recover_stale_tasks(&mut os, Duration::zero());
+
+        assert_eq!(recovered, vec![task_id]);
+        let run = os.runs.get(&run_id).expect("run");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.finished_at.is_some());
     }
 
     #[test]
@@ -1459,14 +1487,23 @@ impl Runtime {
             .collect::<Vec<_>>();
 
         for task_id in &stale_task_ids {
+            let now = Utc::now();
             {
                 let Some(task) = os.tasks.get_mut(task_id) else {
                     continue;
                 };
                 task.status = TaskStatus::Pending;
-                task.output = Some(format!("recovered stale running task at {}", Utc::now()));
-                task.updated_at = Utc::now();
+                task.output = Some(format!("recovered stale running task at {now}"));
+                task.updated_at = now;
                 task.assigned_to.take();
+            }
+            for run in os.runs.values_mut().filter(|run| {
+                run.task_id == *task_id
+                    && matches!(run.status, RunStatus::Running | RunStatus::CancelRequested)
+            }) {
+                run.status = RunStatus::Failed;
+                run.exit_code = None;
+                run.finished_at = Some(now);
             }
             Self::release_task_from_all_agents(os, task_id);
 

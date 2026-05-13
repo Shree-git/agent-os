@@ -1,6 +1,6 @@
 use crate::models::{
-    AgentId, EventKind, OperatingSystem, Priority, RunId, RunRecord, RunStatus, Task, TaskId,
-    ToolId, ToolInvocation, ToolKind,
+    AgentId, EventKind, OperatingSystem, Policy, Priority, RunId, RunRecord, RunStatus, Task,
+    TaskId, ToolId, ToolInvocation, ToolKind,
 };
 use crate::policy::{PolicyError, check_file_write_path, check_shell_command, check_workspace};
 use crate::providers::{
@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+const LIVE_LOG_TRUNCATED_MARKER: &str = "\n[output truncated]\n";
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -84,10 +86,55 @@ struct PreparedFileRun {
 struct PreparedFileWriteRun {
     run: RunRecord,
     store: Store,
+    policy: Policy,
     path: PathBuf,
     redacted_path: String,
     body: String,
     max_output_bytes: usize,
+}
+
+struct LiveLog {
+    file: File,
+    body: String,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl LiveLog {
+    fn new(file: File, max_bytes: usize) -> Self {
+        Self {
+            file,
+            body: String::new(),
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    fn append(&mut self, text: &str) -> std::io::Result<()> {
+        if text.is_empty() || self.truncated {
+            return Ok(());
+        }
+        let remaining = self.max_bytes.saturating_sub(self.body.len());
+        let (text, truncated) = if text.len() <= remaining {
+            (text, false)
+        } else {
+            let mut end = remaining.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            (&text[..end], true)
+        };
+        if !text.is_empty() {
+            self.file.write_all(text.as_bytes())?;
+            self.body.push_str(text);
+        }
+        if truncated {
+            self.file.write_all(LIVE_LOG_TRUNCATED_MARKER.as_bytes())?;
+            self.body.push_str(LIVE_LOG_TRUNCATED_MARKER);
+            self.truncated = true;
+        }
+        self.file.flush()
+    }
 }
 
 struct FinishedRun {
@@ -541,6 +588,7 @@ fn prepare_file_work(
             Ok(PreparedWork::FileWrite(PreparedFileWriteRun {
                 run,
                 store: store.clone(),
+                policy: os.policy.clone(),
                 path,
                 redacted_path,
                 body,
@@ -569,7 +617,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
         })?;
     }
     let initial_log = format!("$ {}\n\n[stdout]\n", prepared.run.command);
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
@@ -578,17 +626,11 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
             task_id: prepared.run.task_id.clone(),
             source,
         })?;
-    file.write_all(initial_log.as_bytes())
-        .map_err(|source| ExecutorError::Io {
-            task_id: prepared.run.task_id.clone(),
-            source,
-        })?;
-    file.flush().map_err(|source| ExecutorError::Io {
+    let live_log = Arc::new(Mutex::new(LiveLog::new(file, prepared.max_output_bytes)));
+    append_live_log(&live_log, &initial_log).map_err(|source| ExecutorError::Io {
         task_id: prepared.run.task_id.clone(),
         source,
     })?;
-    let log_file = Arc::new(Mutex::new(file));
-    let log_body = Arc::new(Mutex::new(initial_log));
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -608,8 +650,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
     let stdout_reader = stdout.map(|stdout| {
         spawn_pipe_reader(
             stdout,
-            log_file.clone(),
-            log_body.clone(),
+            live_log.clone(),
             prepared.redacted_values.clone(),
             None,
         )
@@ -617,8 +658,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
     let stderr_reader = stderr.map(|stderr| {
         spawn_pipe_reader(
             stderr,
-            log_file.clone(),
-            log_body.clone(),
+            live_log.clone(),
             prepared.redacted_values.clone(),
             Some("\n[stderr]\n"),
         )
@@ -665,8 +705,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
 
     if timed_out {
         append_live_log(
-            &log_file,
-            &log_body,
+            &live_log,
             &format!(
                 "\n[timeout]\ncommand exceeded {} second(s)\n",
                 prepared.timeout.as_secs()
@@ -678,15 +717,12 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
         })?;
     }
     if cancelled {
-        append_live_log(
-            &log_file,
-            &log_body,
-            "\n[cancelled]\nrun cancellation requested\n",
-        )
-        .map_err(|source| ExecutorError::Io {
-            task_id: prepared.run.task_id.clone(),
-            source,
-        })?;
+        append_live_log(&live_log, "\n[cancelled]\nrun cancellation requested\n").map_err(
+            |source| ExecutorError::Io {
+                task_id: prepared.run.task_id.clone(),
+                source,
+            },
+        )?;
     }
 
     prepared.run.exit_code = if timed_out || cancelled {
@@ -702,7 +738,10 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
     } else {
         RunStatus::Failed
     };
-    let log = log_body.lock().map(|body| body.clone()).unwrap_or_default();
+    let log = live_log
+        .lock()
+        .map(|state| state.body.clone())
+        .unwrap_or_default();
 
     Ok(FinishedRun {
         run: prepared.run,
@@ -714,14 +753,13 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     mut reader: R,
-    log_file: Arc<Mutex<File>>,
-    log_body: Arc<Mutex<String>>,
+    live_log: Arc<Mutex<LiveLog>>,
     redacted_values: Vec<String>,
     header: Option<&'static str>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         if let Some(header) = header {
-            let _ = append_live_log(&log_file, &log_body, header);
+            let _ = append_live_log(&live_log, header);
         }
         let mut buffer = [0u8; 8192];
         loop {
@@ -733,22 +771,14 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             }
             let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
             let chunk = redact_values(chunk, &redacted_values);
-            let _ = append_live_log(&log_file, &log_body, &chunk);
+            let _ = append_live_log(&live_log, &chunk);
         }
     })
 }
 
-fn append_live_log(
-    log_file: &Arc<Mutex<File>>,
-    log_body: &Arc<Mutex<String>>,
-    text: &str,
-) -> std::io::Result<()> {
-    if let Ok(mut file) = log_file.lock() {
-        file.write_all(text.as_bytes())?;
-        file.flush()?;
-    }
-    if let Ok(mut body) = log_body.lock() {
-        body.push_str(text);
+fn append_live_log(live_log: &Arc<Mutex<LiveLog>>, text: &str) -> std::io::Result<()> {
+    if let Ok(mut state) = live_log.lock() {
+        state.append(text)?;
     }
     Ok(())
 }
@@ -830,7 +860,7 @@ fn execute_file_write(mut prepared: PreparedFileWriteRun) -> Result<FinishedRun,
     );
     prepared.store.validate_for_save(&preflight)?;
 
-    let result = write_file_tool_body(&prepared.path, prepared.body.as_bytes());
+    let result = write_file_tool_body(&prepared.policy, &prepared.path, prepared.body.as_bytes());
     let (status, exit_code, log) = match result {
         Ok(()) => (
             RunStatus::Success,
@@ -862,7 +892,8 @@ fn execute_file_write(mut prepared: PreparedFileWriteRun) -> Result<FinishedRun,
     })
 }
 
-fn write_file_tool_body(path: &Path, body: &[u8]) -> Result<(), StoreError> {
+fn write_file_tool_body(policy: &Policy, path: &Path, body: &[u8]) -> Result<(), ExecutorError> {
+    check_file_write_path(policy, path)?;
     let destination = match path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             path.canonicalize().map_err(|source| StoreError::Io {
@@ -872,7 +903,8 @@ fn write_file_tool_body(path: &Path, body: &[u8]) -> Result<(), StoreError> {
         }
         _ => path.to_path_buf(),
     };
-    Store::write_file_atomic(&destination, body)
+    Store::write_file_atomic(&destination, body)?;
+    Ok(())
 }
 
 fn build_task_environment(policy: &crate::models::Policy) -> Vec<(String, String)> {
@@ -905,7 +937,7 @@ fn redacted_environment_values(policy: &crate::models::Policy) -> Vec<String> {
 
 fn redact_values(mut value: String, redacted_values: &[String]) -> String {
     for secret in redacted_values {
-        if secret.len() >= 3 {
+        if !secret.is_empty() {
             value = value.replace(secret, "[redacted]");
         }
     }
@@ -999,62 +1031,71 @@ fn finish_run(
     let mut run = finished.run;
     let run_id = run.id.clone();
     let task_id = run.task_id.clone();
-    let mut candidate = os.clone();
-
-    if let Some(response) = &finished.response
-        && let Some(task) = candidate.tasks.get_mut(&task_id)
-    {
-        task.plan = response.plan.clone();
-    }
-
-    match run.status {
-        RunStatus::Success => {
-            let tool_calls = finished
-                .response
-                .as_ref()
-                .map(|response| response.tool_calls.clone())
-                .unwrap_or_default();
-            Runtime::complete_task(
-                &mut candidate,
-                &task_id,
-                Some(
-                    finished
-                        .response
-                        .as_ref()
-                        .map(|response| response.summary.clone())
-                        .unwrap_or_else(|| format!("run {} succeeded with exit code 0", run_id)),
-                ),
-            )?;
-            materialize_provider_tool_calls(&mut candidate, &task_id, &tool_calls);
-        }
-        RunStatus::Cancelled => {
-            Runtime::cancel_task(
-                &mut candidate,
-                &task_id,
-                Some(format!("run {} was cancelled", run_id)),
-            )?;
-        }
-        _ => {
-            let failure_message = finished.failure_message.unwrap_or_else(|| {
-                format!("run {} failed with exit code {:?}", run_id, run.exit_code)
-            });
-            Runtime::fail_task(&mut candidate, &task_id, Some(failure_message))?;
-        }
-    }
-
     let log_path = store.run_log_path(&run_id);
     run.log_path = Some(log_path.display().to_string());
-    candidate.runs.insert(run_id.clone(), run.clone());
-    candidate.record(
-        EventKind::RunFinished,
-        format!("finished run {} with status {}", run_id, run.status),
-    );
-    store.validate_for_save(&candidate)?;
-    store.write_run_log(&run_id, &finished.log)?;
-    store.save_validated(&candidate)?;
-    *os = candidate;
+    let log = finished.log;
+    let run_for_update = run.clone();
+    let response = finished.response;
+    let failure_message = finished.failure_message;
+    let (updated_run, updated_os) = store.update(|latest| {
+        if let Some(response) = &response
+            && let Some(task) = latest.tasks.get_mut(&task_id)
+        {
+            task.plan = response.plan.clone();
+        }
 
-    Ok(run)
+        match run_for_update.status {
+            RunStatus::Success => {
+                let tool_calls = response
+                    .as_ref()
+                    .map(|response| response.tool_calls.clone())
+                    .unwrap_or_default();
+                Runtime::complete_task(
+                    latest,
+                    &task_id,
+                    Some(
+                        response
+                            .as_ref()
+                            .map(|response| response.summary.clone())
+                            .unwrap_or_else(|| {
+                                format!("run {} succeeded with exit code 0", run_id)
+                            }),
+                    ),
+                )?;
+                materialize_provider_tool_calls(latest, &task_id, &tool_calls);
+            }
+            RunStatus::Cancelled => {
+                Runtime::cancel_task(
+                    latest,
+                    &task_id,
+                    Some(format!("run {} was cancelled", run_id)),
+                )?;
+            }
+            _ => {
+                let failure_message = failure_message.unwrap_or_else(|| {
+                    format!(
+                        "run {} failed with exit code {:?}",
+                        run_id, run_for_update.exit_code
+                    )
+                });
+                Runtime::fail_task(latest, &task_id, Some(failure_message))?;
+            }
+        }
+
+        latest.runs.insert(run_id.clone(), run_for_update.clone());
+        latest.record(
+            EventKind::RunFinished,
+            format!(
+                "finished run {} with status {}",
+                run_id, run_for_update.status
+            ),
+        );
+        Ok::<_, ExecutorError>((run_for_update.clone(), latest.clone()))
+    })?;
+    store.write_run_log(&run_id, &log)?;
+    *os = updated_os;
+
+    Ok(updated_run)
 }
 
 fn materialize_provider_tool_calls(
@@ -1250,7 +1291,8 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        OperatingSystem, Priority, ProviderKind, ProviderSettings, Task, TaskStatus, ToolDefinition,
+        MemoryRecord, OperatingSystem, Priority, ProviderKind, ProviderSettings, Task, TaskStatus,
+        ToolDefinition,
     };
     use std::collections::BTreeMap;
 
@@ -1434,15 +1476,66 @@ mod tests {
     }
 
     #[test]
+    fn finish_run_preserves_concurrent_state_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut scheduled_os = OperatingSystem::new("test");
+        let task = Task::new("Run", "run work", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        scheduled_os.create_task(task);
+        store.save(&scheduled_os).expect("save initial state");
+
+        store
+            .update(|latest| {
+                latest.write_memory(MemoryRecord::new(
+                    "operator-note",
+                    "created while run was active",
+                    vec![],
+                ));
+                Ok::<_, StoreError>(())
+            })
+            .expect("concurrent update");
+
+        let mut run = RunRecord::new(task_id.clone(), None, "printf ok", ".");
+        run.status = RunStatus::Success;
+        run.exit_code = Some(0);
+        run.finished_at = Some(Utc::now());
+
+        finish_run(
+            &mut scheduled_os,
+            &store,
+            FinishedRun {
+                run,
+                log: "ok".into(),
+                response: None,
+                failure_message: None,
+            },
+        )
+        .expect("finish run");
+
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.memory.len(), 1);
+        assert_eq!(loaded.memory[0].topic, "operator-note");
+        assert_eq!(
+            loaded.tasks.get(&task_id).expect("task").status,
+            TaskStatus::Complete
+        );
+        assert_eq!(loaded.runs.len(), 1);
+    }
+
+    #[test]
     fn file_write_rejects_invalid_state_without_writing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::new(dir.path().join("state.json"));
         let target = dir.path().join("workspace").join("note.txt");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("workspace");
         let mut os = OperatingSystem::new(" ");
         let task = Task::new("Write", "write file", Priority::Normal, vec![]);
         let task_id = task.id.clone();
         os.create_task(task);
-        store.save(&os).expect("save invalid state fixture");
+        store
+            .save_unchecked(&os)
+            .expect("save invalid state fixture");
 
         let run = RunRecord::new(
             task_id,
@@ -1454,6 +1547,10 @@ mod tests {
         let error = match execute_file_write(PreparedFileWriteRun {
             run,
             store,
+            policy: Policy {
+                allowed_workspaces: vec![dir.path().join("workspace").display().to_string()],
+                ..Policy::default()
+            },
             path: target.clone(),
             redacted_path: target.display().to_string(),
             body: "should not write".into(),
@@ -1475,6 +1572,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::new(dir.path().join("state.json"));
         let target = dir.path().join("workspace").join("note.txt");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("workspace");
         let os = OperatingSystem::new("agent-os");
         store.save_validated(&os).expect("save state");
 
@@ -1490,6 +1588,10 @@ mod tests {
         let error = match execute_file_write(PreparedFileWriteRun {
             run,
             store,
+            policy: Policy {
+                allowed_workspaces: vec![dir.path().join("workspace").display().to_string()],
+                ..Policy::default()
+            },
             path: target.clone(),
             redacted_path: target.display().to_string(),
             body: "should not write".into(),

@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "A local operating system for coordinating AI agents, tasks, memory, and execution events."
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/Shree-git/agent-os"
 documentation = "https://docs.rs/agent_os"
 keywords = ["agents", "automation", "scheduler", "local-first", "rust"]
 categories = ["command-line-utilities", "development-tools"]

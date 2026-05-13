@@ -47,6 +47,7 @@
 
 pub mod api;
 pub mod config;
+mod durable_io;
 pub mod executor;
 pub mod migrations;
 pub mod models;
@@ -76,9 +77,11 @@ pub use providers::{
 pub use runtime::{AgentUpdate, Runtime, RuntimeError, RuntimeReport, TaskUpdate, ToolUpdate};
 pub use scheduler::{Assignment, Scheduler};
 pub use service::{
-    DEFAULT_LAUNCHD_LABEL, LaunchctlCommandOutput, LaunchdService, LaunchdServiceOptions,
-    ServiceError, build_launchd_service, default_launchd_log_paths, default_launchd_plist_path,
-    resolve_launchd_domain, run_launchctl, validate_service_control_inputs, validate_service_label,
+    DEFAULT_LAUNCHD_LABEL, LaunchctlCommandOutput, LaunchdService, LaunchdServiceInstall,
+    LaunchdServiceOptions, LaunchdServiceUninstall, ServiceError, build_launchd_service,
+    default_launchd_log_paths, default_launchd_plist_path, install_launchd_service,
+    resolve_launchd_domain, run_launchctl, uninstall_launchd_service,
+    validate_service_control_inputs, validate_service_label,
 };
 pub use store::{PruneReport, Store, StoreError};
 pub use tools::{

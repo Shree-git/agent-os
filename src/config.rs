@@ -1,3 +1,4 @@
+use crate::durable_io;
 use crate::models::{
     Agent, AgentId, AgentKind, Policy, ProviderKind, ProviderSettings, ToolDefinition, ToolId,
     ToolKind, is_valid_env_var_name, is_valid_provider_endpoint, normalize_list,
@@ -5,10 +6,8 @@ use crate::models::{
 use crate::tools::validate_tool_template;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,9 +157,11 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<(), ConfigError>
         });
     }
     let body = toml::to_string_pretty(&AppConfig::default())?;
-    write_file_atomic_creating_parent(path, body.as_bytes()).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
+    durable_io::write_file_atomic_creating_parent(path, body.as_bytes()).map_err(|error| {
+        ConfigError::Io {
+            path: error.path,
+            source: error.source,
+        }
     })
 }
 
@@ -184,6 +185,9 @@ pub fn validate_seed_config(config: &AppConfig) -> Result<(), String> {
         && config.provider.endpoint.is_none()
     {
         return Err("provider endpoint is required for openai-compatible provider".into());
+    }
+    if config.provider.request_timeout_seconds == 0 {
+        return Err("provider request_timeout_seconds must be greater than 0".into());
     }
     if config.policy.max_output_bytes == 0 {
         return Err("policy max_output_bytes must be greater than 0".into());
@@ -346,30 +350,6 @@ fn validate_optional_text(field: &str, value: Option<&str>) -> Result<(), String
     Ok(())
 }
 
-fn write_file_atomic_creating_parent(path: &Path, body: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let temp_path = unique_temp_config_path(path);
-    let mut temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    if let Err(error) = temp_file.write_all(body) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    drop(temp_file);
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn temp_config_path(path: &Path) -> PathBuf {
     let mut extension = path
@@ -382,24 +362,6 @@ fn temp_config_path(path: &Path) -> PathBuf {
         extension.push(".tmp");
     }
     path.with_extension(extension)
-}
-
-fn unique_temp_config_path(path: &Path) -> PathBuf {
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "config".into());
-    let process_id = std::process::id();
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-
-    parent.join(format!(".{file_name}.{process_id}.{nanos}.{counter}.tmp"))
 }
 
 pub fn source_status(path: PathBuf) -> ConfigSource {

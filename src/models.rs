@@ -724,6 +724,8 @@ pub struct ProviderSettings {
     pub endpoint: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+    #[serde(default = "default_provider_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
 }
 
 impl Default for ProviderSettings {
@@ -733,6 +735,7 @@ impl Default for ProviderSettings {
             model: default_provider_model(),
             endpoint: None,
             api_key_env: default_api_key_env(),
+            request_timeout_seconds: default_provider_request_timeout_seconds(),
         }
     }
 }
@@ -747,6 +750,10 @@ fn default_provider_model() -> String {
 
 fn default_api_key_env() -> String {
     "OPENAI_API_KEY".into()
+}
+
+fn default_provider_request_timeout_seconds() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

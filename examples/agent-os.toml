@@ -1,0 +1,39 @@
+name = "Agent OS Example"
+
+[policy]
+allow_shell = true
+allowed_commands = ["cargo test", "cargo clippy --all-targets"]
+allowed_workspaces = ["."]
+denied_patterns = ["rm -rf", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+max_output_bytes = 131072
+command_timeout_seconds = 300
+inherit_environment = false
+allowed_env_vars = ["PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "RUSTUP_HOME", "CARGO_HOME"]
+redacted_env_patterns = ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"]
+
+[provider]
+kind = "mock"
+model = "mock-agent"
+request_timeout_seconds = 30
+
+[[agents]]
+name = "builder"
+kind = "builder"
+model = "local-default"
+capabilities = ["code", "rust", "test"]
+parallel = 2
+
+[[tools]]
+name = "cargo-test"
+kind = "shell"
+description = "Run the Rust test suite"
+required_capabilities = ["rust", "test"]
+command_template = "cargo test"
+
+[[tools]]
+name = "cargo-clippy"
+kind = "shell"
+description = "Run clippy across all targets"
+required_capabilities = ["rust", "review"]
+command_template = "cargo clippy --all-targets"
+

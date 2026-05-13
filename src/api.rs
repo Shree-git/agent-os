@@ -13,7 +13,8 @@ use crate::runtime::{AgentUpdate, Runtime, RuntimeError, TaskUpdate, ToolUpdate}
 use crate::scheduler::Scheduler;
 use crate::service::{
     LaunchdServiceOptions, ServiceError, build_launchd_service as build_launchd_service_definition,
-    default_launchd_plist_path, resolve_launchd_domain, run_launchctl,
+    default_launchd_plist_path, install_launchd_service as install_launchd_service_definition,
+    resolve_launchd_domain, run_launchctl, uninstall_launchd_service,
     validate_service_control_inputs,
 };
 use crate::store::{Store, StoreError};
@@ -25,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::thread;
 use thiserror::Error;
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -38,6 +40,8 @@ pub enum ApiError {
     Store(#[from] StoreError),
     #[error("invalid bind address: {0}")]
     InvalidAddress(String),
+    #[error("api worker panicked")]
+    WorkerPanicked,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +72,13 @@ pub struct ApiServer {
     store: Store,
     listener: TcpListener,
     max_requests: Option<usize>,
+    bearer_token: Option<String>,
+    config_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct ApiHandler {
+    store: Store,
     bearer_token: Option<String>,
     config_path: Option<PathBuf>,
 }
@@ -112,9 +123,19 @@ impl ApiServer {
     }
 
     pub fn serve(&self) -> Result<(), ApiError> {
+        let handler = ApiHandler {
+            store: self.store.clone(),
+            bearer_token: self.bearer_token.clone(),
+            config_path: self.config_path.clone(),
+        };
+        let mut handles = Vec::new();
         for (index, stream) in self.listener.incoming().enumerate() {
             let stream = stream?;
-            self.handle_stream(stream)?;
+            let handler = handler.clone();
+            let handle = thread::spawn(move || handler.handle_stream(stream));
+            if self.max_requests.is_some() {
+                handles.push(handle);
+            }
             if self
                 .max_requests
                 .map(|max_requests| index + 1 >= max_requests)
@@ -123,9 +144,14 @@ impl ApiServer {
                 break;
             }
         }
+        for handle in handles {
+            handle.join().map_err(|_| ApiError::WorkerPanicked)??;
+        }
         Ok(())
     }
+}
 
+impl ApiHandler {
     fn handle_stream(&self, mut stream: TcpStream) -> Result<(), ApiError> {
         let request = match read_http_request(&mut stream) {
             Ok(request) => request,
@@ -191,13 +217,16 @@ impl ApiServer {
                 ),
             }
         } else if matches!(method, "POST" | "DELETE") {
-            response_for_mutation_with_context(
-                &self.store,
-                self.config_path.as_deref(),
-                method,
-                path,
-                &request.body,
-            )
+            match validate_mutation_content_type(method, &request.headers, &request.body) {
+                Ok(()) => response_for_mutation_with_context(
+                    &self.store,
+                    self.config_path.as_deref(),
+                    method,
+                    path,
+                    &request.body,
+                ),
+                Err(response) => response,
+            }
         } else {
             (
                 "405 Method Not Allowed",
@@ -310,6 +339,50 @@ fn parse_content_length(headers: &str) -> Result<usize, HttpRequestError> {
     Ok(parsed.unwrap_or(0))
 }
 
+fn validate_mutation_content_type(
+    method: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<(), (&'static str, String)> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let Some(content_type) = header_value(headers, "content-type") else {
+        return Err(unsupported_media_type_response(
+            method,
+            "missing content-type",
+        ));
+    };
+    let media_type = content_type
+        .split_once(';')
+        .map(|(media_type, _)| media_type)
+        .unwrap_or(content_type)
+        .trim();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        return Ok(());
+    }
+    Err(unsupported_media_type_response(method, content_type.trim()))
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn unsupported_media_type_response(method: &str, content_type: &str) -> (&'static str, String) {
+    (
+        "415 Unsupported Media Type",
+        json!({
+            "error": "unsupported media type",
+            "method": method,
+            "detail": format!("mutation request bodies must use application/json; got {content_type}"),
+        })
+        .to_string(),
+    )
+}
+
 fn parse_http_request_line(line: Option<&str>) -> Result<(&str, &str), HttpRequestError> {
     let line = line.ok_or(HttpRequestError::MissingRequestLine)?;
     let parts = line.split_whitespace().collect::<Vec<_>>();
@@ -366,7 +439,7 @@ fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> Resu
         ""
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nallow: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-origin: *\r\naccess-control-allow-methods: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-headers: authorization, content-type\r\n{auth_challenge}content-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncache-control: no-store\r\nx-content-type-options: nosniff\r\nallow: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-origin: *\r\naccess-control-allow-methods: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-headers: authorization, content-type\r\n{auth_challenge}content-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1764,12 +1837,16 @@ impl Default for PruneStateRequest {
 struct BackupStateRequest {
     #[serde(default)]
     output: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportStateRequest {
     output: String,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -1778,6 +1855,8 @@ struct ImportStateRequest {
     path: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1787,6 +1866,8 @@ struct MigrateStateRequest {
     input: Option<String>,
     #[serde(default)]
     output: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -3279,10 +3360,15 @@ fn backup_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, St
         Some(output) => std::path::PathBuf::from(output),
         None => store.default_backup_path(),
     };
-    let backup = store.backup_to_path(&output)?;
+    let backup = if request.dry_run {
+        store.preview_backup_to_path(&output)?
+    } else {
+        store.backup_to_path(&output)?
+    };
     Ok((
         "200 OK",
         json!({
+            "dry_run": request.dry_run,
             "backup": backup,
         })
         .to_string(),
@@ -3298,10 +3384,15 @@ fn export_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, St
         return Ok(invalid_text_response("output", "output must not be empty"));
     }
     let output = std::path::PathBuf::from(request.output);
-    let exported = store.export_to_path(&output)?;
+    let exported = if request.dry_run {
+        store.preview_export_to_path(&output)?
+    } else {
+        store.export_to_path(&output)?
+    };
     Ok((
         "200 OK",
         json!({
+            "dry_run": request.dry_run,
             "exported": exported,
         })
         .to_string(),
@@ -3320,10 +3411,15 @@ fn import_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, St
         ));
     }
     let path = std::path::PathBuf::from(request.path);
-    let (_os, validation) = store.import_from_path_checked(&path, request.force)?;
+    let (_os, validation) = if request.dry_run {
+        store.preview_import_from_path_checked(&path, request.force)?
+    } else {
+        store.import_from_path_checked(&path, request.force)?
+    };
     Ok((
         "200 OK",
         json!({
+            "dry_run": request.dry_run,
             "imported": path,
             "state_path": store.path(),
             "validation": validation,
@@ -3354,10 +3450,15 @@ fn migrate_state_response(
         Some(output) => std::path::PathBuf::from(output),
         None => store.path().to_path_buf(),
     };
-    let (migration, validation) = store.migrate_path_to(&input, &output)?;
+    let (migration, validation) = if request.dry_run {
+        store.preview_migrate_path(&input)?
+    } else {
+        store.migrate_path_to(&input, &output)?
+    };
     Ok((
         "200 OK",
         json!({
+            "dry_run": request.dry_run,
             "input": input,
             "output": output,
             "migration": migration,
@@ -3491,18 +3592,17 @@ fn install_launchd_service_response(
         no_logs: request.no_logs,
         plist_path: request.plist_path,
     };
-    let (service, plist_path) = match build_launchd_service_definition(store.path(), options) {
-        Ok(service) => service,
+    let installation = match install_launchd_service_definition(store.path(), options) {
+        Ok(installation) => installation,
         Err(error) => return Ok(service_error_response(error)),
     };
-    Store::write_file_atomic(&plist_path, service.render_plist().as_bytes())?;
     Ok((
         "200 OK",
         json!({
             "platform": "launchd",
-            "installed": true,
-            "plist_path": plist_path,
-            "service": service,
+            "installed": installation.installed,
+            "plist_path": installation.plist_path,
+            "service": installation.service,
         })
         .to_string(),
     ))
@@ -3513,40 +3613,16 @@ fn uninstall_launchd_service_response(body: &[u8]) -> Result<(&'static str, Stri
         Ok(request) => request,
         Err(response) => return Ok(response),
     };
-    if let Err(error) = crate::service::validate_service_label(&request.label) {
-        return Ok(service_error_response(error));
-    }
-    if let Err(error) =
-        crate::service::validate_optional_path("plist_path", request.plist_path.as_deref())
-    {
-        return Ok(service_error_response(error));
-    }
-    let plist_path = request
-        .plist_path
-        .unwrap_or_else(|| default_launchd_plist_path(&request.label));
-    let removed = if plist_path.exists() {
-        match std::fs::remove_file(&plist_path) {
-            Ok(()) => true,
-            Err(error) => {
-                return Ok((
-                    "500 Internal Server Error",
-                    json!({
-                        "error": "service unavailable",
-                        "detail": format!("could not remove {}: {error}", plist_path.display()),
-                    })
-                    .to_string(),
-                ));
-            }
-        }
-    } else {
-        false
+    let removal = match uninstall_launchd_service(&request.label, request.plist_path) {
+        Ok(removal) => removal,
+        Err(error) => return Ok(service_error_response(error)),
     };
     Ok((
         "200 OK",
         json!({
             "platform": "launchd",
-            "removed": removed,
-            "plist_path": plist_path,
+            "removed": removal.removed,
+            "plist_path": removal.plist_path,
         })
         .to_string(),
     ))
@@ -3707,6 +3783,7 @@ fn launchctl_failure_response(
 fn service_error_response(error: ServiceError) -> (&'static str, String) {
     let status = match &error {
         ServiceError::CurrentExe { .. }
+        | ServiceError::Io { .. }
         | ServiceError::CommandIo { .. }
         | ServiceError::DomainIo { .. }
         | ServiceError::EmptyDomainUid
@@ -4689,6 +4766,9 @@ fn add_common_error_responses(schema: &mut serde_json::Value) {
             add_response_if_missing(operation, "405", "Method not allowed");
             add_response_if_missing(operation, "431", "Request headers too large");
             add_response_if_missing(operation, "500", "Server error");
+            if matches!(method, "post" | "delete") {
+                add_response_if_missing(operation, "415", "Unsupported media type");
+            }
             if method == "post" {
                 add_response_if_missing(operation, "413", "Request body too large");
             }
@@ -4743,6 +4823,20 @@ fn standard_response_headers() -> serde_json::Value {
             "schema": {
                 "type": "string",
                 "example": "GET, POST, DELETE, OPTIONS"
+            }
+        },
+        "Cache-Control": {
+            "description": "Cache policy for local API responses that may include operational state or logs.",
+            "schema": {
+                "type": "string",
+                "example": "no-store"
+            }
+        },
+        "X-Content-Type-Options": {
+            "description": "Browser content sniffing protection for JSON API responses.",
+            "schema": {
+                "type": "string",
+                "example": "nosniff"
             }
         },
         "Access-Control-Allow-Origin": {
@@ -5069,7 +5163,8 @@ fn add_backup_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         json!({
             "type": "object",
             "properties": {
-                "output": non_empty_string("Optional backup destination path.")
+                "output": non_empty_string("Optional backup destination path."),
+                "dry_run": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -5078,8 +5173,9 @@ fn add_backup_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         "BackupStateResponse".into(),
         json!({
             "type": "object",
-            "required": ["backup"],
+            "required": ["dry_run", "backup"],
             "properties": {
+                "dry_run": { "type": "boolean" },
                 "backup": { "type": "string" }
             },
             "additionalProperties": false
@@ -5094,7 +5190,8 @@ fn add_export_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
             "type": "object",
             "required": ["output"],
             "properties": {
-                "output": non_empty_string("Export destination path.")
+                "output": non_empty_string("Export destination path."),
+                "dry_run": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -5103,8 +5200,9 @@ fn add_export_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         "ExportStateResponse".into(),
         json!({
             "type": "object",
-            "required": ["exported"],
+            "required": ["dry_run", "exported"],
             "properties": {
+                "dry_run": { "type": "boolean" },
                 "exported": { "type": "string" }
             },
             "additionalProperties": false
@@ -5120,7 +5218,8 @@ fn add_import_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
             "required": ["path"],
             "properties": {
                 "path": non_empty_string("State JSON file to import."),
-                "force": { "type": "boolean", "default": false }
+                "force": { "type": "boolean", "default": false },
+                "dry_run": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -5129,8 +5228,9 @@ fn add_import_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         "ImportStateResponse".into(),
         json!({
             "type": "object",
-            "required": ["imported", "state_path", "validation"],
+            "required": ["dry_run", "imported", "state_path", "validation"],
             "properties": {
+                "dry_run": { "type": "boolean" },
                 "imported": { "type": "string" },
                 "state_path": { "type": "string" },
                 "validation": schema_ref("ValidationReport")
@@ -5147,7 +5247,8 @@ fn add_migration_schemas(schemas: &mut serde_json::Map<String, serde_json::Value
             "type": "object",
             "properties": {
                 "input": non_empty_string("Optional source state JSON path. Defaults to the active state path."),
-                "output": non_empty_string("Optional migrated state JSON path. Defaults to the active state path.")
+                "output": non_empty_string("Optional migrated state JSON path. Defaults to the active state path."),
+                "dry_run": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -5170,8 +5271,9 @@ fn add_migration_schemas(schemas: &mut serde_json::Map<String, serde_json::Value
         "MigrateStateResponse".into(),
         json!({
             "type": "object",
-            "required": ["input", "output", "migration", "validation"],
+            "required": ["dry_run", "input", "output", "migration", "validation"],
             "properties": {
+                "dry_run": { "type": "boolean" },
                 "input": { "type": "string" },
                 "output": { "type": "string" },
                 "migration": schema_ref("MigrationReport"),
@@ -6426,7 +6528,7 @@ fn policy_schema() -> serde_json::Value {
 fn provider_settings_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "required": ["kind", "model", "endpoint", "api_key_env"],
+        "required": ["kind", "model", "endpoint", "api_key_env", "request_timeout_seconds"],
         "properties": {
             "kind": {
                 "type": "string",
@@ -6443,6 +6545,11 @@ fn provider_settings_schema() -> serde_json::Value {
                 "type": "string",
                 "default": "OPENAI_API_KEY",
                 "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "request_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 30
             }
         },
         "additionalProperties": false
@@ -9844,7 +9951,7 @@ mod tests {
         let memory = MemoryRecord::new("Ops", "Tag maintenance", vec!["ops".into()]);
         let memory_id = memory.id.clone();
         os.write_memory(memory);
-        store.save(&os).expect("save state");
+        store.save_unchecked(&os).expect("save state");
 
         let (status, body) = response_for_mutation(
             &store,
@@ -9895,7 +10002,7 @@ mod tests {
         );
         let tool_id = tool.id.clone();
         os.register_tool(tool);
-        store.save(&os).expect("save state");
+        store.save_unchecked(&os).expect("save state");
 
         let (status, body) = response_for_mutation(
             &store,
@@ -10094,7 +10201,7 @@ mod tests {
         let store = Store::new(dir.path().join("state.json"));
         let mut os = OperatingSystem::new("api-test");
         os.name = " ".into();
-        store.save(&os).expect("save invalid state");
+        store.save_unchecked(&os).expect("save invalid state");
 
         let (status, body) = response_for_mutation(
             &store,
@@ -10170,7 +10277,16 @@ mod tests {
         let task = Task::new("Task", "Objective", Priority::Normal, vec![]);
         let task_id = task.id.clone();
         os.create_task(task);
-        store.save(&os).expect("save");
+        let failed_task = Task::new("Fail task", "Objective", Priority::Normal, vec![]);
+        let failed_task_id = failed_task.id.clone();
+        os.create_task(failed_task);
+        let blocked_task = Task::new("Block task", "Objective", Priority::Normal, vec![]);
+        let blocked_task_id = blocked_task.id.clone();
+        os.create_task(blocked_task);
+        let cancelled_task = Task::new("Cancel task", "Objective", Priority::Normal, vec![]);
+        let cancelled_task_id = cancelled_task.id.clone();
+        os.create_task(cancelled_task);
+        store.save_unchecked(&os).expect("save");
 
         let (heartbeat_status, heartbeat_body) = response_for_mutation(
             &store,
@@ -10188,6 +10304,41 @@ mod tests {
         assert_eq!(complete_status, "200 OK");
         assert_eq!(complete["task"]["status"], "complete");
         assert_eq!(complete["task"]["output"], serde_json::Value::Null);
+
+        for (task_id, endpoint, status) in [
+            (&failed_task_id, "fail", TaskStatus::Failed),
+            (&blocked_task_id, "block", TaskStatus::Blocked),
+            (&cancelled_task_id, "cancel", TaskStatus::Cancelled),
+        ] {
+            let (mutation_status, mutation_body) =
+                response_for_mutation(&store, "POST", &format!("/tasks/{task_id}/{endpoint}"), b"");
+            let mutation: serde_json::Value = serde_json::from_str(&mutation_body).expect("json");
+            assert_eq!(mutation_status, "200 OK");
+            assert_eq!(mutation["task"]["status"], status.to_string());
+            assert_eq!(mutation["task"]["output"], serde_json::Value::Null);
+        }
+
+        let (retry_status, retry_body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/tasks/{failed_task_id}/retry"),
+            b"",
+        );
+        let retry: serde_json::Value = serde_json::from_str(&retry_body).expect("json");
+        assert_eq!(retry_status, "200 OK");
+        assert_eq!(retry["task"]["status"], "pending");
+        assert_eq!(retry["task"]["output"], serde_json::Value::Null);
+
+        let (unblock_status, unblock_body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/tasks/{blocked_task_id}/unblock"),
+            b"",
+        );
+        let unblock: serde_json::Value = serde_json::from_str(&unblock_body).expect("json");
+        assert_eq!(unblock_status, "200 OK");
+        assert_eq!(unblock["task"]["status"], "pending");
+        assert_eq!(unblock["task"]["output"], serde_json::Value::Null);
     }
 
     #[test]
@@ -10230,7 +10381,7 @@ mod tests {
             Priority::Normal,
             vec!["rust".into()],
         ));
-        store.save(&os).expect("save state");
+        store.save_unchecked(&os).expect("save state");
 
         let (status, body) =
             response_for_mutation(&store, "POST", &format!("/agents/{agent_id}/claim"), b"");
@@ -10258,7 +10409,7 @@ mod tests {
         run.finished_at = Some(chrono::Utc::now());
         run.exit_code = Some(0);
         os.runs.insert(run_id.clone(), run);
-        store.save(&os).expect("save");
+        store.save_unchecked(&os).expect("save");
 
         let (status, body) =
             cancel_run_response(&store, &run_id.to_string()).expect("cancel response");

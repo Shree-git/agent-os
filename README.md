@@ -1,9 +1,35 @@
 # Agent OS
 
-Agent OS is a local operating system for coordinating AI agents. It gives a team of agents a durable registry, prioritized task queue, capability-aware scheduler, shared memory, and event stream.
+[![CI](https://github.com/Shree-git/agent-os/actions/workflows/ci.yml/badge.svg)](https://github.com/Shree-git/agent-os/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/rust-1.85%2B-93450a)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Local First](https://img.shields.io/badge/local--first-agent%20runtime-2f6f4e)
 
-The implementation is intentionally local-first: state is a single JSON file, the Rust library owns the runtime behavior, and the CLI is a thin control surface over that runtime.
-State reads and writes use a sidecar lock file so CLI commands, daemon ticks, and local API readers can coordinate safely around the same JSON state.
+Agent OS is a local-first control plane for AI agents. It gives builders the durable runtime pieces that most agent projects eventually have to invent: task queues, agent registry, capability-aware scheduling, shared memory, tool execution, policy checks, run logs, daemon execution, and a local HTTP API.
+
+Use Agent OS when you want to build an agent CLI, dashboard, automation daemon, coding worker, or Hermes-style autonomous system without starting from an empty prompt loop and a pile of glue code.
+
+## Why Agent OS
+
+Most agent frameworks help define agent behavior. Agent OS focuses on the operational layer underneath:
+
+- Durable local state for agents, tasks, workflows, tools, memory, events, daemon status, and run history.
+- A single portable state directory instead of a required database, broker, or hosted service.
+- A CLI for operators and a JSON API for dashboards, workers, and integrations.
+- Policy-aware shell and file-tool execution with workspace checks, redaction, cancellation, replay, and logs.
+- Deterministic mock-provider mode for offline development plus an OpenAI-compatible provider boundary for real LLM work.
+- Rust-native packaging with a small binary and a library API for embedding the runtime.
+
+Agent OS is not a chat UI or a hosted agent platform. It is the local runtime you can build those systems on.
+
+## What You Can Build
+
+- A project-local coding agent queue that runs tests, reviews, migrations, or release checks.
+- A dashboard for long-running agent work with live status, logs, metrics, and replay.
+- A self-hosted automation daemon for recurring maintenance tasks.
+- A multi-agent worker backend with capability routing and task leases.
+- A safe tool execution layer for LLM apps that need auditability and recovery.
+- A Hermes-like autonomous agent experience with Agent OS as the scheduler, memory, and execution backend.
 
 ## Installation
 
@@ -25,24 +51,73 @@ For development, `cargo run -- ...` works without installing the binary. The cra
 
 ## Quick Start
 
-```bash
-cargo run -- config init
-cargo run -- init --name "Infinite Agent OS"
-cargo run -- status
-cargo run -- doctor
-cargo run -- agent list
-cargo run -- task create "Build execution kernel" --need rust,code --priority high --command "cargo test"
-cargo run -- run --limit 2 --execute
-cargo run -- runs list
-cargo run -- task list
-cargo run -- api serve --addr 127.0.0.1:7373
-```
-
-Use `--state ./sandbox` to keep state inside a project directory. Global `--state` and `--config` paths, plus `AGENT_OS_HOME` and `AGENT_OS_CONFIG`, must not be empty:
+Use `--state ./sandbox` while learning so state and logs stay inside the checkout:
 
 ```bash
-cargo run -- --state ./sandbox init --force
+cargo run -- --state ./sandbox config init
+cargo run -- --state ./sandbox init --name "Local Agent OS"
+cargo run -- --state ./sandbox agent add builder --kind builder --cap rust --cap test --parallel 2
+cargo run -- --state ./sandbox task create "Run Rust tests" --need rust --need test --command "cargo test"
+cargo run -- --state ./sandbox run --limit 1 --execute
+cargo run -- --state ./sandbox runs list
 ```
+
+Inspect a run:
+
+```bash
+cargo run -- --state ./sandbox runs logs RUN_ID
+cargo run -- --state ./sandbox runs replay RUN_ID
+```
+
+Run the local API:
+
+```bash
+export AGENT_OS_API_TOKEN=dev-token
+cargo run -- --state ./sandbox api serve --addr 127.0.0.1:7373 --token-env AGENT_OS_API_TOKEN
+```
+
+Then query it from another terminal:
+
+```bash
+curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/status
+```
+
+After installation, use `agent-os` directly instead of `cargo run --`.
+
+Global `--state` and `--config` paths, plus `AGENT_OS_HOME` and `AGENT_OS_CONFIG`, must not be empty. Add `--json` to read commands and supported create/update commands when another program needs stable output.
+
+## Build With Agent OS
+
+The fastest way to integrate Agent OS is to treat it as a local backend:
+
+1. Create a project-local state directory such as `.agent-os`.
+2. Register agents with the capabilities your worker process can handle.
+3. Register reusable tools for commands or file operations.
+4. Queue tasks through the CLI or `POST /tasks`.
+5. Run work with `agent-os run --execute`, `agent-os daemon run --execute`, or a launchd service.
+6. Read status, metrics, logs, and replay data from the CLI or HTTP API.
+
+See [Building With Agent OS](docs/BUILDING_WITH_AGENT_OS.md), [Architecture](docs/ARCHITECTURE.md), [Examples](examples/README.md), and the [Public Release Checklist](docs/PUBLIC_RELEASE_CHECKLIST.md) for copyable integration patterns and repository launch steps.
+
+## End-to-End Smoke Workflow
+
+This path exercises the core operator loop across durable state, memory, workflows, API, daemon execution, tools, and run logs:
+
+```bash
+agent-os --state ./sandbox init --force
+agent-os --state ./sandbox memory add release-context "Use the durable workflow smoke path." --tag release
+agent-os --state ./sandbox tool add write-handoff --kind file-write --need rust --cwd ./workspace --command-template "{name}.txt"
+agent-os --state ./sandbox --json workflow create "Prove planner builder reviewer release loop" --execute
+agent-os --state ./sandbox api serve --addr 127.0.0.1:7373 --token-env AGENT_OS_API_TOKEN
+curl -H "Authorization: Bearer $AGENT_OS_API_TOKEN" http://127.0.0.1:7373/memory?query=release-context
+curl -H "Authorization: Bearer $AGENT_OS_API_TOKEN" -H "Content-Type: application/json" -d '{"all":true}' http://127.0.0.1:7373/workflows/WORKFLOW_ID/run
+agent-os --state ./sandbox task create "Write daemon handoff" --need rust --tool write-handoff --arg name=handoff --arg body=daemon-note
+agent-os --state ./sandbox daemon run --execute --limit 1 --interval-ms 10 --max-ticks 2
+agent-os --state ./sandbox runs logs RUN_ID
+agent-os --state ./sandbox runs replay RUN_ID
+```
+
+Use the IDs returned by the JSON commands for `WORKFLOW_ID` and `RUN_ID`. The matching integration test is `end_to_end_operator_workflow_covers_cli_api_daemon_tools_memory_and_run_logs`.
 
 ## Commands
 
@@ -54,10 +129,10 @@ agent-os doctor
 agent-os config init [--force]
 agent-os config show
 agent-os config validate
-agent-os state export [--output PATH]
-agent-os state import PATH [--force]
-agent-os state backup [--output PATH]
-agent-os state migrate [--input PATH] [--output PATH]
+agent-os state export [--output PATH] [--dry-run]
+agent-os state import PATH [--force] [--dry-run]
+agent-os state backup [--output PATH] [--dry-run]
+agent-os state migrate [--input PATH] [--output PATH] [--dry-run]
 agent-os state prune [--keep-runs 100] [--keep-events 500] [--dry-run]
 agent-os state repair [--dry-run]
 agent-os state validate
@@ -112,7 +187,7 @@ agent-os service start [--label LABEL] [--plist-path PATH] [--domain DOMAIN] [--
 agent-os service stop [--label LABEL] [--plist-path PATH] [--domain DOMAIN] [--launchctl-path PATH]
 agent-os service status [--label LABEL] [--domain DOMAIN] [--launchctl-path PATH]
 agent-os completions bash|elvish|fish|powershell|zsh
-agent-os api serve [--addr 127.0.0.1:7373] [--token-env ENV] [--max-requests N]
+agent-os api serve [--addr 127.0.0.1:7373] [--token-env ENV] [--unsafe-no-token] [--max-requests N]
 agent-os api schema
 agent-os workflow create OBJECTIVE [--priority low|normal|high|critical|urgent] [--execute]
 agent-os workflow list [--priority low|normal|high|critical|urgent] [--task TASK_ID] [--since RFC3339] [--until RFC3339] [--query TEXT] [--limit N]
@@ -203,9 +278,9 @@ DELETE /memory/MEMORY_ID
 GET /openapi.json
 ```
 
-Use `api serve --token-env AGENT_OS_API_TOKEN` to require `Authorization: Bearer <token>` on API requests. This is strongly recommended when enabling mutating endpoints.
-Use `api schema` or `GET /openapi.json` to inspect the supported API contract, including mutation request bodies, validation constraints, stable operation IDs, endpoint tags, CORS headers, and standard error responses. The schema endpoint remains available for client discovery even when state is unavailable.
-API mutation bodies reject unknown fields so misspelled request keys fail early.
+Use `api serve --token-env AGENT_OS_API_TOKEN` to require `Authorization: Bearer <token>` on API requests. Non-loopback binds require `--token-env` unless `--unsafe-no-token` is passed explicitly.
+Use `api schema` or `GET /openapi.json` to inspect the supported API contract, including mutation request bodies, validation constraints, stable operation IDs, endpoint tags, CORS/cache-control headers, and standard error responses. The schema endpoint remains available for client discovery even when state is unavailable.
+API mutation bodies with content must use `Content-Type: application/json`, and mutation bodies reject unknown fields so misspelled request keys fail early.
 
 ## Runtime Model
 
@@ -258,7 +333,7 @@ API mutation bodies reject unknown fields so misspelled request keys fail early.
 - Memory records can be inspected, updated, and removed by ID from the CLI and API; updates can replace or clear tags, and updates/removals write audit events.
 - Memory topics, bodies, and tag entries must not be empty.
 - Memory search queries must not be empty.
-- State can be exported, imported, backed up, migrated, pruned, and validated for unsupported versions, dangling references, malformed durable fields, optional metadata drift, timestamp order drift, dependency cycles, task output drift, daemon metadata drift, run command/exit-code/lifecycle drift, and assignment index consistency. State import/export/backup/migrate paths must not be empty when provided. `GET /state/export` returns the exact durable state snapshot, `POST /state/export` accepts `{"output":"state.json"}` to write an atomic export file, `POST /state/import` accepts `{"path":"state.json","force":true}` with the same validation and overwrite checks as the CLI, `POST /state/migrate` accepts `{"input":"legacy.json","output":"state.json"}` with both paths defaulting to the active state, `POST /state/backup` accepts `{"output":"backup.json"}` or uses a timestamped default path, `POST /state/repair` accepts `{"dry_run":true}` to preview repairs without persisting, and `POST /state/prune` accepts `{"keep_runs":100,"keep_events":500,"dry_run":false}` for API-driven maintenance.
+- State can be exported, imported, backed up, migrated, pruned, and validated for unsupported versions, dangling references, malformed durable fields, optional metadata drift, timestamp order drift, dependency cycles, task output drift, daemon metadata drift, run command/exit-code/lifecycle drift, and assignment index consistency. State import/export/backup/migrate paths must not be empty when provided. `GET /state/export` returns the exact durable state snapshot, `POST /state/export` accepts `{"output":"state.json","dry_run":true}` to preview the export path without writing or `{"output":"state.json"}` to write an atomic export file, `POST /state/import` accepts `{"path":"state.json","force":true,"dry_run":true}` with the same validation and overwrite checks as the CLI while dry-run previews without persisting, `POST /state/migrate` accepts `{"input":"legacy.json","output":"state.json","dry_run":true}` with both paths defaulting to the active state and dry-run previewing without persisting, `POST /state/backup` accepts `{"output":"backup.json","dry_run":true}` or uses a timestamped default path, with dry-run previewing without writing a backup file, `POST /state/repair` accepts `{"dry_run":true}` to preview repairs without persisting, and `POST /state/prune` accepts `{"keep_runs":100,"keep_events":500,"dry_run":false}` for API-driven maintenance.
 - `state repair` fixes repairable OS name drift, assignment index drift, dependency drift, workflow stage/task drift, dangling non-running task assignments, optional metadata drift, timestamp order drift, task plan/output drift, provider default/env/empty-endpoint drift, policy list/env/limit drift, zero agent capacity, daemon limit/metadata drift, expired agent leases, repairable run command/cwd/exit-code drift, repairable tool invocation argument drift, capability/tag normalization drift, and stopped daemon state drift.
 - `config init`, `config show`, `config validate`, `GET /config`, `POST /config`, and `GET /config/validate` let operators create, inspect, and validate config from the CLI or API. `config show --json` and `GET /config` return the config path, existence flag, and loaded config, or the default config when no config file exists. `config validate --json` and `GET /config/validate` report `config_valid:null` when no config file exists, and include `config_error` only for load/parse failures. `POST /config` writes the default config and accepts `{"force":true}` for controlled replacement.
 - `init` and `POST /init` initialize durable state from the effective config. API init accepts `{"name":"My OS","force":true}` for an optional name override and controlled replacement of existing state.
@@ -324,6 +399,7 @@ model = "mock-agent"
 # endpoint = "https://api.openai.com/v1/chat/completions"
 # model = "gpt-4.1-mini"
 # api_key_env = "OPENAI_API_KEY"
+request_timeout_seconds = 30
 
 [[agents]]
 name = "builder"
@@ -349,7 +425,16 @@ command_template = "notes/{name}.txt"
 
 ## Providers
 
-The runtime has a provider boundary for agent work. The default `provider:mock` path is local and deterministic, so non-command tasks can still be planned, completed, audited, and logged without network access or API keys. Set `[provider].kind = "openai-compatible"` with an OpenAI-compatible chat-completions endpoint to use an external LLM provider; the API key is read from `api_key_env`. Provider requests include the assigned agent, task, matching registered tools, and recent memory. OpenAI-compatible providers are asked for strict JSON with `summary`, `plan`, `confidence`, and optional `tool_calls`; plain text responses remain supported as a fallback. Tool calls are materialized as normal dependent tool tasks, so policy checks, logs, and scheduling still happen through the runtime. If an assigned agent has a model, it overrides the global provider model for that request.
+The runtime has a provider boundary for agent work. The default `provider:mock` path is local and deterministic, so non-command tasks can still be planned, completed, audited, and logged without network access or API keys. Set `[provider].kind = "openai-compatible"` with an OpenAI-compatible chat-completions endpoint to use an external LLM provider; the API key is read from `api_key_env`, and network calls use `request_timeout_seconds`. Provider requests include the assigned agent, task, matching registered tools, and recent memory. OpenAI-compatible providers are asked for strict JSON with `summary`, `plan`, `confidence`, and optional `tool_calls`; plain text responses remain supported as a fallback. Tool calls are materialized as normal dependent tool tasks, so policy checks, logs, and scheduling still happen through the runtime. If an assigned agent has a model, it overrides the global provider model for that request.
+
+## Troubleshooting
+
+- Run `agent-os doctor` first; it reports state, config, and validation problems in one place.
+- Use `--state ./sandbox` while learning so experiments do not touch the default user state.
+- If `api serve --addr 0.0.0.0:7373` fails, set a nonempty token env and pass `--token-env ENV`, or use `--unsafe-no-token` only for isolated local testing.
+- If execution is rejected, inspect the policy section in `agent-os.toml`; `allowed_workspaces`, `allowed_commands`, and `denied_patterns` are enforced before commands or file tools run.
+- Use `agent-os runs logs RUN_ID`, `agent-os runs tail RUN_ID`, and `agent-os runs replay RUN_ID` to inspect failed or cancelled work.
+- For launchd, verify the rendered plist with `agent-os service launchd` before installing, and check the configured binary path plus launchd stdout/stderr log paths.
 
 ## Development
 
@@ -358,4 +443,4 @@ The runtime has a provider boundary for agent work. The default `provider:mock` 
 AGENT_OS_RELEASE_CHECK=1 ./scripts/ci.sh
 ```
 
-The default CI script checks formatting, tests, docs with warnings denied, clippy, and package verification. Set `AGENT_OS_RELEASE_CHECK=1` to run the crates.io publish dry run.
+The default CI script checks formatting, tests, docs with warnings denied, clippy, and package verification against the checked-in lockfile. Set `AGENT_OS_RELEASE_CHECK=1` to run the crates.io publish dry run with the same locked dependency resolution.
