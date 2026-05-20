@@ -51,13 +51,13 @@ For development, `cargo run -- ...` works without installing the binary. The cra
 
 ## Quick Start
 
-Use `--state ./sandbox` while learning so state and logs stay inside the checkout:
+Use `--state ./sandbox` while learning so state and logs stay inside the checkout. `init` seeds a planner agent, a builder agent, and a reusable `cargo-test` tool so the first demo can start from a working local control plane:
 
 ```bash
-cargo run -- --state ./sandbox config init
-cargo run -- --state ./sandbox init --name "Local Agent OS"
-cargo run -- --state ./sandbox agent add builder --kind builder --cap rust --cap test --parallel 2
-cargo run -- --state ./sandbox task create "Run Rust tests" --need rust --need test --command "cargo test"
+cargo run -- --state ./sandbox init --name "Local Agent OS" --force
+cargo run -- --state ./sandbox agent list
+cargo run -- --state ./sandbox tool list
+cargo run -- --state ./sandbox task create "Show where Agent OS fits" --need rust --command "printf 'coding queue, local dashboard, automation daemon, auditable tools\n'"
 cargo run -- --state ./sandbox run --limit 1 --execute
 cargo run -- --state ./sandbox runs list
 ```
@@ -80,9 +80,49 @@ Then query it from another terminal:
 
 ```bash
 curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/status
+curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/metrics
 ```
 
 After installation, use `agent-os` directly instead of `cargo run --`.
+
+## Live Demo Tracks
+
+Use the same deterministic local workflow for both audiences. It needs no hosted service, no API key for model providers, and no network beyond the optional localhost API.
+
+### Technical builders
+
+Show Agent OS as a local backend for agent products:
+
+```bash
+agent-os --state ./sandbox init --name "Builder Demo" --force
+agent-os --state ./sandbox agent list
+agent-os --state ./sandbox tool list
+agent-os --state ./sandbox task create "Run a local builder task" --need rust --command "printf 'scheduled, executed, logged, replayable\n'"
+agent-os --state ./sandbox run --execute --limit 1
+agent-os --state ./sandbox runs list
+agent-os --state ./sandbox runs logs RUN_ID
+agent-os --state ./sandbox runs replay RUN_ID
+agent-os --state ./sandbox metrics
+```
+
+Then start the API and show dashboard-ready JSON from another terminal:
+
+```bash
+export AGENT_OS_API_TOKEN=dev-token
+agent-os --state ./sandbox api serve --addr 127.0.0.1:7373 --token-env AGENT_OS_API_TOKEN
+curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/status
+curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/metrics
+```
+
+### Business stakeholders
+
+Use the terminal output to tell the product story:
+
+- Coding queue: tasks can be queued, assigned by capability, executed, and inspected.
+- Local dashboard backend: `/status` and `/metrics` expose live state for an operator UI.
+- Automation daemon: `daemon run` keeps recurring or queued work moving without manual ticks.
+- Auditable tool execution: runs have durable logs and replay output.
+- Portable local state: the state directory can be backed up, validated, repaired, exported, and moved with the project.
 
 Global `--state` and `--config` paths, plus `AGENT_OS_HOME` and `AGENT_OS_CONFIG`, must not be empty. Add `--json` to read commands and supported create/update commands when another program needs stable output.
 
