@@ -1,12 +1,14 @@
 use crate::models::{
     Agent, AgentId, AgentKind, AgentStatus, DaemonStatus, EventKind, OperatingSystem, Priority,
-    RunStatus, Task, TaskId, TaskStatus, ToolDefinition, ToolId, ToolInvocation, ToolKind,
-    WorkflowId, normalize_list,
+    RunArtifact, RunId, RunRecord, RunStatus, Task, TaskId, TaskStatus, ToolDefinition, ToolId,
+    ToolInvocation, ToolKind, WorkerNode, WorkflowId, normalize_list,
 };
 use crate::scheduler::{Assignment, Scheduler};
 use crate::tools::{validate_tool_invocation, validate_tool_template};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -51,6 +53,14 @@ pub enum RuntimeError {
     ToolNotFound(ToolId),
     #[error("workflow not found: {0}")]
     WorkflowNotFound(WorkflowId),
+    #[error("worker not found: {0}")]
+    WorkerNotFound(String),
+    #[error("worker {worker_id} cannot report task {task_id}: {reason}")]
+    WorkerReportRejected {
+        worker_id: String,
+        task_id: TaskId,
+        reason: String,
+    },
     #[error("tool {tool_id} is invalid: {reason}")]
     ToolInvalid { tool_id: ToolId, reason: String },
     #[error("tool {tool_id} update is incompatible with task {task_id}: {reason}")]
@@ -93,14 +103,15 @@ pub struct TaskUpdate {
     pub tool: Option<Option<ToolInvocation>>,
     pub cwd: Option<Option<String>>,
     pub required_capabilities: Option<Vec<String>>,
+    pub max_attempts: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{
-        Agent, AgentKind, DaemonState, DaemonStatus, OperatingSystem, Priority, RunRecord, Task,
-        ToolDefinition, ToolInvocation, ToolKind, Workflow,
+        Agent, AgentKind, AgentStatus, DaemonState, DaemonStatus, OperatingSystem, Priority,
+        RunRecord, Task, ToolDefinition, ToolInvocation, ToolKind, WorkerNode, Workflow,
     };
     use std::collections::BTreeMap;
 
@@ -201,6 +212,74 @@ mod tests {
     }
 
     #[test]
+    fn worker_heartbeat_refreshes_matching_agent_lease() {
+        let mut os = OperatingSystem::new("test");
+        let mut agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        agent.lease_expires_at = Some(Utc::now() - Duration::seconds(60));
+        let agent_id = agent.id.clone();
+        os.register_agent(agent);
+        os.workers.insert(
+            agent_id.to_string(),
+            WorkerNode {
+                id: agent_id.to_string(),
+                endpoint: "http://127.0.0.1:9100".into(),
+                status: AgentStatus::Online,
+                last_seen_at: Utc::now() - Duration::seconds(60),
+            },
+        );
+
+        let worker = Runtime::heartbeat_worker(
+            &mut os,
+            agent_id.as_str(),
+            Some("http://127.0.0.1:9101".into()),
+            Some(AgentStatus::Busy),
+            Some(120),
+        )
+        .expect("worker heartbeat");
+
+        assert_eq!(worker.endpoint, "http://127.0.0.1:9101");
+        assert_eq!(worker.status, AgentStatus::Busy);
+        let agent = os.agents.get(&agent_id).expect("agent");
+        assert_eq!(agent.status, AgentStatus::Busy);
+        assert!(agent.last_heartbeat_at.is_some());
+        assert!(
+            agent
+                .lease_expires_at
+                .expect("lease")
+                .signed_duration_since(Utc::now())
+                .num_seconds()
+                > 0
+        );
+    }
+
+    #[test]
+    fn worker_heartbeat_preserves_matching_agent_lease_when_omitted() {
+        let mut os = OperatingSystem::new("test");
+        let mut agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        let lease = Utc::now() + Duration::seconds(60);
+        let agent_id = agent.id.clone();
+        agent.lease_expires_at = Some(lease);
+        os.register_agent(agent);
+        os.workers.insert(
+            agent_id.to_string(),
+            WorkerNode {
+                id: agent_id.to_string(),
+                endpoint: "http://127.0.0.1:9100".into(),
+                status: AgentStatus::Online,
+                last_seen_at: Utc::now(),
+            },
+        );
+
+        Runtime::heartbeat_worker(&mut os, agent_id.as_str(), None, None, None)
+            .expect("worker heartbeat");
+
+        assert_eq!(
+            os.agents.get(&agent_id).expect("agent").lease_expires_at,
+            Some(lease)
+        );
+    }
+
+    #[test]
     fn recovery_marks_active_runs_failed() {
         let mut os = OperatingSystem::new("test");
         let agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
@@ -229,12 +308,196 @@ mod tests {
     }
 
     #[test]
+    fn recovery_uses_stale_active_run_age_when_task_was_recently_updated() {
+        let mut os = OperatingSystem::new("test");
+        let agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        let agent_id = agent.id.clone();
+        os.register_agent(agent);
+        let mut task = Task::new("Build", "build", Priority::Normal, vec!["rust".into()]);
+        let task_id = task.id.clone();
+        task.status = TaskStatus::Running;
+        task.assigned_to = Some(agent_id.clone());
+        task.updated_at = Utc::now();
+        os.create_task(task);
+        os.agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .current_tasks
+            .push(task_id.clone());
+        let mut run = RunRecord::new(task_id.clone(), Some(agent_id.clone()), "sleep 60", ".");
+        run.status = RunStatus::CancelRequested;
+        run.started_at = Utc::now() - Duration::seconds(60);
+        let run_id = run.id.clone();
+        os.runs.insert(run_id.clone(), run);
+
+        let recovery = Runtime::recover_stale_work(&mut os, Duration::seconds(30));
+
+        assert_eq!(recovery.recovered_tasks, vec![task_id.clone()]);
+        assert_eq!(recovery.recovered_runs, vec![run_id.clone()]);
+        let task = os.tasks.get(&task_id).expect("task");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.assigned_to.is_none());
+        assert!(
+            os.agents
+                .get(&agent_id)
+                .expect("agent")
+                .current_tasks
+                .is_empty()
+        );
+        let run = os.runs.get(&run_id).expect("run");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.finished_at.is_some());
+    }
+
+    #[test]
+    fn stale_recovery_reports_runs_and_orphan_active_runs() {
+        let mut os = OperatingSystem::new("test");
+        let agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        let agent_id = agent.id.clone();
+        os.register_agent(agent);
+        let mut stale_task = Task::new("Build", "build", Priority::Normal, vec!["rust".into()]);
+        let stale_task_id = stale_task.id.clone();
+        stale_task.status = TaskStatus::Running;
+        stale_task.assigned_to = Some(agent_id.clone());
+        stale_task.updated_at = Utc::now() - Duration::seconds(60);
+        os.create_task(stale_task);
+        os.agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .current_tasks
+            .push(stale_task_id.clone());
+        let mut stale_run = RunRecord::new(
+            stale_task_id.clone(),
+            Some(agent_id.clone()),
+            "sleep 60",
+            ".",
+        );
+        stale_run.started_at = Utc::now() - Duration::seconds(60);
+        let stale_run_id = stale_run.id.clone();
+        os.runs.insert(stale_run_id.clone(), stale_run);
+
+        let mut complete_task = Task::new("Done", "done", Priority::Normal, vec![]);
+        let complete_task_id = complete_task.id.clone();
+        complete_task.assigned_to = Some(agent_id.clone());
+        os.create_task(complete_task);
+        Runtime::complete_task(&mut os, &complete_task_id, None).expect("complete");
+        os.agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .current_tasks
+            .push(complete_task_id.clone());
+        let mut orphan_run = RunRecord::new(
+            complete_task_id.clone(),
+            Some(agent_id.clone()),
+            "old command",
+            ".",
+        );
+        orphan_run.started_at = Utc::now() - Duration::seconds(60);
+        let orphan_run_id = orphan_run.id.clone();
+        os.runs.insert(orphan_run_id.clone(), orphan_run);
+
+        let recovery = Runtime::recover_stale_work(&mut os, Duration::seconds(30));
+
+        assert_eq!(recovery.recovered_tasks, vec![stale_task_id]);
+        assert_eq!(
+            recovery.recovered_runs,
+            vec![stale_run_id.clone(), orphan_run_id.clone()]
+        );
+        assert!(
+            recovery
+                .notes
+                .iter()
+                .any(|note| note == "recovered 2 active run record(s)")
+        );
+        assert_eq!(
+            os.runs.get(&stale_run_id).expect("stale run").status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            os.runs.get(&orphan_run_id).expect("orphan run").status,
+            RunStatus::Failed
+        );
+        assert!(
+            os.tasks
+                .get(&complete_task_id)
+                .expect("complete task")
+                .assigned_to
+                .is_none()
+        );
+        assert!(
+            !os.agents
+                .get(&agent_id)
+                .expect("agent")
+                .current_tasks
+                .contains(&complete_task_id)
+        );
+    }
+
+    #[test]
+    fn crashed_daemon_recovery_clears_dead_pid() {
+        let mut os = OperatingSystem::new("test");
+        os.daemon = Some(DaemonState::running(42, 1, true));
+
+        assert!(Runtime::recover_crashed_daemon_with(&mut os, |_| false));
+
+        let daemon = os.daemon.as_ref().expect("daemon");
+        assert_eq!(daemon.status, DaemonStatus::Stopped);
+        assert!(daemon.pid.is_none());
+        assert!(!daemon.stop_requested);
+        assert_eq!(
+            daemon.last_message.as_deref(),
+            Some("recovered crashed daemon state for pid 42")
+        );
+    }
+
+    #[test]
+    fn windows_tasklist_parser_detects_matching_pid() {
+        let output = br#""Image Name","PID","Session Name","Session#","Mem Usage"
+"agent-os.exe","4242","Console","1","12,340 K"
+"other.exe","5151","Console","1","4,000 K"
+"#;
+
+        assert!(windows_tasklist_contains_pid(output, 4242));
+        assert!(!windows_tasklist_contains_pid(output, 42));
+    }
+
+    #[test]
+    fn windows_tasklist_parser_treats_no_task_output_as_dead() {
+        assert!(!windows_tasklist_contains_pid(
+            b"INFO: No tasks are running which match the specified criteria.\r\n",
+            4242
+        ));
+    }
+
+    #[test]
+    fn cancel_task_requests_active_run_cancellation() {
+        let mut os = OperatingSystem::new("test");
+        let mut task = Task::new("Run", "run", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        task.status = TaskStatus::Running;
+        os.create_task(task);
+        let mut run = RunRecord::new(task_id.clone(), None, "sleep 60", ".");
+        run.finished_at = Some(Utc::now());
+        run.exit_code = Some(0);
+        let run_id = run.id.clone();
+        os.runs.insert(run_id.clone(), run);
+
+        Runtime::cancel_task(&mut os, &task_id, Some("stop".into())).expect("cancel");
+
+        let run = os.runs.get(&run_id).expect("run");
+        assert_eq!(run.status, RunStatus::CancelRequested);
+        assert!(run.finished_at.is_none());
+        assert!(run.exit_code.is_none());
+    }
+
+    #[test]
     fn lifecycle_transitions_tolerate_missing_assigned_agent() {
         let mut os = OperatingSystem::new("test");
         let mut task = Task::new("Complete", "finish", Priority::Normal, vec!["rust".into()]);
         let task_id = task.id.clone();
         task.status = TaskStatus::Running;
         task.assigned_to = Some(AgentId::new("missing-agent"));
+        task.attempts = 1;
         os.create_task(task);
 
         Runtime::complete_task(&mut os, &task_id, Some("done".into())).expect("complete");
@@ -249,6 +512,68 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Pending);
         assert!(task.assigned_to.is_none());
         assert_eq!(task.output.as_deref(), Some("try again"));
+        assert_eq!(task.attempts, 1);
+    }
+
+    #[test]
+    fn failed_attempt_requeues_until_max_attempts_then_fails() {
+        let mut os = OperatingSystem::new("test");
+        let mut agent = Agent::new("Builder", AgentKind::Builder, None, vec!["rust".into()], 1);
+        let agent_id = agent.id.clone();
+        let mut task = Task::new("Retry", "retry once", Priority::Normal, vec!["rust".into()]);
+        task.max_attempts = 2;
+        task.status = TaskStatus::Running;
+        task.attempts = 1;
+        task.assigned_to = Some(agent_id.clone());
+        let task_id = task.id.clone();
+        agent.current_tasks.push(task_id.clone());
+        os.register_agent(agent);
+        os.create_task(task);
+
+        Runtime::fail_task_or_retry(&mut os, &task_id, Some("exit 1".into()))
+            .expect("first failure requeues");
+
+        let task = os.tasks.get(&task_id).expect("task");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.attempts, 1);
+        assert!(task.assigned_to.is_none());
+        assert!(
+            os.agents
+                .get(&agent_id)
+                .expect("agent")
+                .current_tasks
+                .is_empty()
+        );
+        assert!(
+            task.output
+                .as_deref()
+                .expect("output")
+                .contains("retrying after attempt 1 of 2")
+        );
+
+        let task = os.tasks.get_mut(&task_id).expect("task");
+        task.status = TaskStatus::Running;
+        task.attempts = 2;
+        task.assigned_to = Some(agent_id.clone());
+        os.agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .current_tasks
+            .push(task_id.clone());
+
+        Runtime::fail_task_or_retry(&mut os, &task_id, Some("exit 1".into()))
+            .expect("second failure fails");
+
+        let task = os.tasks.get(&task_id).expect("task");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.attempts, 2);
+        assert!(
+            os.agents
+                .get(&agent_id)
+                .expect("agent")
+                .current_tasks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -683,6 +1008,7 @@ mod tests {
                 tool: None,
                 cwd: Some(Some("/tmp".into())),
                 required_capabilities: Some(vec!["code".into(), "rust".into()]),
+                max_attempts: None,
             },
         )
         .expect("update task");
@@ -831,6 +1157,131 @@ mod tests {
     }
 
     #[test]
+    fn tick_reports_dependency_deadlocks_without_mutating_tasks() {
+        let mut os = OperatingSystem::new("test");
+        let agent = Agent::new("Builder", AgentKind::Builder, None, vec![], 1);
+        os.register_agent(agent);
+
+        let first = Task::new("Cycle A", "waits on b", Priority::Normal, vec![]);
+        let first_id = first.id.clone();
+        let second = Task::new("Cycle B", "waits on a", Priority::Normal, vec![]);
+        let second_id = second.id.clone();
+        os.create_task(first);
+        os.create_task(second);
+        os.tasks
+            .get_mut(&first_id)
+            .expect("first")
+            .dependencies
+            .push(second_id.clone());
+        os.tasks
+            .get_mut(&second_id)
+            .expect("second")
+            .dependencies
+            .push(first_id.clone());
+
+        let report = Runtime::tick(&mut os, 1);
+
+        assert!(report.assignments.is_empty());
+        assert_eq!(
+            report
+                .deadlocked_tasks
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_id.clone(), second_id.clone()])
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("dependency deadlock detected"))
+        );
+        let reasons = report
+            .unscheduled_tasks
+            .iter()
+            .map(|task| (task.task_id.clone(), task.reason.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            reasons.get(&first_id),
+            Some(&"task is in a dependency deadlock")
+        );
+        assert_eq!(
+            reasons.get(&second_id),
+            Some(&"task is in a dependency deadlock")
+        );
+        assert_eq!(
+            os.tasks.get(&first_id).expect("first").status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            os.tasks.get(&second_id).expect("second").status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn tick_reports_unscheduled_task_reasons() {
+        let mut os = OperatingSystem::new("test");
+        let mut busy = Agent::new("Busy", AgentKind::Builder, None, vec!["rust".into()], 1);
+        busy.current_tasks
+            .push(TaskId::from_slug("already-running"));
+        os.register_agent(busy);
+
+        let blocked = Task::new(
+            "Blocked",
+            "operator hold",
+            Priority::Normal,
+            vec!["rust".into()],
+        );
+        let blocked_id = blocked.id.clone();
+        os.create_task(blocked);
+        Runtime::block_task(&mut os, &blocked_id, Some("waiting on approval".into()))
+            .expect("block task");
+
+        let missing_capability = Task::new(
+            "Missing capability",
+            "needs docs",
+            Priority::Normal,
+            vec!["docs".into()],
+        );
+        let missing_capability_id = missing_capability.id.clone();
+        os.create_task(missing_capability);
+
+        let capacity = Task::new(
+            "Capacity",
+            "needs rust",
+            Priority::Normal,
+            vec!["rust".into()],
+        );
+        let capacity_id = capacity.id.clone();
+        os.create_task(capacity);
+
+        let report = Runtime::tick(&mut os, 1);
+
+        assert!(report.assignments.is_empty());
+        let reasons = report
+            .unscheduled_tasks
+            .iter()
+            .map(|task| (task.task_id.clone(), task.reason.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(reasons.get(&blocked_id), Some(&"task is blocked"));
+        assert_eq!(
+            reasons.get(&missing_capability_id),
+            Some(&"no agent has required capabilities [docs]")
+        );
+        assert_eq!(
+            reasons.get(&capacity_id),
+            Some(&"matching agents are at capacity")
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("task(s) could not be scheduled"))
+        );
+    }
+
+    #[test]
     fn delete_task_refuses_dependent_task_references() {
         let mut os = OperatingSystem::new("test");
         let dependency = Task::new("Dependency", "must finish first", Priority::Normal, vec![]);
@@ -908,11 +1359,237 @@ pub struct RuntimeReport {
     pub assignments: Vec<Assignment>,
     pub completed_tasks: Vec<TaskId>,
     pub recovered_tasks: Vec<TaskId>,
+    pub recovered_runs: Vec<RunId>,
+    pub recovered_daemon: bool,
     pub expired_agents: Vec<AgentId>,
+    pub deadlocked_tasks: Vec<TaskId>,
+    pub unscheduled_tasks: Vec<UnscheduledTask>,
     pub notes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnscheduledTask {
+    pub task_id: TaskId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryReport {
+    pub recovered_tasks: Vec<TaskId>,
+    pub recovered_runs: Vec<RunId>,
+    pub recovered_daemon: bool,
+    pub notes: Vec<String>,
+}
+
+impl RuntimeReport {
+    pub fn absorb_recovery(&mut self, recovery: RecoveryReport) {
+        self.recovered_tasks.extend(recovery.recovered_tasks);
+        self.recovered_runs.extend(recovery.recovered_runs);
+        self.recovered_daemon |= recovery.recovered_daemon;
+        self.notes.extend(recovery.notes);
+    }
+
+    pub fn absorb_tick(&mut self, tick: RuntimeReport) {
+        self.assignments = tick.assignments;
+        self.completed_tasks = tick.completed_tasks;
+        self.expired_agents = tick.expired_agents;
+        self.deadlocked_tasks = tick.deadlocked_tasks;
+        self.unscheduled_tasks = tick.unscheduled_tasks;
+        self.notes.extend(tick.notes);
+    }
+}
+
+fn detect_dependency_deadlocks_from(
+    os: &OperatingSystem,
+    active: &BTreeSet<TaskId>,
+    task_id: &TaskId,
+    visiting: &mut BTreeSet<TaskId>,
+    visited: &mut BTreeSet<TaskId>,
+    stack: &mut Vec<TaskId>,
+    deadlocked: &mut BTreeSet<TaskId>,
+) {
+    if visited.contains(task_id) {
+        return;
+    }
+    if !visiting.insert(task_id.clone()) {
+        if let Some(position) = stack.iter().position(|stacked| stacked == task_id) {
+            deadlocked.extend(stack[position..].iter().cloned());
+        }
+        return;
+    }
+
+    stack.push(task_id.clone());
+    if let Some(task) = os.tasks.get(task_id) {
+        for dependency in &task.dependencies {
+            if active.contains(dependency) {
+                detect_dependency_deadlocks_from(
+                    os, active, dependency, visiting, visited, stack, deadlocked,
+                );
+            }
+        }
+    }
+    stack.pop();
+    visiting.remove(task_id);
+    visited.insert(task_id.clone());
+}
+
+fn unscheduled_reason(
+    os: &OperatingSystem,
+    task: &Task,
+    now: chrono::DateTime<Utc>,
+    limit_reached: bool,
+    deadlocked_tasks: &BTreeSet<TaskId>,
+) -> Option<String> {
+    match task.status {
+        TaskStatus::Pending => {}
+        TaskStatus::Blocked => return Some("task is blocked".into()),
+        _ => return None,
+    }
+
+    if deadlocked_tasks.contains(&task.id) {
+        return Some("task is in a dependency deadlock".into());
+    }
+
+    let incomplete_dependencies = task
+        .dependencies
+        .iter()
+        .filter(|dependency| {
+            os.tasks
+                .get(*dependency)
+                .map(|task| task.status != TaskStatus::Complete)
+                .unwrap_or(true)
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !incomplete_dependencies.is_empty() {
+        return Some(format!(
+            "waiting for incomplete dependencies: {}",
+            incomplete_dependencies.join(", ")
+        ));
+    }
+
+    if os
+        .agents
+        .values()
+        .any(|agent| agent.can_accept_at(&task.required_capabilities, now))
+    {
+        return limit_reached
+            .then(|| "scheduler limit reached before this ready task was assigned".into());
+    }
+
+    if os.agents.is_empty() {
+        return Some("no agents registered".into());
+    }
+
+    let matching_agents = os
+        .agents
+        .values()
+        .filter(|agent| {
+            task.required_capabilities
+                .iter()
+                .all(|need| agent.capabilities.iter().any(|cap| cap == need))
+        })
+        .collect::<Vec<_>>();
+    if matching_agents.is_empty() {
+        return Some(format!(
+            "no agent has required capabilities [{}]",
+            task.required_capabilities.join(", ")
+        ));
+    }
+    if matching_agents
+        .iter()
+        .all(|agent| agent.status != AgentStatus::Online)
+    {
+        return Some("matching agents are not online".into());
+    }
+    if matching_agents.iter().all(|agent| {
+        agent
+            .lease_expires_at
+            .map(|expires_at| expires_at <= now)
+            .unwrap_or(false)
+    }) {
+        return Some("matching agents have expired leases".into());
+    }
+    if matching_agents
+        .iter()
+        .all(|agent| agent.current_tasks.len() >= agent.max_parallel_tasks)
+    {
+        return Some("matching agents are at capacity".into());
+    }
+
+    Some("no matching agent can currently accept this task".into())
+}
+
 pub struct Runtime;
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    let output = Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .arg("/FO")
+        .arg("CSV")
+        .arg("/NH")
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => windows_tasklist_contains_pid(&output.stdout, pid),
+        _ => true,
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(any(test, windows))]
+fn windows_tasklist_contains_pid(output: &[u8], pid: u32) -> bool {
+    let pid = pid.to_string();
+    String::from_utf8_lossy(output).lines().any(|line| {
+        parse_windows_tasklist_pid(line)
+            .as_deref()
+            .is_some_and(|reported_pid| reported_pid == pid)
+    })
+}
+
+#[cfg(any(test, windows))]
+fn parse_windows_tasklist_pid(line: &str) -> Option<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.trim().chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                fields.push(field.trim().to_owned());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field.trim().to_owned());
+    fields.get(1).filter(|pid| !pid.is_empty()).cloned()
+}
 
 impl Runtime {
     fn ensure_task_editable(task_id: &TaskId, status: &TaskStatus) -> Result<(), RuntimeError> {
@@ -926,21 +1603,38 @@ impl Runtime {
     }
 
     pub fn tick(os: &mut OperatingSystem, limit: usize) -> RuntimeReport {
+        let limit = limit.max(1);
         let mut report = RuntimeReport {
             expired_agents: Self::expire_agent_leases(os),
+            deadlocked_tasks: Self::detect_dependency_deadlocks(os),
             ..RuntimeReport::default()
         };
-        for _ in 0..limit.max(1) {
+        for _ in 0..limit {
             match Scheduler::assign_next(os) {
                 Some(assignment) => report.assignments.push(assignment),
                 None => break,
             }
         }
+        let limit_reached = report.assignments.len() >= limit;
+        report.unscheduled_tasks = Self::explain_unscheduled_tasks(os, limit_reached);
 
         if report.assignments.is_empty() {
             report
                 .notes
                 .push("no pending task could be scheduled".into());
+        }
+        if !report.unscheduled_tasks.is_empty() {
+            report.notes.push(format!(
+                "{} task(s) could not be scheduled: {}",
+                report.unscheduled_tasks.len(),
+                report
+                    .unscheduled_tasks
+                    .iter()
+                    .take(3)
+                    .map(|task| format!("{} ({})", task.task_id, task.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         if !report.expired_agents.is_empty() {
             report.notes.push(format!(
@@ -948,7 +1642,67 @@ impl Runtime {
                 report.expired_agents.len()
             ));
         }
+        if !report.deadlocked_tasks.is_empty() {
+            report.notes.push(format!(
+                "dependency deadlock detected among {} task(s): {}",
+                report.deadlocked_tasks.len(),
+                report
+                    .deadlocked_tasks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         report
+    }
+
+    pub fn explain_unscheduled_tasks(
+        os: &OperatingSystem,
+        limit_reached: bool,
+    ) -> Vec<UnscheduledTask> {
+        let now = Utc::now();
+        let deadlocked_tasks = Self::detect_dependency_deadlocks(os)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        os.tasks
+            .values()
+            .filter_map(|task| {
+                unscheduled_reason(os, task, now, limit_reached, &deadlocked_tasks).map(|reason| {
+                    UnscheduledTask {
+                        task_id: task.id.clone(),
+                        reason,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub fn detect_dependency_deadlocks(os: &OperatingSystem) -> Vec<TaskId> {
+        let active = os
+            .tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked))
+            .map(|task| task.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut stack = Vec::new();
+        let mut deadlocked = BTreeSet::new();
+
+        for task_id in &active {
+            detect_dependency_deadlocks_from(
+                os,
+                &active,
+                task_id,
+                &mut visiting,
+                &mut visited,
+                &mut stack,
+                &mut deadlocked,
+            );
+        }
+
+        deadlocked.into_iter().collect()
     }
 
     pub fn expire_agent_leases(os: &mut OperatingSystem) -> Vec<AgentId> {
@@ -1000,6 +1754,47 @@ impl Runtime {
             format!("heartbeat from agent {}", agent_id),
         );
         Ok(())
+    }
+
+    pub fn heartbeat_worker(
+        os: &mut OperatingSystem,
+        worker_id: &str,
+        endpoint: Option<String>,
+        status: Option<AgentStatus>,
+        lease_seconds: Option<i64>,
+    ) -> Result<WorkerNode, RuntimeError> {
+        let now = Utc::now();
+        let worker = os
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| RuntimeError::WorkerNotFound(worker_id.to_owned()))?;
+        if let Some(endpoint) = endpoint {
+            worker.endpoint = endpoint;
+        }
+        if let Some(status) = status {
+            worker.status = status;
+        }
+        worker.last_seen_at = now;
+        let worker = worker.clone();
+
+        let agent_id = AgentId::new(worker_id);
+        if let Some(agent) = os.agents.get_mut(&agent_id) {
+            agent.status = worker.status.clone();
+            agent.last_heartbeat_at = Some(now);
+            if let Some(seconds) = lease_seconds {
+                agent.lease_expires_at = Some(now + Duration::seconds(seconds));
+            }
+            agent.updated_at = now;
+            os.record(
+                EventKind::AgentHeartbeat,
+                format!("heartbeat from worker {} for agent {}", worker_id, agent_id),
+            );
+        }
+        os.record(
+            EventKind::WorkerUpdated,
+            format!("updated worker {}", worker.id),
+        );
+        Ok(worker)
     }
 
     pub fn update_agent(
@@ -1311,6 +2106,15 @@ impl Runtime {
             }
             task.required_capabilities = normalize_list(required_capabilities);
         }
+        if let Some(max_attempts) = update.max_attempts {
+            if max_attempts == 0 {
+                return Err(RuntimeError::TaskInvalid {
+                    task_id: task_id.clone(),
+                    reason: "task max_attempts must be greater than 0".into(),
+                });
+            }
+            task.max_attempts = max_attempts;
+        }
         if task.command.is_some() && task.tool.is_some() {
             return Err(RuntimeError::TaskInvalid {
                 task_id: task_id.clone(),
@@ -1478,16 +2282,42 @@ impl Runtime {
     }
 
     pub fn recover_stale_tasks(os: &mut OperatingSystem, older_than: Duration) -> Vec<TaskId> {
+        Self::recover_stale_work(os, older_than).recovered_tasks
+    }
+
+    pub fn recover_stale_state(os: &mut OperatingSystem, older_than: Duration) -> RecoveryReport {
+        let mut report = Self::recover_stale_work(os, older_than);
+        if Self::recover_crashed_daemon(os) {
+            report.recovered_daemon = true;
+            report.notes.push("recovered crashed daemon state".into());
+        }
+        report
+    }
+
+    pub fn recover_stale_work(os: &mut OperatingSystem, older_than: Duration) -> RecoveryReport {
         let cutoff = Utc::now() - older_than;
         let stale_task_ids = os
             .tasks
             .values()
-            .filter(|task| task.status == TaskStatus::Running && task.updated_at <= cutoff)
+            .filter(|task| {
+                task.status == TaskStatus::Running
+                    && (task.updated_at <= cutoff
+                        || os.runs.values().any(|run| {
+                            run.task_id == task.id
+                                && matches!(
+                                    run.status,
+                                    RunStatus::Running | RunStatus::CancelRequested
+                                )
+                                && run.started_at <= cutoff
+                        }))
+            })
             .map(|task| task.id.clone())
             .collect::<Vec<_>>();
+        let mut report = RecoveryReport::default();
 
         for task_id in &stale_task_ids {
             let now = Utc::now();
+            let mut recovered_run_ids = Vec::new();
             {
                 let Some(task) = os.tasks.get_mut(task_id) else {
                     continue;
@@ -1501,6 +2331,7 @@ impl Runtime {
                 run.task_id == *task_id
                     && matches!(run.status, RunStatus::Running | RunStatus::CancelRequested)
             }) {
+                recovered_run_ids.push(run.id.clone());
                 run.status = RunStatus::Failed;
                 run.exit_code = None;
                 run.finished_at = Some(now);
@@ -1511,9 +2342,98 @@ impl Runtime {
                 EventKind::TaskUpdated,
                 format!("recovered stale running task {}", task_id),
             );
+            for run_id in &recovered_run_ids {
+                os.record(
+                    EventKind::RunFinished,
+                    format!("recovered stale active run {run_id} for task {task_id}"),
+                );
+            }
+            report.recovered_tasks.push(task_id.clone());
+            report.recovered_runs.extend(recovered_run_ids);
         }
 
-        stale_task_ids
+        let recovered_task_set = report
+            .recovered_tasks
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let orphan_run_ids = os
+            .runs
+            .values()
+            .filter(|run| {
+                matches!(run.status, RunStatus::Running | RunStatus::CancelRequested)
+                    && run.started_at <= cutoff
+                    && !recovered_task_set.contains(&run.task_id)
+                    && !matches!(
+                        os.tasks.get(&run.task_id).map(|task| &task.status),
+                        Some(TaskStatus::Running)
+                    )
+            })
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        for run_id in orphan_run_ids {
+            let now = Utc::now();
+            let task_id = {
+                let Some(run) = os.runs.get_mut(&run_id) else {
+                    continue;
+                };
+                let task_id = run.task_id.clone();
+                run.status = RunStatus::Failed;
+                run.exit_code = None;
+                run.finished_at = Some(now);
+                task_id
+            };
+            if let Some(task) = os.tasks.get_mut(&task_id)
+                && task.status != TaskStatus::Running
+            {
+                task.assigned_to = None;
+            }
+            Self::release_task_from_all_agents(os, &task_id);
+            os.record(
+                EventKind::RunFinished,
+                format!("recovered stale active run {run_id} without a running task {task_id}"),
+            );
+            report.recovered_runs.push(run_id);
+        }
+
+        if !report.recovered_runs.is_empty() {
+            report.notes.push(format!(
+                "recovered {} active run record(s)",
+                report.recovered_runs.len()
+            ));
+        }
+        report
+    }
+
+    pub fn recover_crashed_daemon(os: &mut OperatingSystem) -> bool {
+        Self::recover_crashed_daemon_with(os, process_is_running)
+    }
+
+    pub fn recover_crashed_daemon_with(
+        os: &mut OperatingSystem,
+        process_is_running: impl Fn(u32) -> bool,
+    ) -> bool {
+        let Some(daemon) = &mut os.daemon else {
+            return false;
+        };
+        if daemon.status != DaemonStatus::Running {
+            return false;
+        }
+        let Some(pid) = daemon.pid else {
+            return false;
+        };
+        if process_is_running(pid) {
+            return false;
+        }
+        daemon.status = DaemonStatus::Stopped;
+        daemon.pid = None;
+        daemon.stop_requested = false;
+        daemon.last_message = Some(format!("recovered crashed daemon state for pid {pid}"));
+        os.record(
+            EventKind::DaemonStopped,
+            format!("recovered crashed daemon state for pid {pid}"),
+        );
+        true
     }
 
     pub fn request_daemon_stop(os: &mut OperatingSystem) -> bool {
@@ -1537,6 +2457,137 @@ impl Runtime {
         Self::finish_with_status(os, task_id, TaskStatus::Failed, reason)
     }
 
+    pub fn fail_task_or_retry(
+        os: &mut OperatingSystem,
+        task_id: &TaskId,
+        reason: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        let retrying_agent = {
+            let task = os
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| RuntimeError::TaskNotFound(task_id.clone()))?;
+            if task.attempts >= task.max_attempts {
+                return Self::finish_with_status(os, task_id, TaskStatus::Failed, reason);
+            }
+            let agent_id = task.assigned_to.take();
+            task.status = TaskStatus::Pending;
+            task.output = Some(format!(
+                "{}; retrying after attempt {} of {}",
+                reason.unwrap_or_else(|| "task attempt failed".into()),
+                task.attempts,
+                task.max_attempts
+            ));
+            task.updated_at = Utc::now();
+            agent_id
+        };
+        if let Some(agent_id) = retrying_agent {
+            Self::release_specific_agent_capacity(os, task_id, &agent_id);
+        }
+        os.record(
+            EventKind::TaskUpdated,
+            format!("requeued task {} for retry", task_id),
+        );
+        Ok(())
+    }
+
+    pub fn report_worker_task(
+        os: &mut OperatingSystem,
+        worker_id: &str,
+        task_id: &TaskId,
+        status: TaskStatus,
+        output: Option<String>,
+        command: Option<String>,
+        cwd: Option<String>,
+        exit_code: Option<i32>,
+        artifacts: Vec<RunArtifact>,
+    ) -> Result<(WorkerNode, Task, RunRecord), RuntimeError> {
+        if !matches!(status, TaskStatus::Complete | TaskStatus::Failed) {
+            return Err(RuntimeError::WorkerReportRejected {
+                worker_id: worker_id.into(),
+                task_id: task_id.clone(),
+                reason: format!("status must be complete or failed, got {status}"),
+            });
+        }
+        let agent_id = AgentId::new(worker_id);
+        let now = Utc::now();
+        {
+            let worker = os
+                .workers
+                .get_mut(worker_id)
+                .ok_or_else(|| RuntimeError::WorkerNotFound(worker_id.into()))?;
+            worker.status = AgentStatus::Online;
+            worker.last_seen_at = now;
+        }
+        if !os.agents.contains_key(&agent_id) {
+            return Err(RuntimeError::AgentNotFound(agent_id));
+        }
+        {
+            let task = os
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| RuntimeError::TaskNotFound(task_id.clone()))?;
+            if task.status != TaskStatus::Running {
+                return Err(RuntimeError::InvalidTransition {
+                    task_id: task_id.clone(),
+                    from: task.status.clone(),
+                    to: status,
+                });
+            }
+            if task.assigned_to.as_ref() != Some(&agent_id) {
+                return Err(RuntimeError::WorkerReportRejected {
+                    worker_id: worker_id.into(),
+                    task_id: task_id.clone(),
+                    reason: format!("task is not assigned to matching agent {agent_id}"),
+                });
+            }
+        }
+
+        let run_status = match status {
+            TaskStatus::Complete => RunStatus::Success,
+            TaskStatus::Failed => RunStatus::Failed,
+            _ => unreachable!("validated worker report status"),
+        };
+        let mut run = RunRecord::new(
+            task_id.clone(),
+            Some(agent_id),
+            command.unwrap_or_else(|| format!("worker:{worker_id}")),
+            cwd.unwrap_or_else(|| ".".into()),
+        );
+        run.started_at = now;
+        run.status = run_status;
+        run.exit_code = Some(exit_code.unwrap_or(match status {
+            TaskStatus::Complete => 0,
+            TaskStatus::Failed => 1,
+            _ => unreachable!("validated worker report status"),
+        }));
+        run.finished_at = Some(now);
+        run.artifacts = artifacts;
+        let run_id = run.id.clone();
+        os.runs.insert(run_id.clone(), run.clone());
+
+        match status {
+            TaskStatus::Complete => Self::complete_task(os, task_id, output)?,
+            TaskStatus::Failed => Self::fail_task_or_retry(os, task_id, output)?,
+            _ => unreachable!("validated worker report status"),
+        }
+        os.record(
+            EventKind::RunFinished,
+            format!("worker {worker_id} reported run {run_id} for task {task_id}"),
+        );
+        let worker = os
+            .workers
+            .get(worker_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::WorkerNotFound(worker_id.into()))?;
+        let task = os
+            .tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::TaskNotFound(task_id.clone()))?;
+        Ok((worker, task, run))
+    }
+
     pub fn block_task(
         os: &mut OperatingSystem,
         task_id: &TaskId,
@@ -1550,7 +2601,18 @@ impl Runtime {
         task_id: &TaskId,
         reason: Option<String>,
     ) -> Result<(), RuntimeError> {
-        Self::finish_with_status(os, task_id, TaskStatus::Cancelled, reason)
+        Self::finish_with_status(os, task_id, TaskStatus::Cancelled, reason)?;
+        let requested_runs = Self::request_active_runs_for_task_cancellation(os, task_id);
+        if requested_runs > 0 {
+            os.record(
+                EventKind::RunFinished,
+                format!(
+                    "cancel requested for {requested_runs} active run(s) on task {}",
+                    task_id
+                ),
+            );
+        }
+        Ok(())
     }
 
     pub fn cancel_workflow(
@@ -1703,6 +2765,24 @@ impl Runtime {
             format!("marked task {} as {}", task_id, status),
         );
         Ok(())
+    }
+
+    fn request_active_runs_for_task_cancellation(
+        os: &mut OperatingSystem,
+        task_id: &TaskId,
+    ) -> usize {
+        let mut requested = 0;
+        for run in os
+            .runs
+            .values_mut()
+            .filter(|run| run.task_id == *task_id && run.status == RunStatus::Running)
+        {
+            run.status = RunStatus::CancelRequested;
+            run.finished_at = None;
+            run.exit_code = None;
+            requested += 1;
+        }
+        requested
     }
 
     fn release_agent_capacity(

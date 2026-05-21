@@ -1,9 +1,11 @@
 use crate::migrations::CURRENT_STATE_VERSION;
 use crate::models::{
-    AgentId, AgentKind, AgentStatus, DaemonStatus, EventKind, OperatingSystem, Policy,
-    ProviderKind, ProviderSettings, RunStatus, TaskId, TaskStatus, ToolDefinition, ToolInvocation,
-    is_valid_env_var_name, is_valid_provider_endpoint, is_valid_slug, normalize_list,
+    AgentId, AgentKind, AgentStatus, DaemonStatus, EventKind, MAX_PROVIDER_RETRIES,
+    OperatingSystem, Policy, ProviderKind, ProviderSettings, RunStatus, TaskId, TaskStatus,
+    ToolDefinition, ToolInvocation, is_valid_env_var_name, is_valid_provider_endpoint,
+    is_valid_slug, normalize_list,
 };
+use crate::secrets::is_valid_secret_reference;
 use crate::tools::{
     allowed_tool_arg_keys, is_valid_tool_arg_key, validate_tool_invocation, validate_tool_template,
 };
@@ -128,6 +130,11 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
     let agent_ids = os.agents.keys().cloned().collect::<BTreeSet<_>>();
     let tool_definitions = os.tools.clone();
     for task in os.tasks.values_mut() {
+        if task.max_attempts == 0 {
+            repairs.push(format!("raised task {} max_attempts to 1", task.id));
+            task.max_attempts = 1;
+            task.updated_at = Utc::now();
+        }
         if let Some(agent_id) = &task.assigned_to
             && task.status != TaskStatus::Running
             && !agent_ids.contains(agent_id)
@@ -337,6 +344,42 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
             &mut record.updated_at,
             &mut repairs,
         );
+        if record
+            .scope
+            .as_ref()
+            .map(|scope| scope.trim().is_empty())
+            .unwrap_or(false)
+        {
+            repairs.push(format!("cleared empty memory record {} scope", record.id));
+            record.scope = None;
+            record.updated_at = Utc::now();
+        }
+    }
+
+    let default_memory_policy = crate::models::MemoryPolicy::default();
+    if os.memory_policy.max_provider_memories == 0 {
+        repairs.push(format!(
+            "reset memory_policy max_provider_memories to {}",
+            default_memory_policy.max_provider_memories
+        ));
+        os.memory_policy.max_provider_memories = default_memory_policy.max_provider_memories;
+        os.touch();
+    }
+    if os.memory_policy.max_age_days == Some(0) {
+        repairs.push("cleared zero memory_policy max_age_days".into());
+        os.memory_policy.max_age_days = None;
+        os.touch();
+    }
+    if os
+        .memory_policy
+        .scope
+        .as_ref()
+        .map(|scope| scope.trim().is_empty())
+        .unwrap_or(false)
+    {
+        repairs.push("cleared empty memory_policy scope".into());
+        os.memory_policy.scope = None;
+        os.touch();
     }
 
     let before_events = os.events.len();
@@ -497,6 +540,22 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
         os.provider.request_timeout_seconds = default_provider.request_timeout_seconds;
         os.touch();
     }
+    if os.provider.max_retries > MAX_PROVIDER_RETRIES {
+        repairs.push(format!(
+            "reset provider max_retries to {}",
+            default_provider.max_retries
+        ));
+        os.provider.max_retries = default_provider.max_retries;
+        os.touch();
+    }
+    if os.provider.retry_backoff_ms == 0 {
+        repairs.push(format!(
+            "reset provider retry_backoff_ms to {}",
+            default_provider.retry_backoff_ms
+        ));
+        os.provider.retry_backoff_ms = default_provider.retry_backoff_ms;
+        os.touch();
+    }
     if os.provider.api_key_env.trim().is_empty() {
         repairs.push(format!(
             "reset provider api_key_env to {}",
@@ -543,6 +602,31 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
         os.provider.endpoint = None;
         os.touch();
     }
+    let provider_adapter = provider_adapter_family(&os.provider);
+    let mut removed_provider_options = Vec::new();
+    os.provider.request_options.retain(|key, _| {
+        if key.trim().is_empty() {
+            removed_provider_options.push("empty provider request_options key".to_owned());
+            return false;
+        }
+        if key != key.trim() {
+            removed_provider_options.push(format!(
+                "provider request_options key `{key}` with surrounding whitespace"
+            ));
+            return false;
+        }
+        if provider_request_option_is_reserved_for_family(provider_adapter, key) {
+            removed_provider_options.push(format!("reserved provider request_options key `{key}`"));
+            return false;
+        }
+        true
+    });
+    if !removed_provider_options.is_empty() {
+        for option in removed_provider_options {
+            repairs.push(format!("removed {option}"));
+        }
+        os.touch();
+    }
 
     if repair_policy_list(
         "policy allowed_commands",
@@ -573,6 +657,23 @@ pub fn repair_state(os: &mut OperatingSystem) -> RepairReport {
         &mut os.policy.redacted_env_patterns,
         &mut repairs,
     ) {
+        os.touch();
+    }
+    if repair_policy_list(
+        "policy sandbox writable_paths",
+        &mut os.policy.sandbox.writable_paths,
+        &mut repairs,
+    ) {
+        os.touch();
+    }
+    if repair_policy_list(
+        "policy network allowed_hosts",
+        &mut os.policy.network.allowed_hosts,
+        &mut repairs,
+    ) {
+        os.touch();
+    }
+    if repair_policy_list("policy rules", &mut os.policy.rules, &mut repairs) {
         os.touch();
     }
     let default_policy = Policy::default();
@@ -662,7 +763,7 @@ fn repair_tool_invocation(
         true
     });
 
-    invocation.secret_env_args.retain(|key, env| {
+    invocation.secret_env_args.retain(|key, reference| {
         if !is_valid_tool_arg_key(key) {
             repairs.push(format!(
                 "removed invalid secret tool argument key {} from task {}",
@@ -687,9 +788,9 @@ fn repair_tool_invocation(
             changed = true;
             return false;
         }
-        if !is_valid_env_var_name(env) {
+        if !is_valid_secret_reference(reference) {
             repairs.push(format!(
-                "removed invalid secret env arg {} from task {}",
+                "removed invalid secret reference arg {} from task {}",
                 key, task_id
             ));
             changed = true;
@@ -809,6 +910,9 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
         }
         if task.title.trim().is_empty() {
             issues.push(format!("task {} has empty title", task.id));
+        }
+        if task.max_attempts == 0 {
+            issues.push(format!("task {} has zero max_attempts", task.id));
         }
         if task.objective.trim().is_empty() {
             issues.push(format!("task {} has empty objective", task.id));
@@ -943,17 +1047,15 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
                 .any(|(_, env)| env.trim().is_empty())
             {
                 issues.push(format!(
-                    "task {} secret tool args contain an empty environment variable",
+                    "task {} secret tool args contain an empty secret reference",
                     task.id
                 ));
             }
-            if tool
-                .secret_env_args
-                .iter()
-                .any(|(_, env)| !env.trim().is_empty() && !is_valid_env_var_name(env))
-            {
+            if tool.secret_env_args.iter().any(|(_, reference)| {
+                !reference.trim().is_empty() && !is_valid_secret_reference(reference)
+            }) {
                 issues.push(format!(
-                    "task {} secret tool args contain an invalid environment variable name",
+                    "task {} secret tool args contain an invalid secret reference",
                     task.id
                 ));
             }
@@ -1204,6 +1306,11 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
         } else if !is_valid_slug(run.id.as_str()) {
             issues.push(format!("run {} has invalid id", run.id));
         }
+        if run.trace_id.trim().is_empty() {
+            issues.push(format!("run {} has empty trace_id", run.id));
+        } else if !is_valid_slug(&run.trace_id) {
+            issues.push(format!("run {} has invalid trace_id", run.id));
+        }
         if !is_valid_slug(run.task_id.as_str()) {
             issues.push(format!(
                 "run {} references invalid task id {}",
@@ -1311,6 +1418,14 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
         if record.body.trim().is_empty() {
             issues.push(format!("memory record {} has empty body", record.id));
         }
+        if record
+            .scope
+            .as_ref()
+            .map(|scope| scope.trim().is_empty())
+            .unwrap_or(false)
+        {
+            issues.push(format!("memory record {} scope is empty", record.id));
+        }
         validate_updated_at_order(
             &mut issues,
             &format!("memory record {}", record.id),
@@ -1328,6 +1443,22 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
                 record.id
             ));
         }
+    }
+
+    if os.memory_policy.max_provider_memories == 0 {
+        issues.push("memory_policy max_provider_memories must be greater than 0".into());
+    }
+    if os.memory_policy.max_age_days == Some(0) {
+        issues.push("memory_policy max_age_days must be greater than 0 when set".into());
+    }
+    if os
+        .memory_policy
+        .scope
+        .as_ref()
+        .map(|scope| scope.trim().is_empty())
+        .unwrap_or(false)
+    {
+        issues.push("memory_policy scope is empty".into());
     }
 
     if os.events.len() > 500 {
@@ -1378,12 +1509,58 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
     {
         issues.push("provider endpoint must be an absolute http(s) URL".into());
     }
-    if matches!(os.provider.kind, ProviderKind::OpenAiCompatible) && os.provider.endpoint.is_none()
-    {
-        issues.push("provider endpoint is required for openai-compatible provider".into());
+    if matches!(os.provider.kind, ProviderKind::Plugin) {
+        match os.provider.plugin_command.as_deref() {
+            Some(command) if command.trim().is_empty() => {
+                issues.push("provider plugin_command is empty".into());
+            }
+            Some(_) => {}
+            None => issues.push("provider plugin_command is required for plugin provider".into()),
+        }
+        if has_empty_entry(&os.provider.plugin_args) {
+            issues.push("provider plugin_args contains an empty value".into());
+        }
+        for key in os.provider.plugin_env.keys() {
+            if !is_valid_env_var_name(key) {
+                issues.push(format!(
+                    "provider plugin_env key `{key}` must be a valid environment variable name"
+                ));
+            }
+        }
+    } else if !matches!(os.provider.kind, ProviderKind::Mock) && os.provider.endpoint.is_none() {
+        issues.push(format!(
+            "provider endpoint is required for {} provider",
+            os.provider.kind
+        ));
     }
     if os.provider.request_timeout_seconds == 0 {
         issues.push("provider request_timeout_seconds must be greater than 0".into());
+    }
+    if os.provider.max_retries > MAX_PROVIDER_RETRIES {
+        issues.push(format!(
+            "provider max_retries must be less than or equal to {MAX_PROVIDER_RETRIES}"
+        ));
+    }
+    if os.provider.retry_backoff_ms == 0 {
+        issues.push("provider retry_backoff_ms must be greater than 0".into());
+    }
+    if let Some(adapter) = &os.provider.adapter {
+        if adapter.trim().is_empty() {
+            issues.push("provider adapter is empty".into());
+        } else if !valid_provider_adapter(adapter) {
+            issues.push(format!("unsupported provider adapter `{adapter}`"));
+        }
+    }
+    for key in os.provider.request_options.keys() {
+        if key.trim().is_empty() {
+            issues.push("provider request_options contains an empty key".into());
+        } else if key != key.trim() {
+            issues.push(format!(
+                "provider request_options key `{key}` has surrounding whitespace"
+            ));
+        } else if provider_request_option_is_reserved(&os.provider, key) {
+            issues.push(format!("provider request_options cannot override `{key}`"));
+        }
     }
     if has_empty_entry(&os.policy.allowed_commands) {
         issues.push("policy allowed_commands contains an empty value".into());
@@ -1407,6 +1584,15 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
     }
     if has_empty_entry(&os.policy.redacted_env_patterns) {
         issues.push("policy redacted_env_patterns contains an empty value".into());
+    }
+    if has_empty_entry(&os.policy.sandbox.writable_paths) {
+        issues.push("policy sandbox writable_paths contains an empty value".into());
+    }
+    if has_empty_entry(&os.policy.network.allowed_hosts) {
+        issues.push("policy network allowed_hosts contains an empty value".into());
+    }
+    if has_empty_entry(&os.policy.rules) {
+        issues.push("policy rules contains an empty value".into());
     }
     if os.policy.max_output_bytes == 0 {
         issues.push("policy max_output_bytes must be greater than 0".into());
@@ -1449,6 +1635,77 @@ pub fn validate_state(os: &OperatingSystem) -> ValidationReport {
 
 fn has_empty_entry(values: &[String]) -> bool {
     values.iter().any(|value| value.trim().is_empty())
+}
+
+fn valid_provider_adapter(adapter: &str) -> bool {
+    matches!(
+        adapter.trim().to_ascii_lowercase().as_str(),
+        "openai"
+            | "openai-chat"
+            | "openai-compatible"
+            | "chat-completions"
+            | "anthropic"
+            | "anthropic-messages"
+            | "claude"
+            | "gemini"
+            | "gemini-generate-content"
+            | "google-gemini"
+            | "ollama"
+            | "ollama-chat"
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderAdapterFamily {
+    OpenAi,
+    Anthropic,
+    Gemini,
+    Ollama,
+}
+
+fn provider_adapter_family(provider: &ProviderSettings) -> Option<ProviderAdapterFamily> {
+    if let Some(adapter) = provider.adapter.as_deref() {
+        return match adapter.trim().to_ascii_lowercase().as_str() {
+            "openai" | "openai-chat" | "openai-compatible" | "chat-completions" => {
+                Some(ProviderAdapterFamily::OpenAi)
+            }
+            "anthropic" | "anthropic-messages" | "claude" => Some(ProviderAdapterFamily::Anthropic),
+            "gemini" | "gemini-generate-content" | "google-gemini" => {
+                Some(ProviderAdapterFamily::Gemini)
+            }
+            "ollama" | "ollama-chat" => Some(ProviderAdapterFamily::Ollama),
+            _ => None,
+        };
+    }
+    Some(match provider.kind {
+        ProviderKind::Anthropic => ProviderAdapterFamily::Anthropic,
+        ProviderKind::Gemini => ProviderAdapterFamily::Gemini,
+        ProviderKind::Ollama => ProviderAdapterFamily::Ollama,
+        ProviderKind::Mock
+        | ProviderKind::OpenAi
+        | ProviderKind::OpenAiCompatible
+        | ProviderKind::Custom
+        | ProviderKind::Plugin
+        | ProviderKind::Local => ProviderAdapterFamily::OpenAi,
+    })
+}
+
+fn provider_request_option_is_reserved(provider: &ProviderSettings, key: &str) -> bool {
+    provider_request_option_is_reserved_for_family(provider_adapter_family(provider), key)
+}
+
+fn provider_request_option_is_reserved_for_family(
+    family: Option<ProviderAdapterFamily>,
+    key: &str,
+) -> bool {
+    match family {
+        Some(ProviderAdapterFamily::OpenAi) | Some(ProviderAdapterFamily::Ollama) => {
+            matches!(key, "model" | "messages")
+        }
+        Some(ProviderAdapterFamily::Anthropic) => matches!(key, "model" | "messages" | "system"),
+        Some(ProviderAdapterFamily::Gemini) => matches!(key, "contents"),
+        None => false,
+    }
 }
 
 fn has_empty_list_part(values: &[String]) -> bool {
@@ -2190,7 +2447,7 @@ mod tests {
             issue.contains("policy allowed_env_vars contains an invalid environment variable name")
         }));
         assert!(report.issues.iter().any(|issue| {
-            issue.contains("secret tool args contain an invalid environment variable name")
+            issue.contains("secret tool args contain an invalid secret reference")
         }));
     }
 
@@ -2322,7 +2579,7 @@ mod tests {
             report
                 .repairs
                 .iter()
-                .any(|repair| repair.contains("removed invalid secret env arg secret"))
+                .any(|repair| repair.contains("removed invalid secret reference arg secret"))
         );
     }
 
@@ -2734,6 +2991,16 @@ mod tests {
         os.provider.model = " ".into();
         os.provider.api_key_env = " OPENAI_API_KEY ".into();
         os.provider.endpoint = Some(" ".into());
+        os.provider.max_retries = MAX_PROVIDER_RETRIES + 1;
+        os.provider
+            .request_options
+            .insert("messages".into(), serde_json::json!([]));
+        os.provider
+            .request_options
+            .insert(" temperature ".into(), serde_json::json!(0.2));
+        os.provider
+            .request_options
+            .insert("top_p".into(), serde_json::json!(0.9));
 
         let report = repair_state(&mut os);
 
@@ -2742,11 +3009,33 @@ mod tests {
         assert_eq!(os.provider.model, ProviderSettings::default().model);
         assert_eq!(os.provider.api_key_env, "OPENAI_API_KEY");
         assert!(os.provider.endpoint.is_none());
+        assert_eq!(
+            os.provider.max_retries,
+            ProviderSettings::default().max_retries
+        );
+        assert!(os.provider.request_options.get("messages").is_none());
+        assert!(os.provider.request_options.get(" temperature ").is_none());
+        assert_eq!(
+            os.provider.request_options.get("top_p"),
+            Some(&serde_json::json!(0.9))
+        );
         assert!(
             report
                 .repairs
                 .iter()
                 .any(|repair| repair.contains("reset provider model"))
+        );
+        assert!(
+            report
+                .repairs
+                .iter()
+                .any(|repair| repair.contains("reserved provider request_options key `messages`"))
+        );
+        assert!(
+            report
+                .repairs
+                .iter()
+                .any(|repair| repair.contains("surrounding whitespace"))
         );
         assert!(
             report
@@ -2759,6 +3048,12 @@ mod tests {
                 .repairs
                 .iter()
                 .any(|repair| repair.contains("cleared empty provider endpoint"))
+        );
+        assert!(
+            report
+                .repairs
+                .iter()
+                .any(|repair| repair.contains("reset provider max_retries"))
         );
 
         let mut mock = OperatingSystem::new("test");
@@ -2774,6 +3069,27 @@ mod tests {
                 .repairs
                 .iter()
                 .any(|repair| repair.contains("cleared invalid mock provider endpoint"))
+        );
+    }
+
+    #[test]
+    fn validates_adapter_reserved_provider_request_options() {
+        let mut os = OperatingSystem::new("test");
+        os.provider.kind = ProviderKind::Custom;
+        os.provider.adapter = Some("anthropic".into());
+        os.provider.endpoint = Some("https://provider.example/v1/messages".into());
+        os.provider
+            .request_options
+            .insert("system".into(), serde_json::json!("do not override"));
+
+        let report = validate_state(&os);
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("provider request_options cannot override `system`"))
         );
     }
 

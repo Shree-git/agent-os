@@ -1,4 +1,5 @@
 use crate::models::{ToolDefinition, ToolInvocation, ToolKind, is_valid_env_var_name};
+use crate::secrets::{EnvironmentSecretResolver, SecretResolveError, SecretResolver};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -32,6 +33,15 @@ pub enum ToolError {
         arg: String,
         env: String,
     },
+    #[error(
+        "secret tool argument `{arg}` for tool `{tool}` could not resolve `{reference}`: {message}"
+    )]
+    SecretResolve {
+        tool: String,
+        arg: String,
+        reference: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,11 +70,31 @@ pub fn render_tool_command_with_redaction_patterns(
     invocation: &ToolInvocation,
     redacted_key_patterns: &[String],
 ) -> Result<RenderedToolCommand, ToolError> {
+    render_tool_command_with_resolver_and_redaction_patterns(
+        tool,
+        invocation,
+        &EnvironmentSecretResolver,
+        redacted_key_patterns,
+    )
+}
+
+pub fn render_tool_command_with_resolver_and_redaction_patterns(
+    tool: &ToolDefinition,
+    invocation: &ToolInvocation,
+    secret_resolver: &impl SecretResolver,
+    redacted_key_patterns: &[String],
+) -> Result<RenderedToolCommand, ToolError> {
     match &tool.kind {
         ToolKind::Shell => {}
         other => return Err(ToolError::UnsupportedKind(other.clone())),
     }
-    let rendered = render_template(tool, invocation, redacted_key_patterns, true)?;
+    let rendered = render_template(
+        tool,
+        invocation,
+        secret_resolver,
+        redacted_key_patterns,
+        true,
+    )?;
 
     Ok(RenderedToolCommand {
         command: rendered.text,
@@ -78,7 +108,27 @@ pub fn render_tool_text_with_redaction_patterns(
     invocation: &ToolInvocation,
     redacted_key_patterns: &[String],
 ) -> Result<RenderedToolText, ToolError> {
-    render_template(tool, invocation, redacted_key_patterns, false)
+    render_tool_text_with_resolver_and_redaction_patterns(
+        tool,
+        invocation,
+        &EnvironmentSecretResolver,
+        redacted_key_patterns,
+    )
+}
+
+pub fn render_tool_text_with_resolver_and_redaction_patterns(
+    tool: &ToolDefinition,
+    invocation: &ToolInvocation,
+    secret_resolver: &impl SecretResolver,
+    redacted_key_patterns: &[String],
+) -> Result<RenderedToolText, ToolError> {
+    render_template(
+        tool,
+        invocation,
+        secret_resolver,
+        redacted_key_patterns,
+        false,
+    )
 }
 
 pub fn validate_tool_template(tool: &ToolDefinition) -> Result<(), ToolError> {
@@ -135,7 +185,16 @@ pub fn resolve_tool_arg(
     invocation: &ToolInvocation,
     key: &str,
 ) -> Result<String, ToolError> {
-    resolve_arg(tool, invocation, key).map(|(value, _)| value)
+    resolve_tool_arg_with_resolver(tool, invocation, key, &EnvironmentSecretResolver)
+}
+
+pub fn resolve_tool_arg_with_resolver(
+    tool: &ToolDefinition,
+    invocation: &ToolInvocation,
+    key: &str,
+    secret_resolver: &impl SecretResolver,
+) -> Result<String, ToolError> {
+    resolve_arg(tool, invocation, key, secret_resolver).map(|(value, _)| value)
 }
 
 fn template_placeholders(tool: &ToolDefinition) -> Result<BTreeSet<String>, ToolError> {
@@ -177,6 +236,7 @@ fn template_placeholders(tool: &ToolDefinition) -> Result<BTreeSet<String>, Tool
 fn render_template(
     tool: &ToolDefinition,
     invocation: &ToolInvocation,
+    secret_resolver: &impl SecretResolver,
     redacted_key_patterns: &[String],
     quote_values: bool,
 ) -> Result<RenderedToolText, ToolError> {
@@ -213,7 +273,7 @@ fn render_template(
         }
         validate_template_placeholder(tool, &key)?;
 
-        let (value, secret) = resolve_arg(tool, invocation, &key)?;
+        let (value, secret) = resolve_arg(tool, invocation, &key, secret_resolver)?;
         if (secret || should_redact_key(&key, redacted_key_patterns)) && !value.is_empty() {
             redacted_values.push(value.clone());
         }
@@ -235,24 +295,23 @@ fn resolve_arg(
     tool: &ToolDefinition,
     invocation: &ToolInvocation,
     key: &str,
+    secret_resolver: &impl SecretResolver,
 ) -> Result<(String, bool), ToolError> {
     if let Some(value) = invocation.args.get(key) {
         return Ok((value.clone(), false));
     }
 
-    if let Some(env) = invocation.secret_env_args.get(key) {
-        if !is_valid_env_var_name(env) {
+    if let Some(reference) = invocation.secret_env_args.get(key) {
+        if !is_valid_env_var_name(reference) && !reference.contains(':') {
             return Err(ToolError::InvalidSecretEnv {
                 tool: tool.id.to_string(),
                 arg: key.to_owned(),
-                env: env.clone(),
+                env: reference.clone(),
             });
         }
-        let value = std::env::var(env).map_err(|_| ToolError::MissingSecretEnv {
-            tool: tool.id.to_string(),
-            arg: key.to_owned(),
-            env: env.clone(),
-        })?;
+        let value = secret_resolver
+            .resolve_secret(reference)
+            .map_err(|error| tool_secret_error(tool, key, reference, error))?;
         return Ok((value, true));
     }
 
@@ -260,6 +319,32 @@ fn resolve_arg(
         tool: tool.id.to_string(),
         arg: key.to_owned(),
     })
+}
+
+fn tool_secret_error(
+    tool: &ToolDefinition,
+    arg: &str,
+    reference: &str,
+    error: SecretResolveError,
+) -> ToolError {
+    match error {
+        SecretResolveError::InvalidEnvironmentName(env) => ToolError::InvalidSecretEnv {
+            tool: tool.id.to_string(),
+            arg: arg.to_owned(),
+            env,
+        },
+        SecretResolveError::MissingEnvironment(env) => ToolError::MissingSecretEnv {
+            tool: tool.id.to_string(),
+            arg: arg.to_owned(),
+            env,
+        },
+        other => ToolError::SecretResolve {
+            tool: tool.id.to_string(),
+            arg: arg.to_owned(),
+            reference: reference.to_owned(),
+            message: other.to_string(),
+        },
+    }
 }
 
 fn should_redact_key(key: &str, redacted_key_patterns: &[String]) -> bool {

@@ -4,17 +4,47 @@ name = "Agent OS Example"
 allow_shell = true
 allowed_commands = ["cargo test", "cargo clippy --all-targets"]
 allowed_workspaces = ["."]
-denied_patterns = ["rm -rf", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+denied_patterns = ["rm -rf", "rm -fr", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "dd of="]
+rules = ["allow cargo test, allow cargo clippy, deny cargo publish, deny writes outside src"]
 max_output_bytes = 131072
 command_timeout_seconds = 300
 inherit_environment = false
 allowed_env_vars = ["PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "RUSTUP_HOME", "CARGO_HOME"]
 redacted_env_patterns = ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"]
 
+[policy.sandbox]
+process_isolation = true
+jailed_workspaces = true
+writable_paths = ["./src"]
+
+[policy.network]
+mode = "allowed"
+allowed_hosts = []
+
+[policy.approval]
+require_for_risky_actions = false
+risky_patterns = ["git push", "git commit", "rm ", "mv ", "chmod", "curl ", "wget ", "ssh "]
+
 [provider]
 kind = "mock"
 model = "mock-agent"
+# kind = "anthropic" # or openai, gemini, ollama, local, openai-compatible, plugin, custom
+# adapter = "anthropic" # optional for custom provider endpoints
+# endpoint = "https://api.anthropic.com/v1/messages"
+# api_key_env = "ANTHROPIC_API_KEY"
+# plugin_command = "agent-os-provider-plugin"
+# plugin_args = ["--json"]
+# plugin_env = { AGENT_OS_PROVIDER_PLUGIN_TOKEN = "local-dev-token" }
 request_timeout_seconds = 30
+# Provider retries are capped at 8 to keep failed calls bounded.
+max_retries = 2
+retry_backoff_ms = 250
+# request_options = { temperature = 0.2, top_p = 0.9, stream = true }
+
+[memory_policy]
+max_provider_memories = 5
+semantic_recall = true
+max_age_days = 30
 
 [[agents]]
 name = "builder"
@@ -36,4 +66,3 @@ kind = "shell"
 description = "Run clippy across all targets"
 required_capabilities = ["rust", "review"]
 command_template = "cargo clippy --all-targets"
-

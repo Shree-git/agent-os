@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">Agent OS dashboard preview</title>
+  <desc id="desc">A product screenshot-style preview showing agent status, task queues, run logs, metrics, approvals, memory, and an event timeline.</desc>
+  <rect width="1280" height="760" fill="#f7f8fa"/>
+  <rect x="40" y="36" width="1200" height="688" rx="8" fill="#ffffff" stroke="#d7dde5"/>
+  <rect x="40" y="36" width="1200" height="64" rx="8" fill="#17212b"/>
+  <text x="72" y="76" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="24" font-weight="700" fill="#ffffff">Agent OS</text>
+  <text x="190" y="76" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15" fill="#a9b7c6">local control plane</text>
+  <rect x="1010" y="56" width="18" height="18" rx="4" fill="#41b883"/>
+  <text x="1038" y="72" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#dce5ee">daemon running</text>
+
+  <rect x="72" y="132" width="240" height="112" rx="8" fill="#eef8f2" stroke="#b9dfc8"/>
+  <text x="96" y="164" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#245b3c">Agents</text>
+  <text x="96" y="205" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="800" fill="#111827">3</text>
+  <text x="150" y="203" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">online builders</text>
+
+  <rect x="336" y="132" width="240" height="112" rx="8" fill="#fff4ed" stroke="#f2c3a5"/>
+  <text x="360" y="164" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#7a3d19">Tasks</text>
+  <text x="360" y="205" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="800" fill="#111827">8</text>
+  <text x="414" y="203" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">queued by capability</text>
+
+  <rect x="600" y="132" width="240" height="112" rx="8" fill="#edf5ff" stroke="#bfd7f3"/>
+  <text x="624" y="164" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#24506f">Runs</text>
+  <text x="624" y="205" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="800" fill="#111827">21</text>
+  <text x="696" y="203" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">logged and replayable</text>
+
+  <rect x="864" y="132" width="344" height="112" rx="8" fill="#f5f3ff" stroke="#d8d1f5"/>
+  <text x="888" y="164" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="700" fill="#51427e">Metrics</text>
+  <text x="888" y="205" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="800" fill="#111827">99.8%</text>
+  <text x="1014" y="203" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">runs completed locally</text>
+
+  <rect x="72" y="276" width="540" height="216" rx="8" fill="#ffffff" stroke="#d7dde5"/>
+  <text x="96" y="312" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#111827">Workflow Queue</text>
+  <line x1="96" y1="332" x2="588" y2="332" stroke="#e5e9ef"/>
+  <circle cx="112" cy="364" r="7" fill="#41b883"/>
+  <text x="132" y="370" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#111827">plan: reproduce failing release check</text>
+  <text x="522" y="370" text-anchor="end" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#52606d">done</text>
+  <circle cx="112" cy="410" r="7" fill="#d06b2f"/>
+  <text x="132" y="416" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#111827">build: patch Homebrew formula</text>
+  <text x="522" y="416" text-anchor="end" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#52606d">running</text>
+  <circle cx="112" cy="456" r="7" fill="#b8c1cc"/>
+  <text x="132" y="462" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#111827">review: verify release notes</text>
+  <text x="522" y="462" text-anchor="end" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#52606d">waiting</text>
+
+  <rect x="640" y="276" width="568" height="216" rx="8" fill="#101820"/>
+  <text x="664" y="312" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#ffffff">Run Log</text>
+  <text x="664" y="350" font-family="SFMono-Regular, ui-monospace, monospace" font-size="13" fill="#c9d4df">$ agent-os run --execute --limit 1</text>
+  <text x="664" y="382" font-family="SFMono-Regular, ui-monospace, monospace" font-size="13" fill="#a7f3d0">scheduled task-4f12a9c1 to builder</text>
+  <text x="664" y="414" font-family="SFMono-Regular, ui-monospace, monospace" font-size="13" fill="#fde68a">trace trace-a91c52b0ef3d</text>
+  <text x="664" y="446" font-family="SFMono-Regular, ui-monospace, monospace" font-size="13" fill="#dbeafe">completed cargo-test in 1842 ms</text>
+
+  <rect x="72" y="524" width="340" height="152" rx="8" fill="#ffffff" stroke="#d7dde5"/>
+  <text x="96" y="560" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#111827">Approvals</text>
+  <text x="96" y="598" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">provider requested tool task</text>
+  <rect x="96" y="620" width="92" height="28" rx="6" fill="#245b3c"/>
+  <text x="142" y="639" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#ffffff">approve</text>
+  <rect x="198" y="620" width="72" height="28" rx="6" fill="#f1f3f5" stroke="#d7dde5"/>
+  <text x="234" y="639" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#1f2937">deny</text>
+
+  <rect x="440" y="524" width="340" height="152" rx="8" fill="#ffffff" stroke="#d7dde5"/>
+  <text x="464" y="560" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#111827">Memory</text>
+  <text x="464" y="598" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">shared release-context</text>
+  <text x="464" y="628" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">private client note hidden from providers</text>
+
+  <rect x="808" y="524" width="400" height="152" rx="8" fill="#ffffff" stroke="#d7dde5"/>
+  <text x="832" y="560" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#111827">Event Timeline</text>
+  <text x="832" y="598" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">task-created -> run-started -> run-finished</text>
+  <text x="832" y="628" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#52606d">policy-rejected events stay auditable</text>
+</svg>

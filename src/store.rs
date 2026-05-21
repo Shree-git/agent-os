@@ -34,6 +34,8 @@ pub enum StoreError {
     },
     #[error("state validation failed at {path}: {issues}")]
     InvalidState { path: PathBuf, issues: String },
+    #[error("sqlite backend error at {path}: {message}")]
+    Backend { path: PathBuf, message: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -41,12 +43,20 @@ pub struct PruneReport {
     pub dry_run: bool,
     pub removed_runs: Vec<RunId>,
     pub removed_log_paths: Vec<String>,
+    pub removed_artifact_paths: Vec<String>,
     pub removed_events: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreBackend {
+    Json,
+    Sqlite,
 }
 
 #[derive(Clone, Debug)]
 pub struct Store {
     path: PathBuf,
+    backend: StoreBackend,
 }
 
 struct StoreLock {
@@ -74,7 +84,17 @@ impl Store {
     }
 
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            backend: StoreBackend::Json,
+        }
+    }
+
+    pub fn new_sqlite(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            backend: StoreBackend::Sqlite,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -94,6 +114,15 @@ impl Store {
             .join(format!("{run_id}.log"))
     }
 
+    pub fn run_artifact_path(&self, run_id: &RunId, name: &str) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("artifacts")
+            .join(run_id.to_string())
+            .join(name)
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("lock")
     }
@@ -108,6 +137,11 @@ impl Store {
     }
 
     fn load_unlocked(&self) -> Result<OperatingSystem, StoreError> {
+        if self.backend == StoreBackend::Sqlite {
+            return crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()));
+        }
         let body = fs::read_to_string(&self.path).map_err(|source| StoreError::Io {
             path: self.path.clone(),
             source,
@@ -178,6 +212,15 @@ impl Store {
 
     pub fn export_json(&self) -> Result<String, StoreError> {
         let _lock = self.lock_shared()?;
+        if self.backend == StoreBackend::Sqlite {
+            let os = crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()))?;
+            return serde_json::to_string_pretty(&os).map_err(|source| StoreError::Json {
+                path: self.path.clone(),
+                source,
+            });
+        }
         fs::read_to_string(&self.path).map_err(|source| StoreError::Io {
             path: self.path.clone(),
             source,
@@ -195,10 +238,20 @@ impl Store {
             });
         }
         let _lock = self.lock_shared()?;
-        let body = fs::read(&self.path).map_err(|source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        let body = if self.backend == StoreBackend::Sqlite {
+            let os = crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()))?;
+            serde_json::to_vec_pretty(&os).map_err(|source| StoreError::Json {
+                path: self.path.clone(),
+                source,
+            })?
+        } else {
+            fs::read(&self.path).map_err(|source| StoreError::Io {
+                path: self.path.clone(),
+                source,
+            })?
+        };
         write_file_atomic_creating_parent(destination_path, &body)?;
         Ok(destination_path.to_path_buf())
     }
@@ -214,10 +267,16 @@ impl Store {
             });
         }
         let _lock = self.lock_shared()?;
-        fs::read(&self.path).map_err(|source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        if self.backend == StoreBackend::Sqlite {
+            crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()))?;
+        } else {
+            fs::read(&self.path).map_err(|source| StoreError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         Ok(destination_path.to_path_buf())
     }
 
@@ -291,6 +350,14 @@ impl Store {
     }
 
     pub fn read_state_from_path(source_path: &Path) -> Result<OperatingSystem, StoreError> {
+        if is_sqlite_path(source_path) {
+            return crate::sqlite_store::SqliteStore::new(source_path)
+                .load_snapshot()
+                .map_err(|source| StoreError::Backend {
+                    path: source_path.to_path_buf(),
+                    message: source.to_string(),
+                });
+        }
         let body = fs::read_to_string(source_path).map_err(|source| StoreError::Io {
             path: source_path.to_path_buf(),
             source,
@@ -406,10 +473,20 @@ impl Store {
             });
         }
         let _lock = self.lock_shared()?;
-        let body = fs::read(&self.path).map_err(|source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        let body = if self.backend == StoreBackend::Sqlite {
+            let os = crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()))?;
+            serde_json::to_vec_pretty(&os).map_err(|source| StoreError::Json {
+                path: self.path.clone(),
+                source,
+            })?
+        } else {
+            fs::read(&self.path).map_err(|source| StoreError::Io {
+                path: self.path.clone(),
+                source,
+            })?
+        };
         write_file_atomic_creating_parent(destination_path, &body)?;
         Ok(destination_path.to_path_buf())
     }
@@ -425,10 +502,16 @@ impl Store {
             });
         }
         let _lock = self.lock_shared()?;
-        fs::read(&self.path).map_err(|source| StoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        if self.backend == StoreBackend::Sqlite {
+            crate::sqlite_store::SqliteStore::new(&self.path)
+                .load_snapshot()
+                .map_err(|source| self.backend_error(source.to_string()))?;
+        } else {
+            fs::read(&self.path).map_err(|source| StoreError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         Ok(destination_path.to_path_buf())
     }
 
@@ -455,10 +538,23 @@ impl Store {
     }
 
     fn save_unlocked(&self, os: &OperatingSystem) -> Result<(), StoreError> {
+        if self.backend == StoreBackend::Sqlite {
+            return crate::sqlite_store::SqliteStore::new(&self.path)
+                .save_snapshot_with_records(os)
+                .map_err(|source| self.backend_error(source.to_string()));
+        }
         Self::save_to_path(&self.path, os)
     }
 
     fn save_to_path(path: &Path, os: &OperatingSystem) -> Result<(), StoreError> {
+        if is_sqlite_path(path) {
+            return crate::sqlite_store::SqliteStore::new(path)
+                .save_snapshot_with_records(os)
+                .map_err(|source| StoreError::Backend {
+                    path: path.to_path_buf(),
+                    message: source.to_string(),
+                });
+        }
         let body = serde_json::to_string_pretty(os).map_err(|source| StoreError::Json {
             path: path.to_path_buf(),
             source,
@@ -508,6 +604,11 @@ impl Store {
     pub fn write_run_log(&self, run_id: &RunId, body: &str) -> Result<PathBuf, StoreError> {
         let path = self.run_log_path(run_id);
         write_file_atomic_creating_parent(&path, body.as_bytes())?;
+        if self.backend == StoreBackend::Sqlite {
+            crate::sqlite_store::SqliteStore::new(&self.path)
+                .save_run_log(run_id, body)
+                .map_err(|source| self.backend_error(source.to_string()))?;
+        }
         Ok(path)
     }
 
@@ -542,8 +643,27 @@ impl Store {
                 fs::remove_file(&path).map_err(|source| StoreError::Io { path, source })?;
             }
         }
+        for path in &report.removed_artifact_paths {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|source| StoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
 
         Ok(report)
+    }
+
+    fn backend_error(&self, message: String) -> StoreError {
+        StoreError::Backend {
+            path: self.path.clone(),
+            message,
+        }
     }
 }
 
@@ -574,12 +694,31 @@ fn prune_report(
         .iter()
         .map(|run| store.run_log_path(&run.id).display().to_string())
         .collect::<Vec<_>>();
+    let removed_artifact_paths = runs_to_remove
+        .iter()
+        .flat_map(|run| {
+            run.artifacts
+                .iter()
+                .filter(|artifact| {
+                    matches!(
+                        artifact.kind,
+                        crate::models::RunArtifactKind::Stdout
+                            | crate::models::RunArtifactKind::Stderr
+                            | crate::models::RunArtifactKind::Diff
+                            | crate::models::RunArtifactKind::File
+                    )
+                })
+                .map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let removed_events = os.events.len().saturating_sub(keep_events);
 
     PruneReport {
         dry_run,
         removed_runs,
         removed_log_paths,
+        removed_artifact_paths,
         removed_events,
     }
 }
@@ -632,6 +771,18 @@ fn path_targets_same_file(left: &Path, right: &Path) -> bool {
         (Ok(left_parent), Ok(right_parent)) => left_parent == right_parent,
         _ => false,
     }
+}
+
+fn is_sqlite_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "sqlite" | "sqlite3" | "db"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn normalize_path_lexically(path: &Path) -> PathBuf {
@@ -758,11 +909,11 @@ mod tests {
         assert_eq!(migration.from_version, 0);
         assert!(migration.changed);
         assert!(validation.valid);
-        assert_eq!(store.load().expect("load").version, 3);
+        assert_eq!(store.load().expect("load").version, 4);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(store.path()).expect("state body"))
                 .expect("persisted json");
-        assert_eq!(persisted["version"], 3);
+        assert_eq!(persisted["version"], 4);
     }
 
     #[test]
@@ -1154,5 +1305,152 @@ mod tests {
         assert!(matches!(error, StoreError::Io { .. }));
         assert!(destination.is_dir());
         assert_eq!(fs::read_dir(dir.path()).expect("read dir").count(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_can_be_used_as_active_state_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new_sqlite(dir.path().join("active.sqlite"));
+        let mut os = OperatingSystem::new("active-sqlite");
+        let task = crate::models::Task::new(
+            "Persist me",
+            "through sqlite",
+            crate::models::Priority::Normal,
+            vec![],
+        );
+        let task_id = task.id.clone();
+        os.create_task(task);
+        os.record(crate::models::EventKind::DaemonTick, "active sqlite event");
+        let event_id = os.events.last().expect("event").id.clone();
+        let expected_event_count = os.events.len();
+        let run = RunRecord::new(task_id.clone(), None, "printf active", ".");
+        let run_id = run.id.clone();
+        os.runs.insert(run_id.clone(), run);
+
+        store.save_validated(&os).expect("save sqlite");
+
+        let loaded = store.load().expect("load sqlite");
+        assert_eq!(loaded.name, "active-sqlite");
+        assert_eq!(loaded.tasks.len(), 1);
+
+        let backup_path = dir.path().join("active-backup.json");
+        let preview_backup = store
+            .preview_backup_to_path(&backup_path)
+            .expect("preview sqlite backup");
+        assert_eq!(preview_backup, backup_path);
+        assert!(!backup_path.exists());
+        store.backup_to_path(&backup_path).expect("backup sqlite");
+        assert_eq!(
+            Store::read_state_from_path(&backup_path)
+                .expect("backup snapshot")
+                .name,
+            "active-sqlite"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(&backup_path).expect("backup body")
+            )
+            .is_ok(),
+            "SQLite active-state backup should be JSON, not raw database bytes"
+        );
+
+        let sqlite = crate::sqlite_store::SqliteStore::new(store.path());
+        assert_eq!(sqlite.run_record_count().expect("run count"), 1);
+        assert_eq!(sqlite.task_record_count().expect("task count"), 1);
+        assert_eq!(
+            sqlite.event_record_count().expect("event count"),
+            expected_event_count
+        );
+        assert_eq!(
+            sqlite
+                .load_task_record(&task_id)
+                .expect("task record")
+                .title,
+            "Persist me"
+        );
+        assert_eq!(
+            sqlite
+                .load_event_record(&event_id)
+                .expect("event record")
+                .message,
+            "active sqlite event"
+        );
+        assert_eq!(
+            sqlite
+                .load_run_record(&run_id)
+                .expect("active run record")
+                .command,
+            "printf active"
+        );
+
+        let memory_id = store
+            .update(|os| {
+                let record = crate::models::MemoryRecord::new(
+                    "sqlite-memory",
+                    "stored through active backend",
+                    vec![],
+                );
+                let memory_id = record.id.clone();
+                os.write_memory(record);
+                Ok::<_, StoreError>(memory_id)
+            })
+            .expect("update sqlite");
+
+        let updated = store.load().expect("load updated sqlite");
+        assert!(
+            updated
+                .memory
+                .iter()
+                .any(|memory| memory.topic == "sqlite-memory")
+        );
+        assert_eq!(sqlite.memory_record_count().expect("memory count"), 1);
+        assert_eq!(
+            sqlite
+                .load_memory_record(&memory_id)
+                .expect("memory record")
+                .body,
+            "stored through active backend"
+        );
+
+        store
+            .update(|os| {
+                os.remove_memory(&memory_id);
+                Ok::<_, StoreError>(())
+            })
+            .expect("remove memory");
+        assert_eq!(
+            sqlite
+                .memory_record_count()
+                .expect("memory count after remove"),
+            0
+        );
+
+        store
+            .update(|os| {
+                os.runs.remove(&run_id);
+                Ok::<_, StoreError>(())
+            })
+            .expect("remove run");
+        assert_eq!(sqlite.run_record_count().expect("run count after prune"), 0);
+        assert_eq!(
+            sqlite
+                .task_record_count()
+                .expect("task count after run prune"),
+            1
+        );
+
+        store
+            .update(|os| {
+                os.events.clear();
+                os.touch();
+                Ok::<_, StoreError>(())
+            })
+            .expect("clear events");
+        assert_eq!(
+            sqlite
+                .event_record_count()
+                .expect("event count after clear"),
+            0
+        );
     }
 }

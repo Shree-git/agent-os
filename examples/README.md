@@ -2,6 +2,8 @@
 
 These examples show how to use Agent OS as a local backend for agent products and automation.
 
+For product storytelling, open `docs/landing.html` from the repository root. It includes the "Why Agent OS" positioning, a copyable local demo flow, and a dashboard-preview screenshot asset for release notes or repository screenshots.
+
 ## Local Coding Queue
 
 Run the example from a checkout after installing the binary:

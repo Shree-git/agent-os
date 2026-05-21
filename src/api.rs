@@ -1,36 +1,56 @@
 use crate::config::{
-    AppConfig, ConfigError, load_config, validate_seed_config, write_default_config,
+    AppConfig, ConfigError, ConfigProfile, load_config, validate_seed_config, write_profile_config,
 };
 use crate::executor::CommandExecutor;
+use crate::git_integration::{
+    GitIntegrationError, resolve_git_cwd, run_git_capture, run_git_command,
+};
+use crate::json_schema::validate_json_schema;
 use crate::migrations::CURRENT_STATE_VERSION;
 use crate::models::{
-    Agent, AgentId, AgentKind, AgentStatus, EventKind, MemoryRecord, OperatingSystem, Priority,
-    ProviderKind, RunId, RunRecord, RunStatus, Task, TaskId, TaskStatus, ToolDefinition, ToolId,
-    ToolInvocation, ToolKind, Workflow, WorkflowId, is_valid_env_var_name, memory_matches_query,
-    normalize_list, tail_text_by_bytes, text_tail_was_truncated,
+    Agent, AgentId, AgentKind, AgentProfile, AgentStatus, ApprovalStatus, AutonomyLevel,
+    EvalRecord, EvalRunDetails, EventKind, MAX_PROVIDER_RETRIES, McpServer, MemoryRecord,
+    MemoryVisibility, NetworkMode, OperatingSystem, Priority, ProviderKind, RunArtifact,
+    RunArtifactKind, RunId, RunRecord, RunStatus, SecretsBackend, SecretsBackendKind, Task, TaskId,
+    TaskStatus, ToolDefinition, ToolId, ToolInvocation, ToolKind, WorkerNode, Workflow, WorkflowId,
+    WorkflowTemplate, WorkflowTemplateEdge, memory_recall_hit, memory_relevance_score,
+    normalize_list, render_workflow_template_text, secret_check_report, tail_text_by_bytes,
+    text_tail_was_truncated, workflow_template_edges, workflow_template_task,
 };
+use crate::policy::{check_shell_command, check_shell_writes, check_workspace};
 use crate::runtime::{AgentUpdate, Runtime, RuntimeError, TaskUpdate, ToolUpdate};
 use crate::scheduler::Scheduler;
+use crate::secrets::is_valid_secret_reference;
 use crate::service::{
-    LaunchdServiceOptions, ServiceError, build_launchd_service as build_launchd_service_definition,
-    default_launchd_plist_path, install_launchd_service as install_launchd_service_definition,
-    resolve_launchd_domain, run_launchctl, uninstall_launchd_service,
-    validate_service_control_inputs,
+    LaunchdServiceOptions, ServiceError, SystemdServiceOptions,
+    build_launchd_service as build_launchd_service_definition,
+    build_systemd_service as build_systemd_service_definition, default_launchd_plist_path,
+    install_launchd_service as install_launchd_service_definition,
+    install_systemd_service as install_systemd_service_definition, resolve_launchd_domain,
+    run_launchctl, run_systemctl, uninstall_launchd_service, uninstall_systemd_service,
+    validate_service_control_inputs, validate_systemd_control_inputs,
 };
+use crate::shell_capture::run_shell_capture;
+use crate::sqlite_store::{SqliteStore, SqliteStoreError};
 use crate::store::{Store, StoreError};
 use crate::tools::{validate_tool_invocation, validate_tool_template};
 use crate::validation::{repair_state, validate_state};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::time::Duration;
 use thiserror::Error;
+use uuid::Uuid;
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -56,10 +76,22 @@ enum HttpRequestError {
     MalformedRequestLine { line: String },
     #[error("unsupported http version: {version}")]
     UnsupportedHttpVersion { version: String },
+    #[error("http headers must be valid utf-8")]
+    InvalidHeaderUtf8,
     #[error("http headers exceeded {limit} bytes")]
     HeaderTooLarge { limit: usize },
+    #[error("malformed http header line: {line}")]
+    MalformedHeaderLine { line: String },
+    #[error("invalid http header name: {name}")]
+    InvalidHeaderName { name: String },
+    #[error("duplicate host header")]
+    DuplicateHostHeader,
+    #[error("unsupported transfer-encoding header: {value}")]
+    UnsupportedTransferEncoding { value: String },
     #[error("invalid content-length header: {value}")]
     InvalidContentLength { value: String },
+    #[error("duplicate content-length header")]
+    DuplicateContentLength,
     #[error("conflicting content-length headers: {first} and {second}")]
     ConflictingContentLength { first: usize, second: usize },
     #[error("request body exceeded {limit} bytes")]
@@ -72,14 +104,64 @@ pub struct ApiServer {
     store: Store,
     listener: TcpListener,
     max_requests: Option<usize>,
-    bearer_token: Option<String>,
+    auth: ApiAuth,
+    cors: ApiCors,
     config_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApiAuth {
+    pub full_token: Option<String>,
+    pub read_token: Option<String>,
+    pub write_token: Option<String>,
+}
+
+impl ApiAuth {
+    pub fn bearer(token: Option<String>) -> Self {
+        Self {
+            full_token: token,
+            ..Self::default()
+        }
+    }
+
+    pub fn scoped(
+        full_token: Option<String>,
+        read_token: Option<String>,
+        write_token: Option<String>,
+    ) -> Self {
+        Self {
+            full_token,
+            read_token,
+            write_token,
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.full_token.is_none() && self.read_token.is_none() && self.write_token.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApiCors {
+    pub allowed_origins: Vec<String>,
+}
+
+impl ApiCors {
+    pub fn allow_origins(origins: Vec<String>) -> Self {
+        Self {
+            allowed_origins: origins
+                .into_iter()
+                .filter_map(|origin| normalize_cors_origin(&origin))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ApiHandler {
     store: Store,
-    bearer_token: Option<String>,
+    auth: ApiAuth,
+    cors: ApiCors,
     config_path: Option<PathBuf>,
 }
 
@@ -89,6 +171,15 @@ impl ApiServer {
         addr: &str,
         max_requests: Option<usize>,
         bearer_token: Option<String>,
+    ) -> Result<Self, ApiError> {
+        Self::bind_with_auth(store, addr, max_requests, ApiAuth::bearer(bearer_token))
+    }
+
+    pub fn bind_with_auth(
+        store: Store,
+        addr: &str,
+        max_requests: Option<usize>,
+        auth: ApiAuth,
     ) -> Result<Self, ApiError> {
         let listener = TcpListener::bind(addr).map_err(|error| {
             if addr.parse::<SocketAddr>().is_err() {
@@ -101,9 +192,22 @@ impl ApiServer {
             store,
             listener,
             max_requests,
-            bearer_token,
+            auth,
+            cors: ApiCors::default(),
             config_path: None,
         })
+    }
+
+    pub fn bind_with_auth_and_cors(
+        store: Store,
+        addr: &str,
+        max_requests: Option<usize>,
+        auth: ApiAuth,
+        cors: ApiCors,
+    ) -> Result<Self, ApiError> {
+        let mut server = Self::bind_with_auth(store, addr, max_requests, auth)?;
+        server.cors = cors;
+        Ok(server)
     }
 
     pub fn bind_with_config_path(
@@ -118,6 +222,31 @@ impl ApiServer {
         Ok(server)
     }
 
+    pub fn bind_with_auth_config_path(
+        store: Store,
+        addr: &str,
+        max_requests: Option<usize>,
+        auth: ApiAuth,
+        config_path: PathBuf,
+    ) -> Result<Self, ApiError> {
+        let mut server = Self::bind_with_auth(store, addr, max_requests, auth)?;
+        server.config_path = Some(config_path);
+        Ok(server)
+    }
+
+    pub fn bind_with_auth_config_path_and_cors(
+        store: Store,
+        addr: &str,
+        max_requests: Option<usize>,
+        auth: ApiAuth,
+        config_path: PathBuf,
+        cors: ApiCors,
+    ) -> Result<Self, ApiError> {
+        let mut server = Self::bind_with_auth_and_cors(store, addr, max_requests, auth, cors)?;
+        server.config_path = Some(config_path);
+        Ok(server)
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr, ApiError> {
         Ok(self.listener.local_addr()?)
     }
@@ -125,7 +254,8 @@ impl ApiServer {
     pub fn serve(&self) -> Result<(), ApiError> {
         let handler = ApiHandler {
             store: self.store.clone(),
-            bearer_token: self.bearer_token.clone(),
+            auth: self.auth.clone(),
+            cors: self.cors.clone(),
             config_path: self.config_path.clone(),
         };
         let mut handles = Vec::new();
@@ -153,12 +283,15 @@ impl ApiServer {
 
 impl ApiHandler {
     fn handle_stream(&self, mut stream: TcpStream) -> Result<(), ApiError> {
+        let trace_id = Uuid::new_v4().to_string();
+        stream.set_read_timeout(Some(HTTP_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT))?;
         let request = match read_http_request(&mut stream) {
             Ok(request) => request,
             Err(HttpRequestError::Io(error)) => return Err(ApiError::Io(error)),
             Err(error) => {
                 let (status, body) = http_request_error_response(&error);
-                write_http_response(&mut stream, status, &body)?;
+                write_http_response(&mut stream, status, &body, None, &trace_id)?;
                 return Ok(());
             }
         };
@@ -166,18 +299,41 @@ impl ApiHandler {
             Ok(parts) => parts,
             Err(error) => {
                 let (status, body) = http_request_error_response(&error);
-                write_http_response(&mut stream, status, &body)?;
+                write_http_response(&mut stream, status, &body, None, &trace_id)?;
                 return Ok(());
             }
         };
 
+        let origin = match allowed_cors_origin(&request.headers, &self.cors) {
+            Ok(origin) => origin,
+            Err((status, body)) => {
+                write_http_response(&mut stream, status, &body, None, &trace_id)?;
+                return Ok(());
+            }
+        };
+
+        let auth = if method == "OPTIONS" {
+            AuthDecision::Allowed
+        } else {
+            self.authorize(method, &request.headers)
+        };
+
         let (status, body) = if method == "OPTIONS" {
             ("204 No Content", String::new())
-        } else if !self.authorized(&request.headers) {
+        } else if auth == AuthDecision::MissingOrInvalid {
             (
                 "401 Unauthorized",
                 json!({
                     "error": "unauthorized",
+                })
+                .to_string(),
+            )
+        } else if auth == AuthDecision::InsufficientScope {
+            (
+                "403 Forbidden",
+                json!({
+                    "error": "forbidden",
+                    "detail": "bearer token does not grant the required API scope",
                 })
                 .to_string(),
             )
@@ -205,7 +361,7 @@ impl ApiHandler {
                 ),
                 Err(error) if is_metrics_path(path) => (
                     "503 Service Unavailable",
-                    metrics_unavailable_json(error.to_string()).to_string(),
+                    metrics_response_body(metrics_unavailable_json(error.to_string()), path),
                 ),
                 Err(error) => (
                     "500 Internal Server Error",
@@ -237,21 +393,47 @@ impl ApiHandler {
                 .to_string(),
             )
         };
-        write_http_response(&mut stream, status, &body)?;
+        let content_type = response_content_type(method, path, status);
+        write_http_response_with_content_type(
+            &mut stream,
+            status,
+            &body,
+            origin.as_deref(),
+            content_type,
+            &trace_id,
+        )?;
         Ok(())
     }
 
-    fn authorized(&self, headers: &str) -> bool {
-        let Some(token) = &self.bearer_token else {
-            return true;
+    fn authorize(&self, method: &str, headers: &str) -> AuthDecision {
+        if self.auth.is_disabled() {
+            return AuthDecision::Allowed;
+        }
+        let Some(candidate) = bearer_candidate(headers) else {
+            return AuthDecision::MissingOrInvalid;
         };
-        headers.lines().skip(1).any(|line| {
-            let Some((key, value)) = line.split_once(':') else {
-                return false;
-            };
-            key.eq_ignore_ascii_case("authorization") && value.trim() == format!("Bearer {token}")
-        })
+        if token_matches(self.auth.full_token.as_deref(), candidate)
+            || (method == "GET" && token_matches(self.auth.read_token.as_deref(), candidate))
+            || (matches!(method, "POST" | "DELETE")
+                && token_matches(self.auth.write_token.as_deref(), candidate))
+        {
+            return AuthDecision::Allowed;
+        }
+        if token_matches(self.auth.read_token.as_deref(), candidate)
+            || token_matches(self.auth.write_token.as_deref(), candidate)
+        {
+            AuthDecision::InsufficientScope
+        } else {
+            AuthDecision::MissingOrInvalid
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthDecision {
+    Allowed,
+    MissingOrInvalid,
+    InsufficientScope,
 }
 
 struct HttpRequest {
@@ -283,7 +465,12 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, HttpRequestE
             });
         }
     };
-    let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+    let headers = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|_| HttpRequestError::InvalidHeaderUtf8)?
+        .to_owned();
+    let request_line = headers.lines().next().map(str::to_owned);
+    parse_http_request_line(request_line.as_deref())?;
+    validate_http_headers(&headers)?;
     let content_length = parse_content_length(&headers)?;
     if content_length > MAX_HTTP_BODY_BYTES {
         return Err(HttpRequestError::PayloadTooLarge {
@@ -302,7 +489,6 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, HttpRequestE
         bytes.extend_from_slice(&buffer[..read]);
     }
     let body_end = (body_start + content_length).min(bytes.len());
-    let request_line = headers.lines().next().map(str::to_owned);
     Ok(HttpRequest {
         request_line,
         headers,
@@ -331,12 +517,51 @@ fn parse_content_length(headers: &str) -> Result<usize, HttpRequestError> {
                         second: content_length,
                     });
                 }
+                return Err(HttpRequestError::DuplicateContentLength);
             } else {
                 parsed = Some(content_length);
             }
         }
     }
     Ok(parsed.unwrap_or(0))
+}
+
+fn validate_http_headers(headers: &str) -> Result<(), HttpRequestError> {
+    let mut host_seen = false;
+    for line in headers.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, _value)) = line.split_once(':') else {
+            return Err(HttpRequestError::MalformedHeaderLine {
+                line: line.to_owned(),
+            });
+        };
+        if !valid_http_header_name(name) {
+            return Err(HttpRequestError::InvalidHeaderName {
+                name: name.to_owned(),
+            });
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if host_seen {
+                return Err(HttpRequestError::DuplicateHostHeader);
+            }
+            host_seen = true;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpRequestError::UnsupportedTransferEncoding {
+                value: _value.trim().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'))
 }
 
 fn validate_mutation_content_type(
@@ -365,10 +590,18 @@ fn validate_mutation_content_type(
 }
 
 fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
-    headers.lines().skip(1).find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case(name).then_some(value.trim())
-    })
+    header_values(headers, name).into_iter().next()
+}
+
+fn header_values<'a>(headers: &'a str, name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then_some(value.trim())
+        })
+        .collect()
 }
 
 fn unsupported_media_type_response(method: &str, content_type: &str) -> (&'static str, String) {
@@ -394,6 +627,11 @@ fn parse_http_request_line(line: Option<&str>) -> Result<(&str, &str), HttpReque
     let method = parts[0];
     let path = parts[1];
     let version = parts[2];
+    if !valid_http_header_name(method) {
+        return Err(HttpRequestError::MalformedRequestLine {
+            line: line.to_owned(),
+        });
+    }
     if !path.starts_with('/') {
         return Err(HttpRequestError::MalformedRequestLine {
             line: line.to_owned(),
@@ -429,22 +667,178 @@ fn is_config_path(path: &str) -> bool {
 
 fn is_metrics_path(path: &str) -> bool {
     let (path, _) = path.split_once('?').unwrap_or((path, ""));
-    path.trim_end_matches('/') == "/metrics"
+    matches!(
+        path.trim_end_matches('/'),
+        "/metrics" | "/metrics/prometheus"
+    )
 }
 
-fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<(), ApiError> {
+fn is_prometheus_metrics_path(path: &str) -> bool {
+    let (path, _) = path.split_once('?').unwrap_or((path, ""));
+    path.trim_end_matches('/') == "/metrics/prometheus"
+}
+
+fn is_dashboard_html_path(path: &str) -> bool {
+    let (path, _) = path.split_once('?').unwrap_or((path, ""));
+    path.trim_end_matches('/') == "/dashboard.html"
+}
+
+fn response_content_type(method: &str, path: &str, status: &str) -> &'static str {
+    if method == "GET"
+        && is_prometheus_metrics_path(path)
+        && (status.starts_with("200 ") || status.starts_with("503 "))
+    {
+        "text/plain; version=0.0.4; charset=utf-8"
+    } else if method == "GET" && is_dashboard_html_path(path) && status.starts_with("200 ") {
+        "text/html; charset=utf-8"
+    } else {
+        "application/json"
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+    allowed_origin: Option<&str>,
+    trace_id: &str,
+) -> Result<(), ApiError> {
+    write_http_response_with_content_type(
+        stream,
+        status,
+        body,
+        allowed_origin,
+        "application/json",
+        trace_id,
+    )
+}
+
+fn write_http_response_with_content_type(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+    allowed_origin: Option<&str>,
+    content_type: &str,
+    trace_id: &str,
+) -> Result<(), ApiError> {
     let auth_challenge = if status.starts_with("401 ") {
         "www-authenticate: Bearer\r\n"
     } else {
         ""
     };
+    let cors_headers = allowed_origin
+        .map(|origin| {
+            format!(
+                "vary: Origin\r\naccess-control-allow-origin: {origin}\r\naccess-control-allow-methods: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-headers: authorization, content-type\r\n"
+            )
+        })
+        .unwrap_or_else(|| "vary: Origin\r\n".to_owned());
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncache-control: no-store\r\nx-content-type-options: nosniff\r\nallow: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-origin: *\r\naccess-control-allow-methods: GET, POST, DELETE, OPTIONS\r\naccess-control-allow-headers: authorization, content-type\r\n{auth_challenge}content-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: no-store\r\nx-content-type-options: nosniff\r\nx-trace-id: {trace_id}\r\nallow: GET, POST, DELETE, OPTIONS\r\n{cors_headers}{auth_challenge}content-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
     stream.write_all(response.as_bytes())?;
     Ok(())
+}
+
+fn allowed_cors_origin(
+    headers: &str,
+    cors: &ApiCors,
+) -> Result<Option<String>, (&'static str, String)> {
+    let origins = header_values(headers, "origin");
+    if origins.len() > 1 {
+        return Err((
+            "400 Bad Request",
+            json!({
+                "error": "origin must not be repeated",
+            })
+            .to_string(),
+        ));
+    }
+    let Some(origin) = origins.first().copied() else {
+        return Ok(None);
+    };
+    let origin = origin.trim();
+    if is_allowed_local_origin(origin)
+        || cors.allowed_origins.iter().any(|allowed| allowed == origin)
+    {
+        return Ok(Some(origin.to_owned()));
+    }
+    Err((
+        "403 Forbidden",
+        json!({
+            "error": "origin not allowed",
+        })
+        .to_string(),
+    ))
+}
+
+pub fn normalize_cors_origin(origin: &str) -> Option<String> {
+    let origin = origin.trim();
+    let url = url::Url::parse(origin).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let mut normalized = format!("{}://{}", url.scheme(), host);
+    if host.contains(':') && !host.starts_with('[') {
+        normalized = format!("{}://[{}]", url.scheme(), host);
+    }
+    if let Some(port) = url.port() {
+        normalized.push(':');
+        normalized.push_str(&port.to_string());
+    }
+    Some(normalized)
+}
+
+fn is_allowed_local_origin(origin: &str) -> bool {
+    let Some(origin) = normalize_cors_origin(origin) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(&origin) else {
+        return false;
+    };
+    let host = url
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .unwrap_or_default();
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn bearer_candidate(headers: &str) -> Option<&str> {
+    let authorization = header_values(headers, "authorization");
+    if authorization.len() != 1 {
+        return None;
+    }
+    authorization.first().and_then(|value| {
+        let (scheme, candidate) = value.trim().split_once(' ')?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| candidate.trim())
+    })
+}
+
+fn token_matches(token: Option<&str>, candidate: &str) -> bool {
+    token
+        .map(|token| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+        .unwrap_or(false)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 fn http_request_error_response(error: &HttpRequestError) -> (&'static str, String) {
@@ -456,7 +850,13 @@ fn http_request_error_response(error: &HttpRequestError) -> (&'static str, Strin
         | HttpRequestError::MissingRequestLine
         | HttpRequestError::MalformedRequestLine { .. }
         | HttpRequestError::UnsupportedHttpVersion { .. }
+        | HttpRequestError::InvalidHeaderUtf8
+        | HttpRequestError::MalformedHeaderLine { .. }
+        | HttpRequestError::InvalidHeaderName { .. }
+        | HttpRequestError::DuplicateHostHeader
+        | HttpRequestError::UnsupportedTransferEncoding { .. }
         | HttpRequestError::InvalidContentLength { .. }
+        | HttpRequestError::DuplicateContentLength
         | HttpRequestError::ConflictingContentLength { .. }
         | HttpRequestError::IncompleteBody { .. } => "400 Bad Request",
     };
@@ -507,6 +907,13 @@ fn response_for_path_inner(
     let body = match path.trim_end_matches('/') {
         "" | "/" | "/health" => health_json(os, config_path),
         "/metrics" => metrics_json(os),
+        "/metrics/prometheus" => {
+            return ("200 OK", metrics_prometheus(&metrics_json(os)));
+        }
+        "/dashboard" => dashboard_json(os),
+        "/dashboard.html" => {
+            return ("200 OK", dashboard_html(os));
+        }
         "/openapi.json" => openapi_schema(),
         "/status" => status_json(os),
         "/daemon" => daemon_json(os),
@@ -524,6 +931,23 @@ fn response_for_path_inner(
             Ok(workflows) => workflows,
             Err(response) => return response,
         },
+        "/workers" => match workers_json(os, query) {
+            Ok(workers) => workers,
+            Err(response) => return response,
+        },
+        "/evals" => match evals_json(os, query) {
+            Ok(evals) => evals,
+            Err(response) => return response,
+        },
+        "/git/status" => match git_status_json(query) {
+            Ok(status) => status,
+            Err(response) => return response,
+        },
+        "/secrets" => match secrets_json(os, query) {
+            Ok(backends) => backends,
+            Err(response) => return response,
+        },
+        "/secrets/check" => json!(secret_check_report(os)),
         "/tools" => match tools_json(os, query) {
             Ok(tools) => tools,
             Err(response) => return response,
@@ -540,6 +964,15 @@ fn response_for_path_inner(
             Ok(memory) => memory,
             Err(response) => return response,
         },
+        "/memory/recall" => match memory_recall_json(os, query) {
+            Ok(memory) => memory,
+            Err(response) => return response,
+        },
+        "/approvals" => json!(os.approvals.values().collect::<Vec<_>>()),
+        "/registry" => registry_json(os),
+        "/registry/profiles" => json!(&os.agent_profiles),
+        "/registry/templates" => json!(&os.workflow_templates),
+        "/registry/mcp-servers" => json!(&os.mcp_servers),
         _ => {
             return (
                 "404 Not Found",
@@ -552,6 +985,687 @@ fn response_for_path_inner(
         }
     };
     ("200 OK", body.to_string())
+}
+
+fn dashboard_json(os: &OperatingSystem) -> serde_json::Value {
+    json!({
+        "status": status_json(os),
+        "metrics": metrics_json(os),
+        "daemon": &os.daemon,
+        "agents": os.agents.values().collect::<Vec<_>>(),
+        "tasks": os.tasks.values().collect::<Vec<_>>(),
+        "workflows": os.workflows.values().map(|workflow| {
+            os.workflow_progress(&workflow.id)
+        }).collect::<Vec<_>>(),
+        "workflow_dags": os.workflows.values().map(|workflow| {
+            workflow_dag_value(os, workflow)
+        }).collect::<Vec<_>>(),
+        "runs": os.runs.values().collect::<Vec<_>>(),
+        "approvals": os.approvals.values().collect::<Vec<_>>(),
+        "workers": os.workers.values().collect::<Vec<_>>(),
+        "evals": &os.evals,
+        "memory": &os.memory,
+        "recent_events": os.events.iter().rev().take(50).collect::<Vec<_>>(),
+    })
+}
+
+fn dashboard_html(os: &OperatingSystem) -> String {
+    let metrics = metrics_json(os);
+    let mut body = String::new();
+    let _ = write!(
+        body,
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Agent OS Dashboard</title><style>{}</style></head><body>",
+        dashboard_css()
+    );
+    let _ = write!(
+        body,
+        "<header><div><p>Agent OS</p><h1>{}</h1></div><dl><div><dt>Agents</dt><dd>{}</dd></div><div><dt>Tasks</dt><dd>{}</dd></div><div><dt>Runs</dt><dd>{}</dd></div><div><dt>Memory</dt><dd>{}</dd></div></dl></header>",
+        escape_html(&os.name),
+        os.agents.len(),
+        os.tasks.len(),
+        os.runs.len(),
+        os.memory.len()
+    );
+    body.push_str("<main>");
+    body.push_str("<section><h2>Metrics</h2><div class=\"metric-grid\">");
+    for key in [
+        "tasks_pending",
+        "tasks_running",
+        "tasks_complete",
+        "runs_running",
+        "runs_success",
+        "runs_failed",
+        "approvals_pending",
+        "events_total",
+    ] {
+        let value = metrics.get(key).cloned().unwrap_or(Value::Null);
+        let _ = write!(
+            body,
+            "<article><span>{}</span><strong>{}</strong></article>",
+            escape_html(&key.replace('_', " ")),
+            escape_html(&dashboard_metric_value(&value))
+        );
+    }
+    body.push_str("</div></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Agents</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/agents\"><h4>Create Agent</h4><label>Name<input name=\"name\" required></label><label>Kind<input name=\"kind\" value=\"builder\" required></label><label>Model<input name=\"model\" placeholder=\"gpt-5.2\"></label><label>Capabilities<input name=\"capabilities\" data-list=\"true\" placeholder=\"rust,review\"></label><label>Parallel<input name=\"parallel\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><button type=\"submit\">Create Agent</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/agents/{agent_id}\"><h4>Inspect Agent</h4><label>Agent ID<input name=\"agent_id\" data-path=\"true\" required></label><button type=\"submit\">Inspect Agent</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/agents/{agent_id}\"><h4>Update Agent</h4><label>Agent ID<input name=\"agent_id\" data-path=\"true\" required></label><label>Name<input name=\"name\"></label><label>Kind<input name=\"kind\" placeholder=\"builder\"></label><label>Model<input name=\"model\"></label><label>Clear model<select name=\"clear_model\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Capabilities<input name=\"capabilities\" data-list=\"true\" placeholder=\"rust,review\"></label><label>Parallel<input name=\"parallel\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Update Agent</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/agents/{agent_id}/heartbeat\"><h4>Heartbeat Agent</h4><label>Agent ID<input name=\"agent_id\" data-path=\"true\" required></label><label>Status<select name=\"status\"><option value=\"online\">Online</option><option value=\"busy\">Busy</option><option value=\"paused\">Paused</option><option value=\"offline\">Offline</option></select></label><label>Lease seconds<input name=\"lease_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Heartbeat Agent</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint-template=\"/agents/{agent_id}/claim\"><h4>Claim Agent Task</h4><label>Agent ID<input name=\"agent_id\" data-path=\"true\" required></label><label>Lease seconds<input name=\"lease_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Claim Agent Task</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/agents/{agent_id}\"><h4>Remove Agent</h4><label>Agent ID<input name=\"agent_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Agent</button><output></output></form></div><table><thead><tr><th>Name</th><th>Kind</th><th>Status</th><th>Load</th></tr></thead><tbody>");
+    for agent in os.agents.values() {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}/{}</td></tr>",
+            escape_html(&agent.name),
+            escape_html(&agent.kind.to_string()),
+            escape_html(&agent.status.to_string()),
+            agent.current_tasks.len(),
+            agent.max_parallel_tasks
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Tasks</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/tasks\"><h4>Create Task</h4><label>Title<input name=\"title\" required></label><label>Objective<input name=\"objective\"></label><label>Command<input name=\"command\"></label><label>CWD<input name=\"cwd\"></label><label>Tool<input name=\"tool\"></label><label>Args JSON<textarea name=\"args\" data-json=\"true\" placeholder='{\"name\":\"value\"}'></textarea></label><label>Secret args JSON<textarea name=\"secret_args\" data-json=\"true\" placeholder='{\"token\":\"AGENT_OS_TOKEN\"}'></textarea></label><label>Priority<select name=\"priority\"><option value=\"normal\">Normal</option><option value=\"low\">Low</option><option value=\"high\">High</option><option value=\"critical\">Critical</option><option value=\"urgent\">Urgent</option></select></label><label>Capabilities<input name=\"required_capabilities\" data-list=\"true\" placeholder=\"rust,review\"></label><label>Dependencies<input name=\"dependencies\" data-list=\"true\" placeholder=\"task-a,task-b\"></label><label>Max attempts<input name=\"max_attempts\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Create Task</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/tasks/{task_id}\"><h4>Inspect Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><button type=\"submit\">Inspect Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}\"><h4>Update Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Title<input name=\"title\"></label><label>Objective<input name=\"objective\"></label><label>Command<input name=\"command\"></label><label>Clear command<select name=\"clear_command\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Tool<input name=\"tool\"></label><label>Clear tool<select name=\"clear_tool\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Args JSON<textarea name=\"args\" data-json=\"true\" placeholder='{\"name\":\"value\"}'></textarea></label><label>Secret args JSON<textarea name=\"secret_args\" data-json=\"true\" placeholder='{\"token\":\"AGENT_OS_TOKEN\"}'></textarea></label><label>Clear args<select name=\"clear_args\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Clear secret args<select name=\"clear_secret_args\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>CWD<input name=\"cwd\"></label><label>Clear CWD<select name=\"clear_cwd\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Capabilities<input name=\"required_capabilities\" data-list=\"true\" placeholder=\"rust,review\"></label><label>Clear capabilities<select name=\"clear_required_capabilities\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Max attempts<input name=\"max_attempts\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Update Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/assign\"><h4>Assign Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Agent ID<input name=\"agent\" required></label><button type=\"submit\">Assign Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/priority\"><h4>Set Priority</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Priority<select name=\"priority\"><option value=\"normal\">Normal</option><option value=\"low\">Low</option><option value=\"high\">High</option><option value=\"critical\">Critical</option><option value=\"urgent\">Urgent</option></select></label><button type=\"submit\">Set Priority</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/dependencies\"><h4>Set Dependencies</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Dependencies<input name=\"dependencies\" data-list=\"true\" placeholder=\"task-a,task-b\" required></label><button type=\"submit\">Set Dependencies</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/plan\"><h4>Set Plan</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Steps<input name=\"steps\" data-list=\"true\" placeholder=\"inspect,edit,test\" required></label><button type=\"submit\">Set Plan</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/complete\"><h4>Complete Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button type=\"submit\">Complete Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/fail\"><h4>Fail Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button class=\"deny\" type=\"submit\">Fail Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/block\"><h4>Block Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button type=\"submit\">Block Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/cancel\"><h4>Cancel Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button class=\"deny\" type=\"submit\">Cancel Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/retry\"><h4>Retry Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button type=\"submit\">Retry Task</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tasks/{task_id}/unblock\"><h4>Unblock Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><label>Note<input name=\"note\"></label><button type=\"submit\">Unblock Task</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/tasks/{task_id}\"><h4>Remove Task</h4><label>Task ID<input name=\"task_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Task</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/tasks/recover\"><h4>Recover Stale Tasks</h4><label>Older than seconds<input name=\"older_than_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Recover Tasks</button><output></output></form></div><table><thead><tr><th>Title</th><th>Status</th><th>Priority</th><th>Agent</th></tr></thead><tbody>");
+    for task in os.tasks.values().take(20) {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&task.title),
+            escape_html(&task.status.to_string()),
+            escape_html(&task.priority.to_string()),
+            task.assigned_to
+                .as_ref()
+                .map(|agent| escape_html(&agent.to_string()))
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Tools</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/tools\"><h4>Create Tool</h4><label>Name<input name=\"name\" required></label><label>Kind<select name=\"kind\"><option value=\"shell\">Shell</option><option value=\"file-read\">File Read</option><option value=\"file-write\">File Write</option></select></label><label>Description<input name=\"description\"></label><label>Capabilities<input name=\"required_capabilities\" data-list=\"true\" placeholder=\"rust,docs\"></label><label>Command template<input name=\"command_template\" required></label><label>CWD<input name=\"cwd\"></label><button type=\"submit\">Create Tool</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/tools/{tool_id}\"><h4>Inspect Tool</h4><label>Tool ID<input name=\"tool_id\" data-path=\"true\" required></label><button type=\"submit\">Inspect Tool</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/tools/{tool_id}\"><h4>Update Tool</h4><label>Tool ID<input name=\"tool_id\" data-path=\"true\" required></label><label>Kind<select name=\"kind\"><option value=\"\">Unchanged</option><option value=\"shell\">Shell</option><option value=\"file-read\">File Read</option><option value=\"file-write\">File Write</option></select></label><label>Description<input name=\"description\"></label><label>Clear description<select name=\"clear_description\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Capabilities<input name=\"required_capabilities\" data-list=\"true\" placeholder=\"rust,docs\"></label><label>Clear capabilities<select name=\"clear_required_capabilities\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Command template<input name=\"command_template\"></label><label>CWD<input name=\"cwd\"></label><label>Clear CWD<select name=\"clear_cwd\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Update Tool</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/tools/{tool_id}\"><h4>Remove Tool</h4><label>Tool ID<input name=\"tool_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Tool</button><output></output></form></div><table><thead><tr><th>Tool</th><th>Kind</th><th>Capabilities</th><th>Template</th><th>CWD</th></tr></thead><tbody>");
+    for tool in os.tools.values().take(20) {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&tool.name),
+            escape_html(&tool.kind.to_string()),
+            escape_html(&dashboard_list_value(&tool.required_capabilities)),
+            escape_html(&tool.command_template),
+            tool.default_cwd
+                .as_ref()
+                .map(|cwd| escape_html(cwd))
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section><h2>Runs</h2><table><thead><tr><th>Run</th><th>Status</th><th>Command</th><th>Artifacts</th><th>Trace</th></tr></thead><tbody>");
+    for run in os.runs.values().take(20) {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&run.id.to_string()),
+            escape_html(&run.status.to_string()),
+            escape_html(&run.command),
+            run.artifacts.len(),
+            escape_html(&run.trace_id)
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    let (daemon_status, daemon_ticks, daemon_message) = os
+        .daemon
+        .as_ref()
+        .map(|daemon| {
+            (
+                daemon.status.to_string(),
+                daemon.ticks.to_string(),
+                daemon
+                    .last_message
+                    .as_deref()
+                    .unwrap_or("no daemon message")
+                    .to_owned(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                "not-started".into(),
+                "-".into(),
+                "daemon has not been started".into(),
+            )
+        });
+    let _ = write!(
+        body,
+        "<section class=\"wide\"><h2>Scheduler &amp; Daemon</h2><div class=\"run-actions\"><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/run\"><h4>Run Scheduler</h4><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><label>Recover stale seconds<input name=\"recover_stale_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Run Scheduler</button><output></output></form><form data-dashboard-query data-endpoint=\"/daemon\"><h4>Daemon Status</h4><button type=\"submit\">Inspect Daemon</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/daemon/stop\"><h4>Stop Daemon</h4><button class=\"deny\" type=\"submit\">Request Stop</button><output></output></form></div><table><thead><tr><th>Status</th><th>Ticks</th><th>Message</th></tr></thead><tbody><tr><td>{}</td><td>{}</td><td>{}</td></tr></tbody></table></section>",
+        escape_html(&daemon_status),
+        escape_html(&daemon_ticks),
+        escape_html(&daemon_message)
+    );
+
+    body.push_str("<section><h2>Workflows</h2><table><thead><tr><th>Objective</th><th>Priority</th><th>Progress</th><th>DAG</th></tr></thead><tbody>");
+    for workflow in os.workflows.values().take(20) {
+        let progress = os.workflow_progress(&workflow.id);
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}/{} complete</td><td>{}</td></tr>",
+            escape_html(&workflow.objective),
+            escape_html(&workflow.priority.to_string()),
+            progress
+                .as_ref()
+                .map(|progress| progress.tasks_complete)
+                .unwrap_or(0),
+            progress
+                .as_ref()
+                .map(|progress| progress.total_tasks)
+                .unwrap_or(0)
+                .to_string(),
+            escape_html(&workflow_dag_summary(os, workflow))
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Workflow DAG Editor</h2>");
+    if os.workflows.is_empty() {
+        body.push_str("<p class=\"muted\">No workflows</p>");
+    }
+    for workflow in os.workflows.values().take(8) {
+        let workflow_path = format!("/workflows/{}", workflow.id);
+        let _ = write!(
+            body,
+            "<article class=\"dag-editor\"><h3>{}</h3><p class=\"muted\">{} · {}</p><pre>{}</pre>",
+            escape_html(&workflow.objective),
+            escape_html(&workflow.id.to_string()),
+            escape_html(&workflow.priority.to_string()),
+            escape_html(&workflow_dag_summary(os, workflow))
+        );
+        let _ = write!(
+            body,
+            "<form data-dashboard-form data-endpoint=\"{}/tasks\"><h4>Add Stage</h4><label>Stage<input name=\"stage\" required></label><label>Title<input name=\"title\" required></label><label>Objective<input name=\"objective\"></label><label>Command<input name=\"command\"></label><label>Needs<input name=\"required_capabilities\" data-list=\"true\"></label><label>After<input name=\"dependencies\" data-list=\"true\"></label><label>Priority<input name=\"priority\"></label><button type=\"submit\">Add</button><output></output></form>",
+            escape_html(&workflow_path)
+        );
+        let _ = write!(
+            body,
+            "<div class=\"dag-actions\"><form data-dashboard-form data-endpoint=\"{}/link\"><h4>Link</h4><label>From<input name=\"from\" required></label><label>To<input name=\"to\" required></label><button type=\"submit\">Link</button><output></output></form><form data-dashboard-form data-endpoint=\"{}/unlink\"><h4>Unlink</h4><label>From<input name=\"from\" required></label><label>To<input name=\"to\" required></label><button type=\"submit\">Unlink</button><output></output></form></div></article>",
+            escape_html(&workflow_path),
+            escape_html(&workflow_path)
+        );
+    }
+    body.push_str("</section>");
+
+    body.push_str("<section class=\"wide\"><h2>Registry Templates</h2><form class=\"marketplace-import\" data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/registry/marketplace-import\"><h4>Import Marketplace</h4><label>Manifest<textarea name=\"manifest\" data-json=\"true\" required placeholder=\"{&quot;workflow_templates&quot;:[]}\"></textarea></label><label>Source<input name=\"source\" placeholder=\"marketplace.json\"></label><label>Expect checksum<input name=\"expect_checksum\" placeholder=\"fnv1a64:...\"></label><label>Force<select name=\"force\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Import Marketplace</button><output></output></form>");
+    body.push_str("<h3>Agent Profiles</h3>");
+    if os.agent_profiles.is_empty() {
+        body.push_str("<p class=\"muted\">No agent profiles</p>");
+    }
+    for profile in os.agent_profiles.values().take(8) {
+        let endpoint = escape_html(&format!("/registry/profiles/{}/agents", profile.id));
+        let _ = write!(
+            body,
+            "<article class=\"template-editor\"><h3>{}</h3><p class=\"muted\">{} · {} · {}</p><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"{}\"><h4>Install Agent</h4><label>Name override<input name=\"name\" placeholder=\"{}\"></label><label>Model override<input name=\"model\" placeholder=\"{}\"></label><label>Parallel<input name=\"parallel\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><button type=\"submit\">Install Agent</button><output></output></form></article>",
+            escape_html(&profile.name),
+            escape_html(&profile.id),
+            escape_html(&profile.kind.to_string()),
+            escape_html(&dashboard_list_value(&profile.capabilities)),
+            endpoint,
+            escape_html(&profile.name),
+            escape_html(profile.model.as_deref().unwrap_or("profile default"))
+        );
+    }
+    body.push_str("<h3>Workflow Templates</h3>");
+    if os.workflow_templates.is_empty() {
+        body.push_str("<p class=\"muted\">No workflow templates</p>");
+    }
+    for template in os.workflow_templates.values().take(8) {
+        let endpoint = escape_html(&format!("/registry/templates/{}/workflows", template.id));
+        let _ = write!(
+            body,
+            "<article class=\"template-editor\"><h3>{}</h3><p class=\"muted\">{} · {}</p><p>{}</p><form data-dashboard-form data-endpoint=\"{}\"><h4>Create Workflow</h4><label>Objective<input name=\"objective\" required></label><label>Priority<select name=\"priority\"><option value=\"normal\">Normal</option><option value=\"high\">High</option><option value=\"critical\">Critical</option><option value=\"low\">Low</option></select></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Create Workflow</button><output></output></form></article>",
+            escape_html(&template.name),
+            escape_html(&template.id),
+            escape_html(&template.stages.join(" -> ")),
+            escape_html(&template.description),
+            endpoint
+        );
+    }
+    body.push_str("</section>");
+
+    body.push_str("<section class=\"wide\"><h2>MCP Servers</h2><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/registry/mcp-servers\"><h4>Register MCP Server</h4><label>ID<input name=\"id\" required></label><label>Command<input name=\"command\" required></label><label>Args<input name=\"args\" data-list=\"true\" placeholder=\"--stdio,--verbose\"></label><label>Env JSON<textarea name=\"env\" data-json=\"true\" placeholder=\"{&quot;TOKEN&quot;:&quot;value&quot;}\"></textarea></label><label>Enabled<select name=\"enabled\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Register MCP Server</button><output></output></form>");
+    if os.mcp_servers.is_empty() {
+        body.push_str("<p class=\"muted\">No MCP servers</p>");
+    }
+    for server in os.mcp_servers.values().take(12) {
+        let endpoint = escape_html(&format!("/registry/mcp-servers/{}", server.id));
+        let env_json = serde_json::to_string_pretty(&server.env).unwrap_or_else(|_| "{}".into());
+        let _ = write!(
+            body,
+            "<article class=\"mcp-editor\"><h3>{}</h3><p class=\"muted\">{} · {}</p><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"{}\"><h4>Update MCP Server</h4><label>Command<input name=\"command\" value=\"{}\"></label><label>Args<input name=\"args\" data-list=\"true\" value=\"{}\"></label><label>Env JSON<textarea name=\"env\" data-json=\"true\">{}</textarea></label><label>Enabled<select name=\"enabled\" data-bool=\"true\"><option value=\"{}\">Keep {}</option><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Update MCP</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-dashboard-result=\"json\" data-endpoint=\"{}\"><button class=\"deny\" type=\"submit\">Remove MCP</button><output></output></form></article>",
+            escape_html(&server.id),
+            escape_html(&server.command),
+            escape_html(if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }),
+            endpoint,
+            escape_html(&server.command),
+            escape_html(&server.args.join(",")),
+            escape_html(&env_json),
+            if server.enabled { "true" } else { "false" },
+            escape_html(if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }),
+            endpoint
+        );
+    }
+    body.push_str("</section>");
+
+    body.push_str("<section class=\"wide\"><h2>Git Workspace</h2><div class=\"git-actions\"><form data-dashboard-query data-endpoint=\"/git/status\"><h4>Status</h4><label>Workspace<input name=\"cwd\" placeholder=\"/path/to/repo\"></label><button type=\"submit\">Inspect Status</button><output></output></form><form data-dashboard-form data-endpoint=\"/git/review-task\"><h4>Review Task</h4><label>Workspace<input name=\"cwd\" placeholder=\"/path/to/repo\"></label><label>Base<input name=\"base\" value=\"main\"></label><label>Title<input name=\"title\" value=\"Code review\"></label><label>Priority<input name=\"priority\" value=\"normal\"></label><button type=\"submit\">Create Review Task</button><output></output></form></div></section>");
+
+    body.push_str(
+        "<section class=\"wide\"><h2>Service Definitions</h2><div class=\"service-actions\">",
+    );
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd\"><h4>Render Launchd</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Binary<input name=\"bin_path\" placeholder=\"/usr/local/bin/agent-os\"></label><label>Interval ms<input name=\"interval_ms\" type=\"number\" min=\"1\" value=\"1000\" data-number=\"true\"></label><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Recover stale seconds<input name=\"recover_stale_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><label>No logs<select name=\"no_logs\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Plist path<input name=\"plist_path\" placeholder=\"~/Library/LaunchAgents/com.agent-os.daemon.plist\"></label><button type=\"submit\">Render Launchd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd/install\"><h4>Install Launchd</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Binary<input name=\"bin_path\" placeholder=\"/usr/local/bin/agent-os\"></label><label>Interval ms<input name=\"interval_ms\" type=\"number\" min=\"1\" value=\"1000\" data-number=\"true\"></label><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Recover stale seconds<input name=\"recover_stale_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><label>No logs<select name=\"no_logs\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Plist path<input name=\"plist_path\" placeholder=\"~/Library/LaunchAgents/com.agent-os.daemon.plist\"></label><button type=\"submit\">Install Launchd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd/uninstall\"><h4>Uninstall Launchd</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Plist path<input name=\"plist_path\" placeholder=\"~/Library/LaunchAgents/com.agent-os.daemon.plist\"></label><button class=\"deny\" type=\"submit\">Uninstall Launchd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd/start\"><h4>Start Launchd</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Plist path<input name=\"plist_path\" placeholder=\"~/Library/LaunchAgents/com.agent-os.daemon.plist\"></label><label>Domain<input name=\"domain\" placeholder=\"gui/501\"></label><label>Launchctl path<input name=\"launchctl_path\" placeholder=\"launchctl\"></label><button type=\"submit\">Start Launchd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd/stop\"><h4>Stop Launchd</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Plist path<input name=\"plist_path\" placeholder=\"~/Library/LaunchAgents/com.agent-os.daemon.plist\"></label><label>Domain<input name=\"domain\" placeholder=\"gui/501\"></label><label>Launchctl path<input name=\"launchctl_path\" placeholder=\"launchctl\"></label><button class=\"deny\" type=\"submit\">Stop Launchd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/launchd/status\"><h4>Launchd Status</h4><label>Label<input name=\"label\" placeholder=\"com.agent-os.daemon\"></label><label>Domain<input name=\"domain\" placeholder=\"gui/501\"></label><label>Launchctl path<input name=\"launchctl_path\" placeholder=\"launchctl\"></label><button type=\"submit\">Launchd Status</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd\"><h4>Render Systemd</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Binary<input name=\"bin_path\" placeholder=\"/usr/local/bin/agent-os\"></label><label>Interval ms<input name=\"interval_ms\" type=\"number\" min=\"1\" value=\"1000\" data-number=\"true\"></label><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Recover stale seconds<input name=\"recover_stale_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><label>Unit path<input name=\"unit_path\" placeholder=\"~/.config/systemd/user/agent-os.service\"></label><button type=\"submit\">Render Systemd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd/install\"><h4>Install Systemd</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Binary<input name=\"bin_path\" placeholder=\"/usr/local/bin/agent-os\"></label><label>Interval ms<input name=\"interval_ms\" type=\"number\" min=\"1\" value=\"1000\" data-number=\"true\"></label><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"1\" data-number=\"true\"></label><label>Execute<select name=\"execute\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Recover stale seconds<input name=\"recover_stale_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><label>Unit path<input name=\"unit_path\" placeholder=\"~/.config/systemd/user/agent-os.service\"></label><button type=\"submit\">Install Systemd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd/uninstall\"><h4>Uninstall Systemd</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Unit path<input name=\"unit_path\" placeholder=\"~/.config/systemd/user/agent-os.service\"></label><button class=\"deny\" type=\"submit\">Uninstall Systemd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd/start\"><h4>Start Systemd</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Systemctl path<input name=\"systemctl_path\" placeholder=\"systemctl\"></label><button type=\"submit\">Start Systemd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd/stop\"><h4>Stop Systemd</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Systemctl path<input name=\"systemctl_path\" placeholder=\"systemctl\"></label><button class=\"deny\" type=\"submit\">Stop Systemd</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/service/systemd/status\"><h4>Systemd Status</h4><label>Unit name<input name=\"unit_name\" placeholder=\"agent-os.service\"></label><label>Systemctl path<input name=\"systemctl_path\" placeholder=\"systemctl\"></label><button type=\"submit\">Systemd Status</button><output></output></form>");
+    body.push_str("</div></section>");
+
+    body.push_str(
+        "<section class=\"wide\"><h2>State Maintenance</h2><div class=\"state-actions\">",
+    );
+    body.push_str("<form data-dashboard-query data-endpoint=\"/state/validate\"><h4>Validate State</h4><button type=\"submit\">Validate State</button><output></output></form>");
+    body.push_str("<form data-dashboard-query data-endpoint=\"/state/export\"><h4>Read Snapshot</h4><button type=\"submit\">Read Snapshot</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/export\"><h4>Export State</h4><label>Output<input name=\"output\" placeholder=\"state.json\" required></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Export State</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/import\"><h4>Import State</h4><label>Path<input name=\"path\" placeholder=\"state.json\" required></label><label>Force<select name=\"force\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button class=\"deny\" type=\"submit\">Import State</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/migrate\"><h4>Migrate State</h4><label>Input<input name=\"input\" placeholder=\"legacy.json\"></label><label>Output<input name=\"output\" placeholder=\"state.json\"></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Migrate State</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/sqlite\"><h4>SQLite Mirror</h4><label>Output<input name=\"output\" placeholder=\"state.sqlite\"></label><label>Init only<select name=\"init_only\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Restore<select name=\"restore\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Force<select name=\"force\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Sync SQLite</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/backup\"><h4>Backup</h4><label>Output<input name=\"output\" placeholder=\"backup.json\"></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Backup State</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/repair\"><h4>Repair</h4><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Repair State</button><output></output></form>");
+    body.push_str("<form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/state/prune\"><h4>Prune</h4><label>Keep runs<input name=\"keep_runs\" type=\"number\" min=\"0\" value=\"100\" data-number=\"true\"></label><label>Keep events<input name=\"keep_events\" type=\"number\" min=\"0\" value=\"500\" data-number=\"true\"></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Prune State</button><output></output></form>");
+    body.push_str("</div></section>");
+
+    let _ = write!(
+        body,
+        "<section class=\"wide\"><h2>Policy Posture</h2><div class=\"policy-grid\"><article><span>Autonomy</span><strong>{}</strong><small>Shell {}</small></article><article><span>Sandbox</span><strong>{}</strong><small>Workspace jail {}</small><small>Writable paths: {}</small></article><article><span>Network</span><strong>{}</strong><small>Allowed hosts: {}</small></article><article><span>Approval Gates</span><strong>{}</strong><small>Risky patterns: {}</small></article><article><span>Runtime Limits</span><strong>{}s timeout</strong><small>Max output: {} bytes</small></article><article><span>Memory Policy</span><strong>{}</strong><small>Provider memories: {}</small><small>Scope: {}</small></article><article><span>Allowed Workspaces</span><strong>{}</strong></article><article><span>Policy Rules</span><strong>{}</strong></article></div><div class=\"policy-actions\"><form data-dashboard-query data-endpoint=\"/config\"><h4>Config</h4><button type=\"submit\">Inspect Config</button><output></output></form><form data-dashboard-query data-endpoint=\"/config/validate\"><h4>Config Validation</h4><button type=\"submit\">Validate Config</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/config\"><h4>Write Config Profile</h4><label>Profile<select name=\"profile\"><option value=\"safe\">Safe</option><option value=\"dev\">Dev</option><option value=\"autonomous\">Autonomous</option><option value=\"ci\">CI</option></select></label><label>Force<select name=\"force\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Write Config</button><output></output></form></div></section>",
+        escape_html(autonomy_level_label(&os.policy.autonomy)),
+        escape_html(enabled_label(os.policy.allow_shell)),
+        escape_html(enabled_label(os.policy.sandbox.process_isolation)),
+        escape_html(enabled_label(os.policy.sandbox.jailed_workspaces)),
+        escape_html(&dashboard_list_value(&os.policy.sandbox.writable_paths)),
+        escape_html(network_mode_label(&os.policy.network.mode)),
+        escape_html(&dashboard_list_value(&os.policy.network.allowed_hosts)),
+        escape_html(enabled_label(os.policy.approval.require_for_risky_actions)),
+        escape_html(&dashboard_list_value(&os.policy.approval.risky_patterns)),
+        os.policy.command_timeout_seconds,
+        os.policy.max_output_bytes,
+        escape_html(if os.memory_policy.semantic_recall {
+            "semantic recall"
+        } else {
+            "recency recall"
+        }),
+        os.memory_policy.max_provider_memories,
+        escape_html(os.memory_policy.scope.as_deref().unwrap_or("-")),
+        escape_html(&dashboard_list_value(&os.policy.allowed_workspaces)),
+        escape_html(&dashboard_list_value(&os.policy.rules))
+    );
+
+    let _ = write!(
+        body,
+        "<section class=\"wide\"><h2>Provider Boundary</h2><div class=\"provider-grid\"><article><span>Provider</span><strong>{}</strong><small>Model: {}</small><small>Adapter: {}</small></article><article><span>Endpoint</span><strong>{}</strong><small>API key env: {}</small></article><article><span>Plugin</span><strong>{}</strong><small>Args: {}</small><small>Env keys: {}</small></article><article><span>Structured Output</span><strong>{}</strong><small>Request options: {}</small></article><article><span>Retries</span><strong>{}</strong><small>Backoff: {} ms</small><small>Timeout: {}s</small></article></div></section>",
+        escape_html(&os.provider.kind.to_string()),
+        escape_html(&os.provider.model),
+        escape_html(os.provider.adapter.as_deref().unwrap_or("-")),
+        escape_html(os.provider.endpoint.as_deref().unwrap_or("-")),
+        escape_html(&os.provider.api_key_env),
+        escape_html(os.provider.plugin_command.as_deref().unwrap_or("-")),
+        escape_html(&dashboard_list_value(&os.provider.plugin_args)),
+        escape_html(&dashboard_map_keys_value(&os.provider.plugin_env)),
+        escape_html(if os.provider.response_schema.is_some() {
+            "schema configured"
+        } else {
+            "plain text allowed"
+        }),
+        escape_html(&dashboard_map_keys_value(&os.provider.request_options)),
+        os.provider.max_retries,
+        os.provider.retry_backoff_ms,
+        os.provider.request_timeout_seconds
+    );
+
+    body.push_str("<section><h2>Approvals</h2><table><thead><tr><th>Action</th><th>Status</th><th>Reason</th><th>Task</th><th>Resolve</th></tr></thead><tbody>");
+    for approval in os.approvals.values().take(20) {
+        let resolution = if approval.status == ApprovalStatus::Pending {
+            let endpoint = escape_html(&format!("/approvals/{}", approval.id));
+            format!(
+                "<div class=\"approval-actions\"><form data-dashboard-form data-endpoint=\"{endpoint}/approve\"><label>By<input name=\"by\" placeholder=\"operator\"></label><button type=\"submit\">Approve</button><output></output></form><form data-dashboard-form data-endpoint=\"{endpoint}/deny\"><label>By<input name=\"by\" placeholder=\"operator\"></label><button class=\"deny\" type=\"submit\">Deny</button><output></output></form></div>"
+            )
+        } else {
+            approval
+                .resolved_by
+                .as_ref()
+                .map(|resolved_by| escape_html(resolved_by))
+                .unwrap_or_else(|| "-".into())
+        };
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&approval.action),
+            escape_html(&approval_status_label(&approval.status)),
+            escape_html(&approval.reason),
+            escape_html(&approval.task_id.to_string()),
+            resolution
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Workers</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/workers\"><h4>Register Worker</h4><label>Worker ID<input name=\"id\" required></label><label>Endpoint<input name=\"endpoint\" placeholder=\"http://127.0.0.1:9200\" required></label><label>Status<select name=\"status\"><option value=\"online\">Online</option><option value=\"busy\">Busy</option><option value=\"paused\">Paused</option><option value=\"offline\">Offline</option></select></label><button type=\"submit\">Register Worker</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/workers/{worker_id}/heartbeat\"><h4>Heartbeat Worker</h4><label>Worker ID<input name=\"worker_id\" data-path=\"true\" required></label><label>Endpoint<input name=\"endpoint\" placeholder=\"http://127.0.0.1:9200\"></label><label>Status<select name=\"status\"><option value=\"\">Unchanged</option><option value=\"online\">Online</option><option value=\"busy\">Busy</option><option value=\"paused\">Paused</option><option value=\"offline\">Offline</option></select></label><label>Lease seconds<input name=\"lease_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Heartbeat Worker</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint-template=\"/workers/{worker_id}/claim\"><h4>Claim Task</h4><label>Worker ID<input name=\"worker_id\" data-path=\"true\" required></label><label>Lease seconds<input name=\"lease_seconds\" type=\"number\" min=\"1\" data-number=\"true\"></label><button type=\"submit\">Claim Task</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint-template=\"/workers/{worker_id}/report\"><h4>Report Task</h4><label>Worker ID<input name=\"worker_id\" data-path=\"true\" required></label><label>Task ID<input name=\"task_id\" required></label><label>Status<select name=\"status\"><option value=\"complete\">Complete</option><option value=\"failed\">Failed</option></select></label><label>Note<input name=\"note\"></label><label>Command<input name=\"command\"></label><label>CWD<input name=\"cwd\"></label><label>Exit code<input name=\"exit_code\" type=\"number\" data-number=\"true\"></label><label>Artifacts JSON<textarea name=\"artifacts\" data-json=\"true\" placeholder='[{\"kind\":\"stdout\",\"path\":\"artifacts/stdout.log\"}]'></textarea></label><button type=\"submit\">Report Task</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/workers/{worker_id}\"><h4>Remove Worker</h4><label>Worker ID<input name=\"worker_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Worker</button><output></output></form></div><table><thead><tr><th>Worker</th><th>Status</th><th>Endpoint</th><th>Last seen</th></tr></thead><tbody>");
+    for worker in os.workers.values().take(20) {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&worker.id),
+            escape_html(&worker.status.to_string()),
+            escape_html(&worker.endpoint),
+            escape_html(&worker.last_seen_at.to_rfc3339())
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Evals</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/evals\"><h4>Record Eval</h4><label>Target<input name=\"target\" required></label><label>Result<select name=\"success\" data-bool=\"true\"><option value=\"true\">Pass</option><option value=\"false\">Fail</option></select></label><label>Cost micros<input name=\"cost_micros\" type=\"number\" min=\"0\" data-number=\"true\"></label><label>Latency ms<input name=\"latency_ms\" type=\"number\" min=\"0\" data-number=\"true\"></label><button type=\"submit\">Record Eval</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/evals/run\"><h4>Run Eval</h4><label>Target<input name=\"target\" required></label><label>Command<input name=\"command\" required></label><label>CWD<input name=\"cwd\"></label><label>Success pattern<input name=\"success_pattern\"></label><label>Output schema JSON<textarea name=\"output_schema\" data-json=\"true\" placeholder='{\"type\":\"object\",\"required\":[\"ok\"]}'></textarea></label><button type=\"submit\">Run Eval</button><output></output></form></div><table><thead><tr><th>Target</th><th>Success</th><th>Latency</th><th>Run</th></tr></thead><tbody>");
+    for eval in os.evals.iter().rev().take(20) {
+        let run_summary = eval
+            .run
+            .as_ref()
+            .map(|run| {
+                if run.timed_out {
+                    "timed out".to_owned()
+                } else {
+                    run.status
+                        .map(|status| format!("exit {status}"))
+                        .unwrap_or_else(|| "manual".into())
+                }
+            })
+            .unwrap_or_else(|| "manual".into());
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&eval.target),
+            escape_html(if eval.success { "yes" } else { "no" }),
+            escape_html(
+                &eval
+                    .latency_ms
+                    .map(|latency| format!("{latency} ms"))
+                    .unwrap_or_else(|| "-".into())
+            ),
+            escape_html(&run_summary)
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Run Inspector</h2><div class=\"run-actions\"><form data-dashboard-query data-endpoint-template=\"/runs/{run_id}/debug\"><h4>Debug</h4><label>Run ID<input name=\"run_id\" data-path=\"true\" required></label><label>Tail bytes<input name=\"tail_bytes\" type=\"number\" min=\"1\"></label><button type=\"submit\">Debug Run</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/runs/{run_id}/replay\"><h4>Replay</h4><label>Run ID<input name=\"run_id\" data-path=\"true\" required></label><label>Tail bytes<input name=\"tail_bytes\" type=\"number\" min=\"1\"></label><button type=\"submit\">Replay Run</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/runs/{run_id}/artifacts\"><h4>Artifacts</h4><label>Run ID<input name=\"run_id\" data-path=\"true\" required></label><button type=\"submit\">List Artifacts</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/runs/{run_id}/artifacts/{artifact_id}\"><h4>Read Artifact</h4><label>Run ID<input name=\"run_id\" data-path=\"true\" required></label><label>Artifact ID<input name=\"artifact_id\" data-path=\"true\" placeholder=\"stdout\" required></label><label>Tail bytes<input name=\"tail_bytes\" type=\"number\" min=\"1\"></label><button type=\"submit\">Read Artifact</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint-template=\"/runs/{run_id}/cancel\"><h4>Cancel Run</h4><label>Run ID<input name=\"run_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Cancel Run</button><output></output></form></div></section>");
+
+    body.push_str("<section><h2>Run Artifacts</h2><table><thead><tr><th>Run</th><th>Kind</th><th>Bytes</th><th>Path</th></tr></thead><tbody>");
+    for run in os.runs.values().take(20) {
+        for artifact in run.artifacts.iter().take(8) {
+            let _ = write!(
+                body,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&run.id.to_string()),
+                escape_html(run_artifact_kind_label(&artifact.kind)),
+                escape_html(
+                    &artifact
+                        .bytes
+                        .map(|bytes| bytes.to_string())
+                        .unwrap_or_else(|| "-".into())
+                ),
+                escape_html(&artifact.path)
+            );
+        }
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Secrets</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/secrets\"><h4>Register Backend</h4><label>Backend ID<input name=\"id\" required></label><label>Kind<select name=\"kind\"><option value=\"environment\">Environment</option><option value=\"1password\">1Password</option><option value=\"os-keychain\">OS Keychain</option><option value=\"env-vault\">Env Vault</option></select></label><label>Reference<input name=\"reference\"></label><button type=\"submit\">Register Secret Backend</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/secrets/{backend_id}\"><h4>Inspect Backend</h4><label>Backend ID<input name=\"backend_id\" data-path=\"true\" required></label><button type=\"submit\">Inspect Backend</button><output></output></form><form data-dashboard-query data-endpoint=\"/secrets/check\"><h4>Check References</h4><button type=\"submit\">Check Secrets</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/secrets/{backend_id}\"><h4>Remove Backend</h4><label>Backend ID<input name=\"backend_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Backend</button><output></output></form></div><table><thead><tr><th>Backend</th><th>Kind</th><th>Reference</th></tr></thead><tbody>");
+    for backend in os.secrets_backends.values().take(20) {
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&backend.id),
+            escape_html(secrets_backend_kind_name(&backend.kind)),
+            backend
+                .reference
+                .as_ref()
+                .map(|reference| escape_html(reference))
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    body.push_str("</tbody></table></section>");
+
+    body.push_str("<section class=\"wide\"><h2>Memory</h2><div class=\"worker-actions\"><form data-dashboard-form data-endpoint=\"/memory\"><h4>Add Memory</h4><label>Topic<input name=\"topic\" required></label><label>Body<textarea name=\"body\" required></textarea></label><label>Tags<input name=\"tags\" data-list=\"true\" placeholder=\"ops,release\"></label><label>Visibility<select name=\"visibility\"><option value=\"shared\">Shared</option><option value=\"private\">Private</option></select></label><label>Scope<input name=\"scope\"></label><button type=\"submit\">Add Memory</button><output></output></form><form data-dashboard-query data-endpoint=\"/memory/recall\"><h4>Recall</h4><label>Query<input name=\"query\" required></label><label>Tag<input name=\"tag\"></label><label>Visibility<select name=\"visibility\"><option value=\"\">Any</option><option value=\"shared\">Shared</option><option value=\"private\">Private</option></select></label><label>Scope<input name=\"scope\"></label><label>Limit<input name=\"limit\" type=\"number\" min=\"1\" value=\"5\"></label><button type=\"submit\">Recall Memory</button><output></output></form><form data-dashboard-query data-endpoint-template=\"/memory/{memory_id}\"><h4>Inspect Memory</h4><label>Memory ID<input name=\"memory_id\" data-path=\"true\" required></label><button type=\"submit\">Inspect Memory</button><output></output></form><form data-dashboard-form data-endpoint-template=\"/memory/{memory_id}\"><h4>Update Memory</h4><label>Memory ID<input name=\"memory_id\" data-path=\"true\" required></label><label>Topic<input name=\"topic\"></label><label>Body<textarea name=\"body\"></textarea></label><label>Tags<input name=\"tags\" data-list=\"true\" placeholder=\"ops,release\"></label><label>Clear tags<select name=\"clear_tags\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><label>Visibility<select name=\"visibility\"><option value=\"\">Unchanged</option><option value=\"shared\">Shared</option><option value=\"private\">Private</option></select></label><label>Scope<input name=\"scope\"></label><label>Clear scope<select name=\"clear_scope\" data-bool=\"true\"><option value=\"false\">No</option><option value=\"true\">Yes</option></select></label><button type=\"submit\">Update Memory</button><output></output></form><form data-dashboard-form data-dashboard-result=\"json\" data-endpoint=\"/memory/prune\"><h4>Prune Memory</h4><label>Max age days<input name=\"max_age_days\" type=\"number\" min=\"1\" data-number=\"true\"></label><label>Dry run<select name=\"dry_run\" data-bool=\"true\"><option value=\"true\">Yes</option><option value=\"false\">No</option></select></label><button type=\"submit\">Prune Memory</button><output></output></form><form data-dashboard-form data-method=\"DELETE\" data-endpoint-template=\"/memory/{memory_id}\"><h4>Remove Memory</h4><label>Memory ID<input name=\"memory_id\" data-path=\"true\" required></label><button class=\"deny\" type=\"submit\">Remove Memory</button><output></output></form></div><ul>");
+    for memory in os.memory.iter().take(20) {
+        let _ = write!(
+            body,
+            "<li><strong>{}</strong><span>{}</span></li>",
+            escape_html(&memory.topic),
+            escape_html(&memory.tags.join(", "))
+        );
+    }
+    body.push_str("</ul></section>");
+
+    body.push_str("<section><h2>Timeline</h2><ol>");
+    for event in os.events.iter().rev().take(30) {
+        let _ = write!(
+            body,
+            "<li><time>{}</time><strong>{}</strong><span>{}</span></li>",
+            escape_html(&event.at.to_rfc3339()),
+            escape_html(&event.kind.to_string()),
+            escape_html(&event.message)
+        );
+    }
+    body.push_str("</ol></section>");
+    body.push_str("</main>");
+    body.push_str(dashboard_script());
+    body.push_str("</body></html>");
+    body
+}
+
+fn dashboard_css() -> &'static str {
+    "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f7f8;color:#182026}header{background:#182026;color:white;padding:24px 32px;display:flex;gap:24px;justify-content:space-between;align-items:end}header p{margin:0 0 4px;color:#b8c2cc}h1{margin:0;font-size:28px}h2{font-size:16px;margin:0 0 12px}h3{font-size:15px;margin:0 0 4px}h4{font-size:13px;margin:0 0 8px}dl{display:grid;grid-template-columns:repeat(4,minmax(90px,1fr));gap:12px;margin:0}dt{color:#b8c2cc;font-size:12px}dd{margin:0;font-size:24px;font-weight:700}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;padding:16px}section{background:white;border:1px solid #dde3ea;border-radius:8px;padding:16px;overflow:auto}.wide{grid-column:1/-1}table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}th{text-align:left;color:#5f6b76;font-weight:600;border-bottom:1px solid #e6ebf0;padding:8px}td{border-bottom:1px solid #eef2f5;padding:8px;vertical-align:top}.metric-grid,.policy-grid,.provider-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric-grid article,.policy-grid article,.provider-grid article{border:1px solid #e6ebf0;border-radius:6px;padding:10px}.metric-grid span,.policy-grid span,.provider-grid span{display:block;color:#5f6b76;font-size:12px}.metric-grid strong,.policy-grid strong,.provider-grid strong{display:block;font-size:22px}.policy-grid small,.provider-grid small{display:block;color:#5f6b76;font-size:12px;margin-top:4px}ul,ol{margin:0;padding-left:20px}li{margin:0 0 10px}li span{display:block;color:#5f6b76}time,.muted{display:block;color:#5f6b76;font-size:12px}.dag-editor,.template-editor,.mcp-editor{border-top:1px solid #eef2f5;padding:12px 0}.dag-editor:first-of-type,.template-editor:first-of-type,.mcp-editor:first-of-type{border-top:0}.dag-editor pre{white-space:pre-wrap;background:#f6f7f8;border:1px solid #e6ebf0;border-radius:6px;padding:8px;font-size:12px}.template-editor p{margin:0 0 10px}.dag-actions,.approval-actions,.git-actions,.service-actions,.state-actions,.run-actions,.worker-actions,.policy-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.state-actions{grid-template-columns:repeat(4,minmax(0,1fr))}.run-actions,.worker-actions,.policy-actions{grid-template-columns:repeat(3,minmax(0,1fr))}.approval-actions{min-width:360px;gap:8px}form{border:1px solid #e6ebf0;border-radius:6px;padding:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;align-items:end}label{display:grid;gap:4px;color:#5f6b76;font-size:12px}input,select,textarea{box-sizing:border-box;width:100%;border:1px solid #c9d3df;border-radius:6px;padding:7px;font:inherit;background:white}textarea{min-height:140px;resize:vertical}.marketplace-import label:first-of-type{grid-column:1/-1}button{border:0;border-radius:6px;background:#1f6feb;color:white;padding:8px 10px;font-weight:600}output{font-size:12px;color:#5f6b76;white-space:pre-wrap}.service-actions output,.state-actions output,.worker-actions output,.policy-actions output{grid-column:1/-1;max-height:260px;overflow:auto;background:#f6f7f8;border:1px solid #e6ebf0;border-radius:6px;padding:8px}.approval-actions form{grid-template-columns:minmax(120px,1fr) auto;padding:8px}.approval-actions output{grid-column:1/-1}.approval-actions button{white-space:nowrap}button.deny{background:#b42318}@media(max-width:1100px){.state-actions,.worker-actions,.policy-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:900px){.run-actions,.policy-actions{grid-template-columns:1fr}}@media(max-width:720px){header{display:block}dl{grid-template-columns:repeat(2,minmax(90px,1fr));margin-top:16px}main{grid-template-columns:1fr;padding:12px}.dag-actions,.approval-actions,.git-actions,.service-actions,.state-actions,.worker-actions,.policy-actions{grid-template-columns:1fr}.approval-actions{min-width:0}}"
+}
+
+fn dashboard_script() -> &'static str {
+    r#"<script>
+function dashboardHeaders(includeContentType = false) {
+  const headers = {};
+  if (includeContentType) headers['content-type'] = 'application/json';
+  const token = localStorage.getItem('agent_os_api_token') || '';
+  if (token) headers.authorization = `Bearer ${token}`;
+  return headers;
+}
+document.querySelectorAll('[data-dashboard-form]').forEach((form) => {
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const output = form.querySelector('output');
+    const method = form.dataset.method || 'POST';
+    let endpoint = form.dataset.endpointTemplate || form.dataset.endpoint;
+    const body = {};
+    for (const field of new FormData(form).entries()) {
+      const [key, value] = field;
+      const input = form.querySelector(`[name="${key}"]`);
+      const text = String(value).trim();
+      if (!text) continue;
+      if (input && input.dataset.path === 'true') {
+        endpoint = endpoint.replace(`{${key}}`, encodeURIComponent(text));
+      } else if (input && input.dataset.list === 'true') {
+        body[key] = text.split(',').map((item) => item.trim()).filter(Boolean);
+      } else if (input && input.dataset.bool === 'true') {
+        body[key] = text === 'true';
+      } else if (input && input.dataset.number === 'true') {
+        body[key] = Number(text);
+      } else if (input && input.dataset.json === 'true') {
+        try {
+          body[key] = JSON.parse(text);
+        } catch (_error) {
+          output.textContent = `${key} must be valid JSON`;
+          return;
+        }
+      } else {
+        body[key] = text;
+      }
+    }
+    try {
+      const response = await fetch(endpoint, {
+        method,
+        headers: dashboardHeaders(true),
+        body: JSON.stringify(body)
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) {
+        output.textContent = result && result.error ? result.error : `HTTP ${response.status}`;
+      } else if (form.dataset.dashboardResult === 'json') {
+        output.textContent = result ? JSON.stringify(result, null, 2) : 'OK';
+      } else {
+        output.textContent = 'Saved';
+        setTimeout(() => location.reload(), 500);
+      }
+    } catch (error) {
+      output.textContent = error.message || 'Request failed';
+    }
+  });
+});
+document.querySelectorAll('[data-dashboard-query]').forEach((form) => {
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const output = form.querySelector('output');
+    const params = new URLSearchParams();
+    let endpoint = form.dataset.endpointTemplate || form.dataset.endpoint;
+    for (const field of new FormData(form).entries()) {
+      const [key, value] = field;
+      const input = form.querySelector(`[name="${key}"]`);
+      const text = String(value).trim();
+      if (!text) continue;
+      if (input && input.dataset.path === 'true') {
+        endpoint = endpoint.replace(`{${key}}`, encodeURIComponent(text));
+      } else {
+        params.set(key, text);
+      }
+    }
+    const query = params.toString();
+    endpoint = query ? `${endpoint}?${query}` : endpoint;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: dashboardHeaders(false)
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        output.textContent = result.error || `HTTP ${response.status}`;
+      } else if (Object.prototype.hasOwnProperty.call(result, 'stdout')) {
+        output.textContent = result.stdout || 'clean';
+      } else {
+        output.textContent = JSON.stringify(result, null, 2);
+      }
+    } catch (error) {
+      output.textContent = error.message || 'Request failed';
+    }
+  });
+});
+</script>"#
+}
+
+fn dashboard_metric_value(value: &Value) -> String {
+    match value {
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Null => "-".into(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
+fn dashboard_list_value(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".into()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn dashboard_map_keys_value<T>(values: &BTreeMap<String, T>) -> String {
+    if values.is_empty() {
+        "-".into()
+    } else {
+        values.keys().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn enabled_label(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
+}
+
+fn autonomy_level_label(level: &AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::ObserveOnly => "observe-only",
+        AutonomyLevel::Suggest => "suggest",
+        AutonomyLevel::ExecuteWithApproval => "execute-with-approval",
+        AutonomyLevel::ExecuteFreely => "execute-freely",
+    }
+}
+
+fn network_mode_label(mode: &NetworkMode) -> &'static str {
+    match mode {
+        NetworkMode::Disabled => "disabled",
+        NetworkMode::ProvidersOnly => "providers-only",
+        NetworkMode::Allowed => "allowed",
+    }
+}
+
+fn approval_status_label(status: &ApprovalStatus) -> String {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Denied => "denied",
+    }
+    .into()
+}
+
+fn run_artifact_kind_label(kind: &RunArtifactKind) -> &'static str {
+    match kind {
+        RunArtifactKind::Stdout => "stdout",
+        RunArtifactKind::Stderr => "stderr",
+        RunArtifactKind::Summary => "summary",
+        RunArtifactKind::Diff => "diff",
+        RunArtifactKind::File => "file",
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn registry_json(os: &OperatingSystem) -> serde_json::Value {
+    json!({
+        "agent_profiles": &os.agent_profiles,
+        "workflow_templates": &os.workflow_templates,
+        "tools": &os.tools,
+        "mcp_servers": &os.mcp_servers,
+        "secrets_backends": &os.secrets_backends,
+    })
 }
 
 fn limited_events_json(
@@ -837,25 +1951,392 @@ fn workflow_matches_query(workflow: &Workflow, query: &str) -> bool {
             .any(|task_id| task_id.to_string().contains(query))
 }
 
+fn workflow_dag_json(os: &OperatingSystem, id: &WorkflowId, query: &str) -> (&'static str, String) {
+    if let Err(response) = reject_unknown_query_keys(query, &[]) {
+        return response;
+    }
+    match os.workflows.get(id) {
+        Some(workflow) => ("200 OK", workflow_dag_value(os, workflow).to_string()),
+        None => (
+            "404 Not Found",
+            json!({ "error": "workflow not found" }).to_string(),
+        ),
+    }
+}
+
+fn workflow_dag_value(os: &OperatingSystem, workflow: &Workflow) -> serde_json::Value {
+    let task_to_stage = workflow
+        .tasks
+        .iter()
+        .map(|(stage, task_id)| (task_id.clone(), stage.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let nodes = workflow
+        .tasks
+        .iter()
+        .map(|(stage, task_id)| {
+            let task = os.tasks.get(task_id);
+            json!({
+                "stage": stage,
+                "task_id": task_id,
+                "title": task.map(|task| task.title.as_str()),
+                "status": task.map(|task| task.status.to_string()),
+                "priority": task.map(|task| task.priority.to_string()),
+                "assigned_to": task.and_then(|task| task.assigned_to.as_ref()).map(AgentId::to_string),
+                "missing": task.is_none(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut edges = Vec::new();
+    let mut external_dependencies = Vec::new();
+    for (to_stage, to_task_id) in &workflow.tasks {
+        let Some(task) = os.tasks.get(to_task_id) else {
+            continue;
+        };
+        for dependency in &task.dependencies {
+            if let Some(from_stage) = task_to_stage.get(dependency) {
+                edges.push(json!({
+                    "from": from_stage,
+                    "to": to_stage,
+                    "from_task_id": dependency,
+                    "to_task_id": to_task_id,
+                }));
+            } else {
+                external_dependencies.push(json!({
+                    "stage": to_stage,
+                    "task_id": to_task_id,
+                    "dependency_task_id": dependency,
+                }));
+            }
+        }
+    }
+
+    json!({
+        "id": workflow.id,
+        "objective": workflow.objective,
+        "priority": workflow.priority,
+        "nodes": nodes,
+        "edges": edges,
+        "external_dependencies": external_dependencies,
+        "progress": os.workflow_progress(&workflow.id),
+    })
+}
+
+fn workflow_dag_summary(os: &OperatingSystem, workflow: &Workflow) -> String {
+    let dag = workflow_dag_value(os, workflow);
+    let Some(edges) = dag.get("edges").and_then(Value::as_array) else {
+        return "-".into();
+    };
+    let summary = edges
+        .iter()
+        .filter_map(|edge| {
+            let from = edge.get("from").and_then(Value::as_str)?;
+            let to = edge.get("to").and_then(Value::as_str)?;
+            Some(format!("{from} -> {to}"))
+        })
+        .collect::<Vec<_>>();
+    if summary.is_empty() {
+        "-".into()
+    } else {
+        summary.join("; ")
+    }
+}
+
+fn workers_json(
+    os: &OperatingSystem,
+    query: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    reject_unknown_query_keys(query, &["status", "since", "until", "query", "limit"])?;
+    let status = agent_status_query(query)?;
+    let since = timestamp_query(query, "since")?;
+    let until = timestamp_query(query, "until")?;
+    let search = non_empty_query_string(query, "query")?.map(|query| query.to_ascii_lowercase());
+    let limit = positive_query_usize(query, "limit")?;
+    let mut workers = os
+        .workers
+        .values()
+        .filter(|worker| {
+            status
+                .as_ref()
+                .map(|status| &worker.status == status)
+                .unwrap_or(true)
+                && since
+                    .as_ref()
+                    .map(|since| worker.last_seen_at >= *since)
+                    .unwrap_or(true)
+                && until
+                    .as_ref()
+                    .map(|until| worker.last_seen_at <= *until)
+                    .unwrap_or(true)
+                && search
+                    .as_ref()
+                    .map(|query| worker_matches_query(worker, query))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    workers.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if let Some(limit) = limit {
+        workers.truncate(limit);
+    }
+    Ok(json!(workers))
+}
+
+fn worker_matches_query(worker: &WorkerNode, query: &str) -> bool {
+    worker.id.to_ascii_lowercase().contains(query)
+        || worker.endpoint.to_ascii_lowercase().contains(query)
+        || worker
+            .status
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
+fn evals_json(
+    os: &OperatingSystem,
+    query: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    reject_unknown_query_keys(
+        query,
+        &["target", "success", "since", "until", "query", "limit"],
+    )?;
+    let target = non_empty_query_string(query, "target")?;
+    let success = bool_query(query, "success")?;
+    let since = timestamp_query(query, "since")?;
+    let until = timestamp_query(query, "until")?;
+    let search = non_empty_query_string(query, "query")?.map(|query| query.to_ascii_lowercase());
+    let limit = positive_query_usize(query, "limit")?;
+    let mut evals = os
+        .evals
+        .iter()
+        .filter(|record| {
+            target
+                .as_ref()
+                .map(|target| &record.target == target)
+                .unwrap_or(true)
+                && success
+                    .map(|success| record.success == success)
+                    .unwrap_or(true)
+                && since
+                    .as_ref()
+                    .map(|since| record.recorded_at >= *since)
+                    .unwrap_or(true)
+                && until
+                    .as_ref()
+                    .map(|until| record.recorded_at <= *until)
+                    .unwrap_or(true)
+                && search
+                    .as_ref()
+                    .map(|query| eval_matches_query(record, query))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    evals.sort_by(|left, right| {
+        right
+            .recorded_at
+            .cmp(&left.recorded_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if let Some(limit) = limit {
+        evals.truncate(limit);
+    }
+    Ok(json!(evals))
+}
+
+fn eval_matches_query(record: &EvalRecord, query: &str) -> bool {
+    record.id.to_ascii_lowercase().contains(query)
+        || record.target.to_ascii_lowercase().contains(query)
+        || if record.success { "yes" } else { "no" }.contains(query)
+        || record
+            .run
+            .as_ref()
+            .map(|run| {
+                run.command.to_ascii_lowercase().contains(query)
+                    || run.cwd.to_ascii_lowercase().contains(query)
+                    || run.stdout.to_ascii_lowercase().contains(query)
+                    || run.stderr.to_ascii_lowercase().contains(query)
+                    || run
+                        .success_pattern
+                        .as_ref()
+                        .map(|pattern| pattern.to_ascii_lowercase().contains(query))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+}
+
+fn git_status_json(query: &str) -> Result<serde_json::Value, (&'static str, String)> {
+    reject_unknown_query_keys(query, &["cwd"])?;
+    let cwd = non_empty_query_string(query, "cwd")?.map(PathBuf::from);
+    let cwd = resolve_git_cwd(cwd).map_err(git_integration_error_response)?;
+    let output = run_git_command(&cwd, &["status", "--short", "--branch"], false)
+        .map_err(git_integration_error_response)?;
+    Ok(json!(output))
+}
+
+fn create_git_review_task_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<GitReviewTaskRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_optional_text_field("cwd", request.cwd.as_deref()) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_text_field("base", &request.base) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_text_field("title", &request.title) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_git_ref("base", &request.base) {
+        return Ok(response);
+    }
+    let priority = match parse_priority_request(&request.priority) {
+        Ok(priority) => priority,
+        Err(response) => return Ok(response),
+    };
+    let cwd = request.cwd.map(PathBuf::from);
+    let cwd = match resolve_git_cwd(cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => return Ok(git_integration_error_response(error)),
+    };
+    let top_level = match run_git_capture(&cwd, &["rev-parse", "--show-toplevel"]) {
+        Ok(top_level) => top_level,
+        Err(error) => return Ok(git_integration_error_response(error)),
+    };
+    let top_level = top_level.trim().to_owned();
+    if let Some(response) = reject_empty_text_field("git root", &top_level) {
+        return Ok(response);
+    }
+    let base = request.base;
+    let command = format!("git diff --stat {base}...HEAD && git diff {base}...HEAD");
+    let objective = format!("Review the git diff for {} against {base}", top_level);
+
+    store.update(|os| {
+        let mut task = Task::new(
+            request.title,
+            objective,
+            priority,
+            vec!["review".to_owned()],
+        );
+        os.ensure_unique_task_id(&mut task);
+        task.command = Some(command);
+        task.cwd = Some(top_level);
+        let id = task.id.clone();
+        os.create_task(task);
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "task": os.tasks.get(&id),
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn git_integration_error_response(error: GitIntegrationError) -> (&'static str, String) {
+    (
+        "400 Bad Request",
+        json!({
+            "error": error.to_string(),
+            "stderr": error.stderr(),
+        })
+        .to_string(),
+    )
+}
+
+fn secrets_json(
+    os: &OperatingSystem,
+    query: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    reject_unknown_query_keys(query, &["kind", "query", "limit"])?;
+    let kind = match non_empty_query_string(query, "kind")? {
+        Some(kind) => Some(parse_secrets_backend_kind_request(&kind)?),
+        None => None,
+    };
+    let search = non_empty_query_string(query, "query")?.map(|query| query.to_ascii_lowercase());
+    let limit = positive_query_usize(query, "limit")?;
+    let mut backends = os
+        .secrets_backends
+        .values()
+        .filter(|backend| {
+            kind.as_ref()
+                .map(|kind| &backend.kind == kind)
+                .unwrap_or(true)
+                && search
+                    .as_ref()
+                    .map(|query| secrets_backend_matches_query(backend, query))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    backends.sort_by(|left, right| left.id.cmp(&right.id));
+    if let Some(limit) = limit {
+        backends.truncate(limit);
+    }
+    Ok(json!(backends))
+}
+
+fn secrets_backend_matches_query(backend: &SecretsBackend, query: &str) -> bool {
+    backend.id.to_ascii_lowercase().contains(query)
+        || secrets_backend_kind_name(&backend.kind).contains(query)
+        || backend
+            .reference
+            .as_ref()
+            .map(|reference| reference.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+}
+
 fn memory_json(
     os: &OperatingSystem,
     query: &str,
 ) -> Result<serde_json::Value, (&'static str, String)> {
-    reject_unknown_query_keys(query, &["query", "tag", "since", "until", "limit"])?;
+    reject_unknown_query_keys(
+        query,
+        &[
+            "query",
+            "tag",
+            "since",
+            "until",
+            "limit",
+            "visibility",
+            "scope",
+        ],
+    )?;
     let search = non_empty_query_string(query, "query")?;
     let tags = tag_query(query)?;
+    let visibility = memory_visibility_query(query)?;
+    let scope = non_empty_query_string(query, "scope")?;
     let since = timestamp_query(query, "since")?;
     let until = timestamp_query(query, "until")?;
     let limit = positive_query_usize(query, "limit")?;
     let mut records = os
         .memory
         .iter()
-        .filter(|record| {
-            search
+        .filter_map(|record| {
+            let score = search
                 .as_ref()
-                .map(|query| memory_matches_query(record, query))
-                .unwrap_or(true)
-                && has_all_tags(&record.tags, &tags)
+                .map(|query| memory_relevance_score(record, query))
+                .unwrap_or(0);
+            (search.is_none() || score > 0).then_some((score, record))
+        })
+        .filter(|(_, record)| {
+            has_all_tags(&record.tags, &tags)
+                && visibility
+                    .as_ref()
+                    .map(|visibility| record.visibility == *visibility)
+                    .unwrap_or(true)
+                && scope
+                    .as_ref()
+                    .map(|scope| record.scope.as_deref() == Some(scope.as_str()))
+                    .unwrap_or(true)
                 && since
                     .as_ref()
                     .map(|since| record.updated_at >= *since)
@@ -866,11 +2347,85 @@ fn memory_json(
                     .unwrap_or(true)
         })
         .collect::<Vec<_>>();
-    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+    records.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
     if let Some(limit) = limit {
         records.truncate(limit);
     }
+    let records = records
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
     Ok(json!(records))
+}
+
+fn memory_recall_json(
+    os: &OperatingSystem,
+    query: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    reject_unknown_query_keys(
+        query,
+        &[
+            "query",
+            "tag",
+            "since",
+            "until",
+            "limit",
+            "visibility",
+            "scope",
+        ],
+    )?;
+    let Some(search) = non_empty_query_string(query, "query")? else {
+        return Err((
+            "400 Bad Request",
+            json!({ "error": "query is required for memory recall" }).to_string(),
+        ));
+    };
+    let tags = tag_query(query)?;
+    let visibility = memory_visibility_query(query)?;
+    let scope = non_empty_query_string(query, "scope")?;
+    let since = timestamp_query(query, "since")?;
+    let until = timestamp_query(query, "until")?;
+    let limit = positive_query_usize(query, "limit")?;
+    let mut hits = os
+        .memory
+        .iter()
+        .filter_map(|record| {
+            let score = memory_relevance_score(record, &search);
+            (score > 0
+                && has_all_tags(&record.tags, &tags)
+                && visibility
+                    .as_ref()
+                    .map(|visibility| record.visibility == *visibility)
+                    .unwrap_or(true)
+                && scope
+                    .as_ref()
+                    .map(|scope| record.scope.as_deref() == Some(scope.as_str()))
+                    .unwrap_or(true)
+                && since
+                    .as_ref()
+                    .map(|since| record.updated_at >= *since)
+                    .unwrap_or(true)
+                && until
+                    .as_ref()
+                    .map(|until| record.updated_at <= *until)
+                    .unwrap_or(true))
+            .then(|| memory_recall_hit(record, &search, score))
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.record.updated_at.cmp(&left.record.updated_at))
+    });
+    if let Some(limit) = limit {
+        hits.truncate(limit);
+    }
+    Ok(json!(hits))
 }
 
 fn tools_json(
@@ -1015,6 +2570,17 @@ fn non_empty_query_string(
     Ok(value)
 }
 
+fn bool_query(query: &str, key: &str) -> Result<Option<bool>, (&'static str, String)> {
+    let Some(value) = non_empty_query_string(query, key)? else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err(invalid_query_response(key, "must be true or false")),
+    }
+}
+
 fn capability_query(query: &str) -> Result<Vec<String>, (&'static str, String)> {
     let Some(value) = non_empty_query_string(query, "capability")? else {
         return Ok(Vec::new());
@@ -1107,12 +2673,52 @@ fn run_status_query(query: &str) -> Result<Option<RunStatus>, (&'static str, Str
         .map(Some)
 }
 
+fn parse_worker_report_status_request(status: &str) -> Result<TaskStatus, (&'static str, String)> {
+    match TaskStatus::try_parse(status) {
+        Some(TaskStatus::Complete) => Ok(TaskStatus::Complete),
+        Some(TaskStatus::Failed) => Ok(TaskStatus::Failed),
+        Some(_) => Err((
+            "400 Bad Request",
+            json!({ "error": "worker report status must be complete or failed" }).to_string(),
+        )),
+        None => Err((
+            "400 Bad Request",
+            json!({ "error": "invalid worker report status" }).to_string(),
+        )),
+    }
+}
+
+fn parse_run_artifact_kind_request(kind: &str) -> Result<RunArtifactKind, (&'static str, String)> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "stdout" => Ok(RunArtifactKind::Stdout),
+        "stderr" => Ok(RunArtifactKind::Stderr),
+        "summary" => Ok(RunArtifactKind::Summary),
+        "diff" => Ok(RunArtifactKind::Diff),
+        "file" => Ok(RunArtifactKind::File),
+        _ => Err((
+            "400 Bad Request",
+            json!({ "error": "invalid run artifact kind" }).to_string(),
+        )),
+    }
+}
+
 fn event_kind_query(query: &str) -> Result<Option<EventKind>, (&'static str, String)> {
     let Some(kind) = non_empty_query_string(query, "kind")? else {
         return Ok(None);
     };
     EventKind::try_parse(&kind)
         .ok_or_else(|| invalid_query_response("kind", "must be a valid event kind"))
+        .map(Some)
+}
+
+fn memory_visibility_query(
+    query: &str,
+) -> Result<Option<MemoryVisibility>, (&'static str, String)> {
+    let Some(visibility) = non_empty_query_string(query, "visibility")? else {
+        return Ok(None);
+    };
+    MemoryVisibility::try_parse(&visibility)
+        .ok_or_else(|| invalid_query_response("visibility", "must be shared or private"))
         .map(Some)
 }
 
@@ -1278,9 +2884,67 @@ fn response_for_mutation_with_context(
         ("POST", ["tasks", id, "plan"]) => plan_task_response(store, id, body),
         ("DELETE", ["tasks", id]) => delete_task_response(store, id),
         ("POST", ["workflows"]) => create_workflow_response(store, body),
+        ("POST", ["workflows", id, "tasks"]) => add_workflow_task_response(store, id, body),
+        ("POST", ["workflows", id, "link"]) => edit_workflow_edge_response(store, id, body, true),
+        ("POST", ["workflows", id, "unlink"]) => {
+            edit_workflow_edge_response(store, id, body, false)
+        }
+        ("POST", ["workflows", id, "pause"]) => transition_workflow_response(
+            store,
+            id,
+            body,
+            "paused",
+            |status| matches!(status, TaskStatus::Pending),
+            Runtime::block_task,
+        ),
+        ("POST", ["workflows", id, "resume"]) => transition_workflow_response(
+            store,
+            id,
+            body,
+            "resumed",
+            |status| matches!(status, TaskStatus::Blocked),
+            Runtime::unblock_task,
+        ),
+        ("POST", ["workflows", id, "retry"]) => transition_workflow_response(
+            store,
+            id,
+            body,
+            "retried",
+            |status| {
+                matches!(
+                    status,
+                    TaskStatus::Blocked | TaskStatus::Failed | TaskStatus::Cancelled
+                )
+            },
+            Runtime::retry_task,
+        ),
         ("POST", ["workflows", id, "run"]) => run_workflow_response(store, id, body),
         ("POST", ["workflows", id, "cancel"]) => cancel_workflow_response(store, id, body),
         ("DELETE", ["workflows", id]) => delete_workflow_response(store, id),
+        ("POST", ["approvals", id, "approve"]) => resolve_approval_response(store, id, body, true),
+        ("POST", ["approvals", id, "deny"]) => resolve_approval_response(store, id, body, false),
+        ("POST", ["workers"]) => register_worker_response(store, body),
+        ("POST", ["workers", id, "heartbeat"]) => heartbeat_worker_response(store, id, body),
+        ("POST", ["workers", id, "claim"]) => claim_worker_response(store, id, body),
+        ("POST", ["workers", id, "report"]) => report_worker_response(store, id, body),
+        ("DELETE", ["workers", id]) => delete_worker_response(store, id),
+        ("POST", ["evals"]) => record_eval_response(store, body),
+        ("POST", ["evals", "run"]) => run_eval_response(store, body),
+        ("POST", ["git", "review-task"]) => create_git_review_task_response(store, body),
+        ("POST", ["registry", "marketplace-import"]) => {
+            import_marketplace_manifest_response(store, body)
+        }
+        ("POST", ["registry", "profiles", id, "agents"]) => {
+            install_agent_profile_response(store, id, body)
+        }
+        ("POST", ["registry", "mcp-servers"]) => register_mcp_server_response(store, body),
+        ("POST", ["registry", "mcp-servers", id]) => update_mcp_server_response(store, id, body),
+        ("DELETE", ["registry", "mcp-servers", id]) => delete_mcp_server_response(store, id),
+        ("POST", ["registry", "templates", id, "workflows"]) => {
+            create_template_workflow_response(store, id, body)
+        }
+        ("POST", ["secrets"]) => register_secrets_backend_response(store, body),
+        ("DELETE", ["secrets", id]) => delete_secrets_backend_response(store, id),
         ("POST", ["tools"]) => create_tool_response(store, body),
         ("POST", ["tools", id]) => update_tool_response(store, id, body),
         ("DELETE", ["tools", id]) => delete_tool_response(store, id),
@@ -1290,6 +2954,7 @@ fn response_for_mutation_with_context(
         ("POST", ["state", "repair"]) => repair_state_response(store, body),
         ("POST", ["state", "prune"]) => prune_state_response(store, body),
         ("POST", ["state", "backup"]) => backup_state_response(store, body),
+        ("POST", ["state", "sqlite"]) => sqlite_state_response(store, body),
         ("POST", ["run"]) => run_once_response(store, body),
         ("POST", ["daemon", "stop"]) => stop_daemon_response(store),
         ("POST", ["service", "launchd"]) => render_launchd_service_response(store, body),
@@ -1300,8 +2965,17 @@ fn response_for_mutation_with_context(
         ("POST", ["service", "launchd", "start"]) => start_launchd_service_response(body),
         ("POST", ["service", "launchd", "stop"]) => stop_launchd_service_response(body),
         ("POST", ["service", "launchd", "status"]) => status_launchd_service_response(body),
+        ("POST", ["service", "systemd"]) => render_systemd_service_response(store, body),
+        ("POST", ["service", "systemd", "install"]) => {
+            install_systemd_service_response(store, body)
+        }
+        ("POST", ["service", "systemd", "uninstall"]) => uninstall_systemd_service_response(body),
+        ("POST", ["service", "systemd", "start"]) => start_systemd_service_response(body),
+        ("POST", ["service", "systemd", "stop"]) => stop_systemd_service_response(body),
+        ("POST", ["service", "systemd", "status"]) => status_systemd_service_response(body),
         ("POST", ["runs", id, "cancel"]) => cancel_run_response(store, id),
         ("POST", ["memory"]) => create_memory_response(store, body),
+        ("POST", ["memory", "prune"]) => prune_memory_response(store, body),
         ("POST", ["memory", id]) => update_memory_response(store, id, body),
         ("DELETE", ["memory", id]) => delete_memory_response(store, id),
         _ => Ok((
@@ -1321,6 +2995,7 @@ fn store_error_response(error: StoreError) -> (&'static str, String) {
     let status = match error {
         StoreError::AlreadyExists { .. } | StoreError::InvalidState { .. } => "409 Conflict",
         StoreError::EmptyHome
+        | StoreError::Backend { .. }
         | StoreError::Io { .. }
         | StoreError::Json { .. }
         | StoreError::Migration { .. }
@@ -1374,7 +3049,7 @@ fn config_json_response(config_path: Option<&Path>) -> (&'static str, String) {
             json!({
                 "path": path.display().to_string(),
                 "exists": exists,
-                "config": config.unwrap_or_default(),
+                "config": config.unwrap_or_else(AppConfig::effective_default),
             })
             .to_string(),
         ),
@@ -1404,13 +3079,15 @@ fn write_config_response(config_path: Option<&Path>, body: &[u8]) -> (&'static s
             .to_string(),
         );
     };
-    match write_default_config(path, request.force) {
+    let profile = request.profile.unwrap_or(ConfigProfile::Safe);
+    match write_profile_config(path, request.force, profile) {
         Ok(()) => (
             "201 Created",
             json!({
                 "path": path.display().to_string(),
                 "written": true,
-                "config": AppConfig::default(),
+                "profile": profile.as_str(),
+                "config": AppConfig::for_profile(profile),
             })
             .to_string(),
         ),
@@ -1455,10 +3132,9 @@ fn init_response(
     {
         return Ok(invalid_text_response("name", "OS name must not be empty"));
     }
-    let config = match config_path {
+    let loaded_config = match config_path {
         Some(path) => match load_config(path) {
-            Ok(Some(config)) => config,
-            Ok(None) => AppConfig::default(),
+            Ok(config) => config,
             Err(error) => {
                 return Ok((
                     "400 Bad Request",
@@ -1470,7 +3146,16 @@ fn init_response(
                 ));
             }
         },
-        None => AppConfig::default(),
+        None => None,
+    };
+    let config = match (loaded_config, request.profile) {
+        (Some(mut config), Some(profile)) => {
+            config.apply_profile(profile);
+            config
+        }
+        (Some(config), None) => config,
+        (None, Some(profile)) => AppConfig::for_profile(profile),
+        (None, None) => AppConfig::effective_default(),
     };
     if let Err(error) = validate_seed_config(&config) {
         return Ok((
@@ -1499,6 +3184,7 @@ fn initialized_os_from_config(config: AppConfig, name: Option<String>) -> Operat
     let mut os = OperatingSystem::new(name);
     os.policy = config.policy.clone();
     os.provider = config.provider.clone();
+    os.memory_policy = config.memory_policy.clone();
     for agent in config.clone().into_agents() {
         os.register_agent(agent);
     }
@@ -1518,6 +3204,8 @@ fn initialized_os_from_config(config: AppConfig, name: Option<String>) -> Operat
 struct WriteConfigRequest {
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    profile: Option<ConfigProfile>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1527,9 +3215,11 @@ struct InitRequest {
     name: Option<String>,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    profile: Option<ConfigProfile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateAgentRequest {
     name: String,
@@ -1543,7 +3233,7 @@ struct CreateAgentRequest {
     parallel: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateAgentRequest {
     #[serde(default)]
@@ -1560,7 +3250,7 @@ struct UpdateAgentRequest {
     parallel: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTaskRequest {
     title: String,
@@ -1582,6 +3272,21 @@ struct CreateTaskRequest {
     required_capabilities: Vec<String>,
     #[serde(default)]
     dependencies: Vec<String>,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitReviewTaskRequest {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default = "default_main_branch")]
+    base: String,
+    #[serde(default = "default_code_review_title")]
+    title: String,
+    #[serde(default = "default_normal_priority")]
+    priority: String,
 }
 
 #[derive(Deserialize)]
@@ -1599,6 +3304,130 @@ struct CreateWorkflowRequest {
 struct RunWorkflowRequest {
     #[serde(default)]
     all: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowAddTaskRequest {
+    stage: String,
+    title: String,
+    #[serde(default)]
+    objective: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowEdgeRequest {
+    from: String,
+    to: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowNoteRequest {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalResolveRequest {
+    #[serde(default)]
+    by: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerRegisterRequest {
+    id: String,
+    endpoint: String,
+    #[serde(default = "default_online_status")]
+    status: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerHeartbeatRequest {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    lease_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReportRequest {
+    task_id: String,
+    #[serde(default = "default_complete_status")]
+    status: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    artifacts: Vec<WorkerReportArtifactRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReportArtifactRequest {
+    kind: String,
+    path: String,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
+fn default_complete_status() -> String {
+    "complete".into()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvalRecordRequest {
+    target: String,
+    success: bool,
+    #[serde(default)]
+    cost_micros: Option<u64>,
+    #[serde(default)]
+    latency_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvalRunRequest {
+    target: String,
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    success_pattern: Option<String>,
+    #[serde(default)]
+    output_schema: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretsRegisterRequest {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    reference: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1632,6 +3461,8 @@ struct UpdateTaskRequest {
     required_capabilities: Option<Vec<String>>,
     #[serde(default)]
     clear_required_capabilities: bool,
+    #[serde(default)]
+    max_attempts: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1670,6 +3501,79 @@ struct UpdateToolRequest {
     clear_cwd: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceManifestMetadata {
+    id: String,
+    version: String,
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceManifest {
+    #[serde(default)]
+    metadata: Option<MarketplaceManifestMetadata>,
+    #[serde(default)]
+    agent_profiles: Vec<AgentProfile>,
+    #[serde(default)]
+    workflow_templates: Vec<WorkflowTemplate>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServer>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceImportRequest {
+    manifest: MarketplaceManifest,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    expect_checksum: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallAgentProfileRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default = "default_parallel")]
+    parallel: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterMcpServerRequest {
+    id: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default = "default_mcp_server_enabled")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateMcpServerRequest {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateMemoryRequest {
@@ -1677,6 +3581,10 @@ struct CreateMemoryRequest {
     body: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    visibility: MemoryVisibility,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1690,6 +3598,12 @@ struct UpdateMemoryRequest {
     tags: Option<Vec<String>>,
     #[serde(default)]
     clear_tags: bool,
+    #[serde(default)]
+    visibility: Option<MemoryVisibility>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    clear_scope: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1784,11 +3698,39 @@ struct LaunchdServiceRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SystemdServiceRequest {
+    #[serde(default = "default_systemd_unit_name")]
+    unit_name: String,
+    #[serde(default)]
+    bin_path: Option<PathBuf>,
+    #[serde(default = "default_interval_ms")]
+    interval_ms: u64,
+    #[serde(default = "default_parallel")]
+    limit: usize,
+    #[serde(default)]
+    execute: bool,
+    #[serde(default)]
+    recover_stale_seconds: Option<i64>,
+    #[serde(default)]
+    unit_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UninstallLaunchdServiceRequest {
     #[serde(default = "default_launchd_label")]
     label: String,
     #[serde(default)]
     plist_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UninstallSystemdServiceRequest {
+    #[serde(default = "default_systemd_unit_name")]
+    unit_name: String,
+    #[serde(default)]
+    unit_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -1802,6 +3744,15 @@ struct LaunchdServiceControlRequest {
     domain: Option<String>,
     #[serde(default = "default_launchctl_path")]
     launchctl_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemdServiceControlRequest {
+    #[serde(default = "default_systemd_unit_name")]
+    unit_name: String,
+    #[serde(default = "default_systemctl_path")]
+    systemctl_path: PathBuf,
 }
 
 #[derive(Default, Deserialize)]
@@ -1870,6 +3821,21 @@ struct MigrateStateRequest {
     dry_run: bool,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateSqliteRequest {
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    init_only: bool,
+    #[serde(default)]
+    restore: bool,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoverTasksRequest {
@@ -1920,6 +3886,29 @@ impl Default for UninstallLaunchdServiceRequest {
     }
 }
 
+impl Default for SystemdServiceRequest {
+    fn default() -> Self {
+        Self {
+            unit_name: default_systemd_unit_name(),
+            bin_path: None,
+            interval_ms: default_interval_ms(),
+            limit: default_parallel(),
+            execute: false,
+            recover_stale_seconds: None,
+            unit_path: None,
+        }
+    }
+}
+
+impl Default for UninstallSystemdServiceRequest {
+    fn default() -> Self {
+        Self {
+            unit_name: default_systemd_unit_name(),
+            unit_path: None,
+        }
+    }
+}
+
 impl Default for LaunchdServiceControlRequest {
     fn default() -> Self {
         Self {
@@ -1927,6 +3916,15 @@ impl Default for LaunchdServiceControlRequest {
             plist_path: None,
             domain: None,
             launchctl_path: default_launchctl_path(),
+        }
+    }
+}
+
+impl Default for SystemdServiceControlRequest {
+    fn default() -> Self {
+        Self {
+            unit_name: default_systemd_unit_name(),
+            systemctl_path: default_systemctl_path(),
         }
     }
 }
@@ -2249,6 +4247,12 @@ fn create_task_response(store: &Store, body: &[u8]) -> Result<(&'static str, Str
     ) {
         return Ok(response);
     }
+    if request.max_attempts == Some(0) {
+        return Ok(invalid_text_response(
+            "max_attempts",
+            "max_attempts must be greater than 0",
+        ));
+    }
     if let Some(tool_id) = &request.tool
         && let Some(response) = reject_invalid_tool_id(tool_id)
     {
@@ -2277,6 +4281,10 @@ fn create_task_response(store: &Store, body: &[u8]) -> Result<(&'static str, Str
             let title = request.title;
             let objective = request.objective.clone().unwrap_or_else(|| title.clone());
             let mut task = Task::new(title, objective, priority, request.required_capabilities);
+            os.ensure_unique_task_id(&mut task);
+            if let Some(max_attempts) = request.max_attempts {
+                task.max_attempts = max_attempts;
+            }
             task.command = request.command;
             task.cwd = request.cwd;
             task.dependencies = match validate_task_dependencies(os, request.dependencies) {
@@ -2348,12 +4356,13 @@ fn create_workflow_response(
     let execute = request.execute;
     let (id, workflow, plan_id, build_id, review_id) = store.update(|os| {
         let objective = request.objective;
-        let plan = Task::new(
+        let mut plan = Task::new(
             format!("Plan: {}", objective),
             format!("Design an implementation plan for: {}", objective),
             priority,
             vec!["plan".into()],
         );
+        os.ensure_unique_task_id(&mut plan);
         let plan_id = plan.id.clone();
 
         let mut build = Task::new(
@@ -2362,6 +4371,7 @@ fn create_workflow_response(
             priority,
             vec!["rust".into(), "code".into()],
         );
+        os.ensure_unique_task_id(&mut build);
         build.dependencies.push(plan_id.clone());
         let build_id = build.id.clone();
 
@@ -2374,13 +4384,14 @@ fn create_workflow_response(
             priority,
             vec!["review".into()],
         );
+        os.ensure_unique_task_id(&mut review);
         review.dependencies.push(build_id.clone());
         let review_id = review.id.clone();
 
         os.create_task(plan);
         os.create_task(build);
         os.create_task(review);
-        let workflow = Workflow::new(
+        let mut workflow = Workflow::new(
             objective,
             priority,
             BTreeMap::from([
@@ -2389,6 +4400,7 @@ fn create_workflow_response(
                 ("review".into(), review_id.clone()),
             ]),
         );
+        os.ensure_unique_workflow_id(&mut workflow);
         let id = workflow.id.clone();
         os.create_workflow(workflow.clone());
         Ok((id, workflow, plan_id, build_id, review_id))
@@ -2415,6 +4427,468 @@ fn create_workflow_response(
         })
         .to_string(),
     ))
+}
+
+fn create_template_workflow_response(
+    store: &Store,
+    template_id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let template_id = match parse_registry_path_id("template id", template_id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json::<CreateWorkflowRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_text_field("objective", &request.objective) {
+        return Ok(response);
+    }
+    let priority = match parse_priority_request(&request.priority) {
+        Ok(priority) => priority,
+        Err(response) => return Ok(response),
+    };
+    let execute = request.execute;
+    let template_workflow = store.update(|os| {
+        let Some(template) = os.workflow_templates.get(&template_id).cloned() else {
+            return Ok(Err((
+                "404 Not Found",
+                json!({ "error": "workflow template not found" }).to_string(),
+            )));
+        };
+        if template.stages.is_empty() {
+            return Ok(Err((
+                "409 Conflict",
+                json!({
+                    "error": "workflow template has no stages",
+                    "template": template.id,
+                })
+                .to_string(),
+            )));
+        }
+        let mut seen_stages = BTreeSet::new();
+        for stage in &template.stages {
+            if let Some(response) = reject_invalid_workflow_stage("stage", stage) {
+                return Ok(Err(response));
+            }
+            if !seen_stages.insert(stage.clone()) {
+                return Ok(Err((
+                    "409 Conflict",
+                    json!({
+                        "error": "workflow template has duplicate stage",
+                        "template": template.id,
+                        "stage": stage,
+                    })
+                    .to_string(),
+                )));
+            }
+        }
+
+        let mut task_map = BTreeMap::new();
+        let mut pending_tasks = BTreeMap::new();
+        for stage in &template.stages {
+            let task_spec = workflow_template_task(&template, stage);
+            let title = task_spec
+                .and_then(|task| task.title.as_ref())
+                .map(|title| render_workflow_template_text(title, &request.objective))
+                .unwrap_or_else(|| format!("{}: {}", stage, request.objective));
+            let objective = task_spec
+                .and_then(|task| task.objective.as_ref())
+                .map(|objective| render_workflow_template_text(objective, &request.objective))
+                .unwrap_or_else(|| {
+                    format!("Run template stage `{stage}` for: {}", request.objective)
+                });
+            let capabilities = task_spec
+                .map(|task| task.capabilities.clone())
+                .unwrap_or_default();
+            let mut task = Task::new(title, objective, priority, capabilities);
+            task.command = task_spec
+                .and_then(|task| task.command.as_ref())
+                .map(|command| render_workflow_template_text(command, &request.objective));
+            os.ensure_unique_task_id(&mut task);
+            let task_id = task.id.clone();
+            task_map.insert(stage.clone(), task_id);
+            pending_tasks.insert(stage.clone(), task);
+        }
+        for edge in workflow_template_edges(&template) {
+            let Some(from_id) = task_map.get(&edge.from).cloned() else {
+                return Ok(Err((
+                    "409 Conflict",
+                    json!({
+                        "error": "workflow template edge references unknown stage",
+                        "template": template.id,
+                        "stage": edge.from,
+                    })
+                    .to_string(),
+                )));
+            };
+            let Some(task) = pending_tasks.get_mut(&edge.to) else {
+                return Ok(Err((
+                    "409 Conflict",
+                    json!({
+                        "error": "workflow template edge references unknown stage",
+                        "template": template.id,
+                        "stage": edge.to,
+                    })
+                    .to_string(),
+                )));
+            };
+            task.dependencies.push(from_id);
+        }
+        for task in pending_tasks.into_values() {
+            os.create_task(task);
+        }
+        let mut workflow = Workflow::new(request.objective, priority, task_map.clone());
+        os.ensure_unique_workflow_id(&mut workflow);
+        let workflow_id = workflow.id.clone();
+        os.create_workflow(workflow);
+        let Some(workflow) = os.workflows.get(&workflow_id).cloned() else {
+            return Ok(Err((
+                "404 Not Found",
+                json!({ "error": "workflow not found after creation" }).to_string(),
+            )));
+        };
+        Ok(Ok((workflow, task_map, template)))
+    })?;
+    let (workflow, tasks, template) = match template_workflow {
+        Ok(workflow) => workflow,
+        Err(response) => return Ok(response),
+    };
+
+    let mut runs = Vec::new();
+    let mut errors = Vec::new();
+    if execute {
+        (runs, errors) = execute_workflow_stages(store, &workflow.id, true)?;
+    }
+    let os = store.load()?;
+    let dag = os
+        .workflows
+        .get(&workflow.id)
+        .map(|workflow| workflow_dag_value(&os, workflow))
+        .unwrap_or(serde_json::Value::Null);
+
+    Ok((
+        "201 Created",
+        json!({
+            "id": workflow.id,
+            "template": template.id,
+            "workflow": workflow,
+            "tasks": tasks,
+            "runs": runs,
+            "errors": errors,
+            "dag": dag,
+        })
+        .to_string(),
+    ))
+}
+
+fn add_workflow_task_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_workflow_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json::<WorkflowAddTaskRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_invalid_workflow_stage("stage", &request.stage) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_text_field("title", &request.title) {
+        return Ok(response);
+    }
+    if let Some(response) =
+        reject_empty_optional_text_field("objective", request.objective.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_optional_text_field("command", request.command.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_capability_values(
+        "required_capabilities",
+        &request.required_capabilities,
+        false,
+    ) {
+        return Ok(response);
+    }
+    for dependency in &request.dependencies {
+        if let Some(response) = reject_invalid_workflow_stage("dependencies", dependency) {
+            return Ok(response);
+        }
+    }
+    let priority = match request.priority.as_deref().map(parse_priority_request) {
+        Some(Ok(priority)) => Some(priority),
+        Some(Err(response)) => return Ok(response),
+        None => None,
+    };
+
+    store.update(|os| {
+        let Some(workflow) = os.workflows.get(&id).cloned() else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        if workflow.tasks.contains_key(&request.stage) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "workflow stage already exists",
+                    "stage": request.stage,
+                })
+                .to_string(),
+            ));
+        }
+        let mut dependencies = Vec::new();
+        for stage in &request.dependencies {
+            let Some(task_id) = workflow.tasks.get(stage).cloned() else {
+                return Ok((
+                    "404 Not Found",
+                    json!({
+                        "error": "workflow stage not found",
+                        "stage": stage,
+                    })
+                    .to_string(),
+                ));
+            };
+            dependencies.push(task_id);
+        }
+
+        let title = request.title;
+        let objective = request.objective.unwrap_or_else(|| title.clone());
+        let mut task = Task::new(
+            title,
+            objective,
+            priority.unwrap_or(workflow.priority),
+            request.required_capabilities,
+        );
+        os.ensure_unique_task_id(&mut task);
+        task.command = request.command;
+        task.dependencies = dependencies;
+        let task_id = task.id.clone();
+        os.create_task(task);
+        let Some(workflow) = os.workflows.get_mut(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        workflow
+            .tasks
+            .insert(request.stage.clone(), task_id.clone());
+        workflow.updated_at = chrono::Utc::now();
+        os.record(
+            EventKind::WorkflowUpdated,
+            format!(
+                "added workflow {} stage {} as task {}",
+                id, request.stage, task_id
+            ),
+        );
+        let Some(task) = os.tasks.get(&task_id).cloned() else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "task not found after creation" }).to_string(),
+            ));
+        };
+        let Some(progress) = os.workflow_progress(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "stage": request.stage,
+                "task_id": task_id,
+                "task": task,
+                "progress": progress,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn edit_workflow_edge_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+    add: bool,
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_workflow_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json::<WorkflowEdgeRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_invalid_workflow_stage("from", &request.from) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_workflow_stage("to", &request.to) {
+        return Ok(response);
+    }
+    if request.from == request.to {
+        return Ok((
+            "400 Bad Request",
+            json!({ "error": "workflow stage cannot depend on itself" }).to_string(),
+        ));
+    }
+
+    store.update(|os| {
+        let (from_task, to_task) =
+            match workflow_stage_task_pair_response(os, &id, &request.from, &request.to) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    return Ok((
+                        "404 Not Found",
+                        json!({ "error": "workflow not found" }).to_string(),
+                    ));
+                }
+                Err(response) => return Ok(response),
+            };
+        let Some(to) = os.tasks.get(&to_task) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow task not found", "task": to_task }).to_string(),
+            ));
+        };
+        let mut dependencies = to.dependencies.clone();
+        if add {
+            if !dependencies
+                .iter()
+                .any(|dependency| dependency == &from_task)
+            {
+                dependencies.push(from_task);
+            }
+        } else {
+            dependencies.retain(|dependency| dependency != &from_task);
+        }
+        if let Err(error) = Runtime::set_task_dependencies(os, &to_task, dependencies) {
+            return Ok(runtime_error_response(error));
+        }
+        let Some(workflow) = os.workflows.get_mut(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        workflow.updated_at = chrono::Utc::now();
+        os.record(
+            EventKind::WorkflowUpdated,
+            format!(
+                "{} dependency {} -> {} in workflow {}",
+                if add { "linked" } else { "unlinked" },
+                request.from,
+                request.to,
+                id
+            ),
+        );
+        let Some(progress) = os.workflow_progress(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        Ok((
+            "200 OK",
+            json!({
+                "id": id,
+                "from": request.from,
+                "to": request.to,
+                "linked": add,
+                "progress": progress,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn transition_workflow_response<F, T>(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+    action: &'static str,
+    should_transition: F,
+    transition: T,
+) -> Result<(&'static str, String), StoreError>
+where
+    F: Fn(&TaskStatus) -> bool,
+    T: Fn(&mut OperatingSystem, &TaskId, Option<String>) -> Result<(), RuntimeError>,
+{
+    let id = match parse_workflow_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json_or_default::<WorkflowNoteRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_optional_text_field("note", request.note.as_deref()) {
+        return Ok(response);
+    }
+
+    store.update(|os| {
+        let Some(workflow) = os.workflows.get(&id).cloned() else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        let mut affected = Vec::new();
+        for task_id in workflow.tasks.values() {
+            let Some(task) = os.tasks.get(task_id) else {
+                return Ok((
+                    "404 Not Found",
+                    json!({ "error": "workflow task not found", "task": task_id }).to_string(),
+                ));
+            };
+            if should_transition(&task.status) {
+                if let Err(error) = transition(os, task_id, request.note.clone()) {
+                    return Ok(runtime_error_response(error));
+                }
+                affected.push(task_id.clone());
+            }
+        }
+        if !affected.is_empty() {
+            let Some(workflow) = os.workflows.get_mut(&id) else {
+                return Ok((
+                    "404 Not Found",
+                    json!({ "error": "workflow not found" }).to_string(),
+                ));
+            };
+            workflow.updated_at = chrono::Utc::now();
+            os.record(
+                EventKind::WorkflowUpdated,
+                format!("{action} {} workflow task(s) for {}", affected.len(), id),
+            );
+        }
+        let Some(progress) = os.workflow_progress(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "workflow not found" }).to_string(),
+            ));
+        };
+        Ok((
+            "200 OK",
+            json!({
+                "id": id,
+                "action": action,
+                "affected_tasks": affected,
+                "progress": progress,
+            })
+            .to_string(),
+        ))
+    })
 }
 
 fn execute_next_workflow_stage(
@@ -2533,6 +5007,7 @@ fn update_task_response(
         && !request.clear_cwd
         && request.required_capabilities.is_none()
         && !request.clear_required_capabilities
+        && request.max_attempts.is_none()
     {
         return Ok((
             "400 Bad Request",
@@ -2643,6 +5118,12 @@ fn update_task_response(
     {
         return Ok(response);
     }
+    if request.max_attempts == Some(0) {
+        return Ok(invalid_text_response(
+            "max_attempts",
+            "max_attempts must be greater than 0",
+        ));
+    }
     store.update(|os| {
         let tool_update = if request.clear_tool {
             Some(None)
@@ -2737,6 +5218,7 @@ fn update_task_response(
             } else {
                 request.required_capabilities
             },
+            max_attempts: request.max_attempts,
         };
         Ok(match Runtime::update_task(os, &id, update) {
             Ok(task) => (
@@ -2797,7 +5279,8 @@ fn runtime_error_response(error: RuntimeError) -> (&'static str, String) {
         RuntimeError::TaskNotFound(_)
         | RuntimeError::AgentNotFound(_)
         | RuntimeError::ToolNotFound(_)
-        | RuntimeError::WorkflowNotFound(_) => "404 Not Found",
+        | RuntimeError::WorkflowNotFound(_)
+        | RuntimeError::WorkerNotFound(_) => "404 Not Found",
         RuntimeError::DuplicateTaskDependency(_)
         | RuntimeError::SelfDependency(_)
         | RuntimeError::TaskDependencyNotFound(_)
@@ -2811,6 +5294,7 @@ fn runtime_error_response(error: RuntimeError) -> (&'static str, String) {
         | RuntimeError::TaskNotEditable { .. }
         | RuntimeError::TaskReferenced { .. }
         | RuntimeError::ToolIncompatible { .. }
+        | RuntimeError::WorkerReportRejected { .. }
         | RuntimeError::InvalidTransition { .. } => "409 Conflict",
     };
     (status, json!({ "error": error.to_string() }).to_string())
@@ -2985,8 +5469,8 @@ fn recover_tasks_response(
         ));
     }
 
-    let recovered = store.update(|os| {
-        Ok::<_, StoreError>(Runtime::recover_stale_tasks(
+    let recovery = store.update(|os| {
+        Ok::<_, StoreError>(Runtime::recover_stale_state(
             os,
             chrono::Duration::seconds(request.older_than_seconds),
         ))
@@ -2995,7 +5479,10 @@ fn recover_tasks_response(
         "200 OK",
         json!({
             "older_than_seconds": request.older_than_seconds,
-            "recovered": recovered,
+            "recovered": recovery.recovered_tasks,
+            "recovered_runs": recovery.recovered_runs,
+            "recovered_daemon": recovery.recovered_daemon,
+            "notes": recovery.notes,
         })
         .to_string(),
     ))
@@ -3261,6 +5748,983 @@ fn cancel_workflow_response(
     })
 }
 
+fn resolve_approval_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+    approved: bool,
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_approval_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json_or_default::<ApprovalResolveRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_optional_text_field("by", request.by.as_deref()) {
+        return Ok(response);
+    }
+
+    store.update(|os| {
+        Ok(match os.resolve_approval(&id, approved, request.by) {
+            Some(approval) => (
+                "200 OK",
+                json!({
+                    "id": id,
+                    "approval": approval,
+                })
+                .to_string(),
+            ),
+            None => (
+                "404 Not Found",
+                json!({ "error": "approval not found" }).to_string(),
+            ),
+        })
+    })
+}
+
+fn register_worker_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<WorkerRegisterRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_invalid_worker_id(&request.id) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_text_field("endpoint", &request.endpoint) {
+        return Ok(response);
+    }
+    let status = match parse_agent_status_request(&request.status) {
+        Ok(status) => status,
+        Err(response) => return Ok(response),
+    };
+
+    store.update(|os| {
+        if os.workers.contains_key(&request.id) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "worker already exists",
+                    "id": request.id,
+                })
+                .to_string(),
+            ));
+        }
+        let worker = WorkerNode {
+            id: request.id,
+            endpoint: request.endpoint,
+            status,
+            last_seen_at: chrono::Utc::now(),
+        };
+        let id = worker.id.clone();
+        os.register_worker(worker.clone());
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "worker": worker,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn heartbeat_worker_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_worker_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json_or_default::<WorkerHeartbeatRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) =
+        reject_empty_optional_text_field("endpoint", request.endpoint.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_non_positive_lease(request.lease_seconds) {
+        return Ok(response);
+    }
+    let status = match request.status.as_deref().map(parse_agent_status_request) {
+        Some(Ok(status)) => Some(status),
+        Some(Err(response)) => return Ok(response),
+        None => None,
+    };
+
+    store.update(|os| {
+        Ok(
+            match Runtime::heartbeat_worker(
+                os,
+                &id,
+                request.endpoint,
+                status,
+                request.lease_seconds,
+            ) {
+                Ok(worker) => (
+                    "200 OK",
+                    json!({
+                        "id": id,
+                        "worker": worker,
+                    })
+                    .to_string(),
+                ),
+                Err(error) => runtime_error_response(error),
+            },
+        )
+    })
+}
+
+fn claim_worker_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_worker_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json_or_default::<ClaimTaskRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_non_positive_lease(request.lease_seconds) {
+        return Ok(response);
+    }
+    store.update(|os| {
+        let agent_id = AgentId::new(&id);
+        if !os.workers.contains_key(&id) {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "worker not found" }).to_string(),
+            ));
+        }
+        if !os.agents.contains_key(&agent_id) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "matching agent not found for worker",
+                    "agent_id": agent_id,
+                    "worker_id": id,
+                })
+                .to_string(),
+            ));
+        }
+        {
+            let Some(worker) = os.workers.get_mut(&id) else {
+                return Ok((
+                    "404 Not Found",
+                    json!({ "error": "worker not found" }).to_string(),
+                ));
+            };
+            worker.status = AgentStatus::Online;
+            worker.last_seen_at = chrono::Utc::now();
+        }
+        let lease_seconds = request.lease_seconds.or_else(|| {
+            os.agents
+                .get(&agent_id)
+                .and_then(|agent| agent.lease_expires_at)
+                .and_then(|expires_at| {
+                    let remaining = (expires_at - chrono::Utc::now()).num_seconds();
+                    (remaining > 0).then_some(remaining)
+                })
+        });
+        let response =
+            match Runtime::heartbeat_agent(os, &agent_id, AgentStatus::Online, lease_seconds) {
+                Ok(()) => {
+                    let assignment = Scheduler::assign_next_for_agent(os, &agent_id);
+                    let task = assignment
+                        .as_ref()
+                        .and_then(|assignment| os.tasks.get(&assignment.task_id))
+                        .cloned();
+                    let worker = os.workers.get(&id).cloned();
+                    os.record(
+                        EventKind::WorkerUpdated,
+                        format!("worker {id} claimed task via agent {agent_id}"),
+                    );
+                    (
+                        "200 OK",
+                        json!({
+                            "id": id,
+                            "worker": worker,
+                            "claimed": assignment.is_some(),
+                            "assignment": assignment,
+                            "task": task,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(error) => runtime_error_response(error),
+            };
+        Ok(response)
+    })
+}
+
+fn report_worker_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_worker_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json::<WorkerReportRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let task_id = match parse_task_path_id(&request.task_id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let status = match parse_worker_report_status_request(&request.status) {
+        Ok(status) => status,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_optional_text_field("note", request.note.as_deref()) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_optional_text_field("command", request.command.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_optional_text_field("cwd", request.cwd.as_deref()) {
+        return Ok(response);
+    }
+    let mut artifacts = Vec::new();
+    for artifact in request.artifacts {
+        let kind = match parse_run_artifact_kind_request(&artifact.kind) {
+            Ok(kind) => kind,
+            Err(response) => return Ok(response),
+        };
+        if let Some(response) = reject_empty_text_field("artifact path", &artifact.path) {
+            return Ok(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "artifact content_type",
+            artifact.content_type.as_deref(),
+        ) {
+            return Ok(response);
+        }
+        let mut artifact_record = RunArtifact::new(kind, artifact.path);
+        artifact_record.bytes = artifact.bytes;
+        artifact_record.content_type = artifact.content_type;
+        artifacts.push(artifact_record);
+    }
+
+    store.update(|os| {
+        Ok(
+            match Runtime::report_worker_task(
+                os,
+                &id,
+                &task_id,
+                status,
+                request.note,
+                request.command,
+                request.cwd,
+                request.exit_code,
+                artifacts,
+            ) {
+                Ok((worker, task, run)) => (
+                    "200 OK",
+                    json!({
+                        "id": id,
+                        "worker": worker,
+                        "task": task,
+                        "run": run,
+                        "reported": true,
+                    })
+                    .to_string(),
+                ),
+                Err(error) => runtime_error_response(error),
+            },
+        )
+    })
+}
+
+fn delete_worker_response(store: &Store, id: &str) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_worker_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    store.update(|os| {
+        Ok(match os.workers.remove(&id) {
+            Some(worker) => {
+                os.record(EventKind::WorkerRemoved, format!("removed worker {id}"));
+                (
+                    "200 OK",
+                    json!({
+                        "id": id,
+                        "removed": true,
+                        "worker": worker,
+                    })
+                    .to_string(),
+                )
+            }
+            None => (
+                "404 Not Found",
+                json!({ "error": "worker not found" }).to_string(),
+            ),
+        })
+    })
+}
+
+fn record_eval_response(store: &Store, body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<EvalRecordRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_text_field("target", &request.target) {
+        return Ok(response);
+    }
+    store.update(|os| {
+        let record = os.record_eval(
+            EvalRecord {
+                id: os.next_eval_id(),
+                target: request.target,
+                success: request.success,
+                cost_micros: request.cost_micros,
+                latency_ms: request.latency_ms,
+                run: None,
+                recorded_at: chrono::Utc::now(),
+            },
+            "recorded",
+        );
+        Ok((
+            "201 Created",
+            json!({
+                "id": record.id,
+                "eval": record,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn import_marketplace_manifest_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<MarketplaceImportRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let mut manifest = request.manifest;
+    if let Some(response) = reject_empty_optional_text_field("source", request.source.as_deref()) {
+        return Ok(response);
+    }
+    if let Some(response) =
+        reject_empty_optional_text_field("expect_checksum", request.expect_checksum.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_marketplace_manifest(&mut manifest) {
+        return Ok(response);
+    }
+    let manifest_bytes = match serde_json::to_vec(&manifest) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok((
+                "500 Internal Server Error",
+                json!({
+                    "error": "marketplace manifest serialization failed",
+                    "detail": error.to_string(),
+                })
+                .to_string(),
+            ));
+        }
+    };
+    let checksum = fnv1a64_checksum(&manifest_bytes);
+    if let Some(expected) = &request.expect_checksum
+        && expected != &checksum
+    {
+        return Ok((
+            "409 Conflict",
+            json!({
+                "error": "marketplace checksum mismatch",
+                "expected": expected,
+                "checksum": checksum,
+            })
+            .to_string(),
+        ));
+    }
+    let source = request.source.unwrap_or_else(|| "api".into());
+    let manifest_id = manifest
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.clone());
+    let manifest_version = manifest
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.version.clone());
+    let imported_agent_profiles = manifest.agent_profiles.len();
+    let imported_workflow_templates = manifest.workflow_templates.len();
+    let imported_mcp_servers = manifest.mcp_servers.len();
+    let force = request.force;
+    let verified_checksum = request.expect_checksum.is_some();
+    store.update(|os| {
+        if !force {
+            for profile in &manifest.agent_profiles {
+                if os.agent_profiles.contains_key(&profile.id) {
+                    return Ok((
+                        "409 Conflict",
+                        json!({
+                            "error": "agent profile already exists",
+                            "id": profile.id,
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+            for template in &manifest.workflow_templates {
+                if os.workflow_templates.contains_key(&template.id) {
+                    return Ok((
+                        "409 Conflict",
+                        json!({
+                            "error": "workflow template already exists",
+                            "id": template.id,
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+            for server in &manifest.mcp_servers {
+                if os.mcp_servers.contains_key(&server.id) {
+                    return Ok((
+                        "409 Conflict",
+                        json!({
+                            "error": "mcp server already exists",
+                            "id": server.id,
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let mut overwritten = 0usize;
+        for profile in manifest.agent_profiles {
+            if os
+                .agent_profiles
+                .insert(profile.id.clone(), profile)
+                .is_some()
+            {
+                overwritten += 1;
+            }
+        }
+        for template in manifest.workflow_templates {
+            if os
+                .workflow_templates
+                .insert(template.id.clone(), template)
+                .is_some()
+            {
+                overwritten += 1;
+            }
+        }
+        for server in manifest.mcp_servers {
+            if os.mcp_servers.insert(server.id.clone(), server).is_some() {
+                overwritten += 1;
+            }
+        }
+        os.record(
+            EventKind::MarketplaceImported,
+            format!(
+                "imported marketplace {} profiles, {} templates, {} mcp servers from {} ({})",
+                imported_agent_profiles,
+                imported_workflow_templates,
+                imported_mcp_servers,
+                source,
+                checksum
+            ),
+        );
+        Ok((
+            "201 Created",
+            json!({
+                "source": source,
+                "checksum": checksum,
+                "verified_checksum": verified_checksum,
+                "manifest_id": manifest_id,
+                "manifest_version": manifest_version,
+                "imported_agent_profiles": imported_agent_profiles,
+                "imported_workflow_templates": imported_workflow_templates,
+                "imported_mcp_servers": imported_mcp_servers,
+                "overwritten": overwritten,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn install_agent_profile_response(
+    store: &Store,
+    profile_id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let profile_id = match parse_registry_path_id("profile id", profile_id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json_or_default::<InstallAgentProfileRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(name) = &request.name
+        && let Some(response) = reject_invalid_agent_name(name)
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_optional_text_field("model", request.model.as_deref()) {
+        return Ok(response);
+    }
+    if request.parallel == 0 {
+        return Ok((
+            "400 Bad Request",
+            json!({
+                "error": "parallel must be greater than 0",
+                "parallel": request.parallel,
+            })
+            .to_string(),
+        ));
+    }
+    store.update(|os| {
+        let Some(profile) = os.agent_profiles.get(&profile_id).cloned() else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "agent profile not found" }).to_string(),
+            ));
+        };
+        let agent = Agent::new(
+            request.name.unwrap_or(profile.name),
+            profile.kind,
+            request.model.or(profile.model),
+            profile.capabilities,
+            request.parallel,
+        );
+        let id = agent.id.clone();
+        if os.agents.contains_key(&id) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "agent already exists",
+                    "id": id,
+                })
+                .to_string(),
+            ));
+        }
+        os.register_agent(agent);
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "profile": profile_id,
+                "agent": os.agents.get(&id),
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn register_mcp_server_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<RegisterMcpServerRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let id = match parse_registry_path_id("mcp server id", &request.id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_text_field("command", &request.command) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_mcp_args(&request.args) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_invalid_mcp_env(&request.env) {
+        return Ok(response);
+    }
+
+    store.update(|os| {
+        if os.mcp_servers.contains_key(&id) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "mcp server already exists",
+                    "id": id,
+                })
+                .to_string(),
+            ));
+        }
+        let server = McpServer {
+            id: id.clone(),
+            command: request.command,
+            args: request.args,
+            env: request.env,
+            enabled: request.enabled,
+        };
+        os.register_mcp_server(server.clone());
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "mcp_server": server,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn update_mcp_server_response(
+    store: &Store,
+    id: &str,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_registry_path_id("mcp server id", id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let request = match parse_json::<UpdateMcpServerRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(command) = &request.command
+        && let Some(response) = reject_empty_text_field("command", command)
+    {
+        return Ok(response);
+    }
+    if let Some(args) = &request.args
+        && let Some(response) = reject_invalid_mcp_args(args)
+    {
+        return Ok(response);
+    }
+    if let Some(env) = &request.env
+        && let Some(response) = reject_invalid_mcp_env(env)
+    {
+        return Ok(response);
+    }
+
+    store.update(|os| {
+        let Some(server) = os.mcp_servers.get_mut(&id) else {
+            return Ok((
+                "404 Not Found",
+                json!({ "error": "mcp server not found" }).to_string(),
+            ));
+        };
+        if let Some(command) = request.command {
+            server.command = command;
+        }
+        if let Some(args) = request.args {
+            server.args = args;
+        }
+        if let Some(env) = request.env {
+            server.env = env;
+        }
+        if let Some(enabled) = request.enabled {
+            server.enabled = enabled;
+        }
+        let server = server.clone();
+        os.record(
+            EventKind::McpServerUpdated,
+            format!("updated mcp server {id}"),
+        );
+        Ok((
+            "200 OK",
+            json!({
+                "id": id,
+                "mcp_server": server,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn delete_mcp_server_response(
+    store: &Store,
+    id: &str,
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_registry_path_id("mcp server id", id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    store.update(|os| {
+        Ok(match os.mcp_servers.remove(&id) {
+            Some(server) => {
+                os.record(
+                    EventKind::McpServerRemoved,
+                    format!("removed mcp server {id}"),
+                );
+                (
+                    "200 OK",
+                    json!({
+                        "id": id,
+                        "removed": true,
+                        "mcp_server": server,
+                    })
+                    .to_string(),
+                )
+            }
+            None => (
+                "404 Not Found",
+                json!({ "error": "mcp server not found" }).to_string(),
+            ),
+        })
+    })
+}
+
+fn register_secrets_backend_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<SecretsRegisterRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_invalid_secrets_backend_id(&request.id) {
+        return Ok(response);
+    }
+    let kind = match parse_secrets_backend_kind_request(&request.kind) {
+        Ok(kind) => kind,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) =
+        reject_empty_optional_text_field("reference", request.reference.as_deref())
+    {
+        return Ok(response);
+    }
+
+    store.update(|os| {
+        if os.secrets_backends.contains_key(&request.id) {
+            return Ok((
+                "409 Conflict",
+                json!({
+                    "error": "secrets backend already exists",
+                    "id": request.id,
+                })
+                .to_string(),
+            ));
+        }
+        let backend = SecretsBackend {
+            id: request.id,
+            kind,
+            reference: request.reference,
+        };
+        let id = backend.id.clone();
+        os.register_secrets_backend(backend.clone());
+        Ok((
+            "201 Created",
+            json!({
+                "id": id,
+                "secrets_backend": backend,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn delete_secrets_backend_response(
+    store: &Store,
+    id: &str,
+) -> Result<(&'static str, String), StoreError> {
+    let id = match parse_secrets_backend_path_id(id) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    store.update(|os| {
+        Ok(match os.secrets_backends.remove(&id) {
+            Some(backend) => {
+                os.record(
+                    EventKind::SecretsBackendRemoved,
+                    format!("removed secrets backend {id}"),
+                );
+                (
+                    "200 OK",
+                    json!({
+                        "id": id,
+                        "removed": true,
+                        "secrets_backend": backend,
+                    })
+                    .to_string(),
+                )
+            }
+            None => (
+                "404 Not Found",
+                json!({ "error": "secrets backend not found" }).to_string(),
+            ),
+        })
+    })
+}
+
+fn run_eval_response(store: &Store, body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json::<EvalRunRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = reject_empty_text_field("target", &request.target) {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_text_field("command", &request.command) {
+        return Ok(response);
+    }
+    if let Some(response) =
+        reject_empty_optional_text_field("success_pattern", request.success_pattern.as_deref())
+    {
+        return Ok(response);
+    }
+    if let Some(response) = reject_empty_optional_text_field("cwd", request.cwd.as_deref()) {
+        return Ok(response);
+    }
+
+    let os = store.load()?;
+    if let Err(error) = check_shell_command(&os.policy, &request.command) {
+        return Ok((
+            "409 Conflict",
+            json!({ "error": error.to_string() }).to_string(),
+        ));
+    }
+    let cwd = request
+        .cwd
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+    if let Err(error) = check_workspace(&os.policy, &cwd) {
+        return Ok((
+            "409 Conflict",
+            json!({ "error": error.to_string() }).to_string(),
+        ));
+    }
+    if let Err(error) = check_shell_writes(&os.policy, &request.command, &cwd) {
+        return Ok((
+            "409 Conflict",
+            json!({ "error": error.to_string() }).to_string(),
+        ));
+    }
+    let env = eval_environment(&os.policy);
+    let started = std::time::Instant::now();
+    let output = match run_shell_capture(
+        &request.command,
+        &cwd,
+        &env,
+        std::time::Duration::from_secs(os.policy.command_timeout_seconds),
+        os.policy.sandbox.process_isolation,
+        os.policy.max_output_bytes,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok((
+                "400 Bad Request",
+                json!({
+                    "error": format!("could not run eval command: {error}"),
+                })
+                .to_string(),
+            ));
+        }
+    };
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let success_pattern_matched = request
+        .success_pattern
+        .as_ref()
+        .map(|pattern| combined.contains(pattern))
+        .unwrap_or(true);
+    let (output_schema_valid, output_schema_error) =
+        eval_output_schema_report(&stdout, request.output_schema.as_ref());
+    let success = !output.timed_out
+        && output.status_code == Some(0)
+        && success_pattern_matched
+        && output_schema_valid;
+    let status_code = output.status_code;
+    let run_details = EvalRunDetails {
+        command: request.command.clone(),
+        cwd: cwd.display().to_string(),
+        status: status_code,
+        stdout: tail_text_by_bytes(&stdout, Some(os.policy.max_output_bytes)),
+        stderr: tail_text_by_bytes(&stderr, Some(os.policy.max_output_bytes)),
+        success_pattern: request.success_pattern.clone(),
+        success_pattern_matched,
+        output_schema: request.output_schema.clone(),
+        output_schema_valid,
+        output_schema_error,
+        timed_out: output.timed_out,
+    };
+    store.update(|os| {
+        let record = os.record_eval(
+            EvalRecord {
+                id: os.next_eval_id(),
+                target: request.target,
+                success,
+                cost_micros: None,
+                latency_ms: Some(latency_ms),
+                run: Some(run_details.clone()),
+                recorded_at: chrono::Utc::now(),
+            },
+            "ran",
+        );
+        Ok((
+            "201 Created",
+            json!({
+                "id": record.id,
+                "eval": record,
+                "command": run_details.command,
+                "cwd": run_details.cwd,
+                "status": run_details.status,
+                "stdout": run_details.stdout,
+                "stderr": run_details.stderr,
+                "success_pattern_matched": run_details.success_pattern_matched,
+                "output_schema_valid": run_details.output_schema_valid,
+                "output_schema_error": run_details.output_schema_error,
+                "timed_out": run_details.timed_out,
+            })
+            .to_string(),
+        ))
+    })
+}
+
+fn eval_output_schema_report(stdout: &str, schema: Option<&Value>) -> (bool, Option<String>) {
+    let Some(schema) = schema else {
+        return (true, None);
+    };
+    let output = match serde_json::from_str::<Value>(stdout) {
+        Ok(output) => output,
+        Err(error) => {
+            return (
+                false,
+                Some(format!(
+                    "output_schema requires stdout to be a JSON value: {error}"
+                )),
+            );
+        }
+    };
+    match validate_json_schema(&output, schema, "output", "output_schema") {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+fn eval_environment(policy: &crate::models::Policy) -> Vec<(String, String)> {
+    let mut env = std::env::vars()
+        .filter(|(key, _)| {
+            policy.inherit_environment
+                || policy.allowed_env_vars.iter().any(|allowed| allowed == key)
+        })
+        .collect::<Vec<_>>();
+    env.sort_by(|left, right| left.0.cmp(&right.0));
+    env
+}
+
 fn delete_tool_response(store: &Store, id: &str) -> Result<(&'static str, String), StoreError> {
     let id = match parse_tool_path_id(id) {
         Ok(id) => id,
@@ -3375,6 +6839,85 @@ fn backup_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, St
     ))
 }
 
+fn sqlite_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<StateSqliteRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if request.init_only && request.restore {
+        return Ok((
+            "400 Bad Request",
+            json!({ "error": "init_only cannot be combined with restore" }).to_string(),
+        ));
+    }
+    let output = match request.output {
+        Some(output) if output.trim().is_empty() => {
+            return Ok(invalid_text_response("output", "output must not be empty"));
+        }
+        Some(output) => std::path::PathBuf::from(output),
+        None => store.path().with_extension("sqlite"),
+    };
+    let sqlite = SqliteStore::new(&output);
+    if request.restore {
+        let restore = sqlite
+            .restore_json_store(store, request.force, request.dry_run)
+            .map_err(sqlite_state_error)?;
+        return Ok((
+            "200 OK",
+            json!({
+                "path": sqlite.path(),
+                "state_path": store.path(),
+                "initialized": true,
+                "imported": false,
+                "dry_run": request.dry_run,
+                "force": request.force,
+                "import": null,
+                "restore": restore,
+            })
+            .to_string(),
+        ));
+    }
+
+    let import = if request.init_only {
+        sqlite.init().map_err(sqlite_state_error)?;
+        None
+    } else {
+        Some(
+            sqlite
+                .import_json_store(store)
+                .map_err(sqlite_state_error)?,
+        )
+    };
+    Ok((
+        "200 OK",
+        json!({
+            "path": sqlite.path(),
+            "state_path": store.path(),
+            "initialized": true,
+            "imported": !request.init_only,
+            "dry_run": false,
+            "force": false,
+            "import": import,
+            "restore": null,
+        })
+        .to_string(),
+    ))
+}
+
+fn sqlite_state_error(error: SqliteStoreError) -> StoreError {
+    match error {
+        SqliteStoreError::Store(error) => error,
+        SqliteStoreError::Sqlite { path, source } => StoreError::Backend {
+            path,
+            message: source.to_string(),
+        },
+        SqliteStoreError::Json { path, source } => StoreError::Backend {
+            path,
+            message: format!("invalid sqlite state payload: {source}"),
+        },
+    }
+}
+
 fn export_state_response(store: &Store, body: &[u8]) -> Result<(&'static str, String), StoreError> {
     let request = match parse_json::<ExportStateRequest>(body) {
         Ok(request) => request,
@@ -3450,6 +6993,7 @@ fn migrate_state_response(
         Some(output) => std::path::PathBuf::from(output),
         None => store.path().to_path_buf(),
     };
+    let output_preexisting = output.exists();
     let (migration, validation) = if request.dry_run {
         store.preview_migrate_path(&input)?
     } else {
@@ -3461,6 +7005,7 @@ fn migrate_state_response(
             "dry_run": request.dry_run,
             "input": input,
             "output": output,
+            "output_preexisting": output_preexisting,
             "migration": migration,
             "validation": validation,
         })
@@ -3480,14 +7025,13 @@ fn run_once_response(store: &Store, body: &[u8]) -> Result<(&'static str, String
         let mut os = store.load()?;
         let mut report = crate::RuntimeReport::default();
         if let Some(seconds) = request.recover_stale_seconds {
-            report.recovered_tasks =
-                Runtime::recover_stale_tasks(&mut os, chrono::Duration::seconds(seconds));
+            report.absorb_recovery(Runtime::recover_stale_state(
+                &mut os,
+                chrono::Duration::seconds(seconds),
+            ));
         }
         let tick_report = Runtime::tick(&mut os, request.limit);
-        report.assignments = tick_report.assignments;
-        report.completed_tasks = tick_report.completed_tasks;
-        report.expired_agents = tick_report.expired_agents;
-        report.notes.extend(tick_report.notes);
+        report.absorb_tick(tick_report);
         return Ok((
             "200 OK",
             json!({
@@ -3502,14 +7046,13 @@ fn run_once_response(store: &Store, body: &[u8]) -> Result<(&'static str, String
     let (mut os, report) = store.update(|os| {
         let mut report = crate::RuntimeReport::default();
         if let Some(seconds) = request.recover_stale_seconds {
-            report.recovered_tasks =
-                Runtime::recover_stale_tasks(os, chrono::Duration::seconds(seconds));
+            report.absorb_recovery(Runtime::recover_stale_state(
+                os,
+                chrono::Duration::seconds(seconds),
+            ));
         }
         let tick_report = Runtime::tick(os, request.limit);
-        report.assignments = tick_report.assignments;
-        report.completed_tasks = tick_report.completed_tasks;
-        report.expired_agents = tick_report.expired_agents;
-        report.notes.extend(tick_report.notes);
+        report.absorb_tick(tick_report);
         Ok::<_, StoreError>((os.clone(), report))
     })?;
     let assignments = report.assignments.clone();
@@ -3574,6 +7117,30 @@ fn render_launchd_service_response(
     }
 }
 
+fn render_systemd_service_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<SystemdServiceRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let options = systemd_options_from_request(request);
+    match build_systemd_service_definition(store.path(), options) {
+        Ok((service, unit_path)) => Ok((
+            "200 OK",
+            json!({
+                "platform": "systemd",
+                "service": service,
+                "unit": service.render_unit(),
+                "unit_path": unit_path,
+            })
+            .to_string(),
+        )),
+        Err(error) => Ok(service_error_response(error)),
+    }
+}
+
 fn install_launchd_service_response(
     store: &Store,
     body: &[u8],
@@ -3608,6 +7175,33 @@ fn install_launchd_service_response(
     ))
 }
 
+fn install_systemd_service_response(
+    store: &Store,
+    body: &[u8],
+) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<SystemdServiceRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let installation = match install_systemd_service_definition(
+        store.path(),
+        systemd_options_from_request(request),
+    ) {
+        Ok(installation) => installation,
+        Err(error) => return Ok(service_error_response(error)),
+    };
+    Ok((
+        "200 OK",
+        json!({
+            "platform": "systemd",
+            "installed": installation.installed,
+            "unit_path": installation.unit_path,
+            "service": installation.service,
+        })
+        .to_string(),
+    ))
+}
+
 fn uninstall_launchd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
     let request = match parse_json_or_default::<UninstallLaunchdServiceRequest>(body) {
         Ok(request) => request,
@@ -3623,6 +7217,26 @@ fn uninstall_launchd_service_response(body: &[u8]) -> Result<(&'static str, Stri
             "platform": "launchd",
             "removed": removal.removed,
             "plist_path": removal.plist_path,
+        })
+        .to_string(),
+    ))
+}
+
+fn uninstall_systemd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<UninstallSystemdServiceRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let removal = match uninstall_systemd_service(&request.unit_name, request.unit_path) {
+        Ok(removal) => removal,
+        Err(error) => return Ok(service_error_response(error)),
+    };
+    Ok((
+        "200 OK",
+        json!({
+            "platform": "systemd",
+            "removed": removal.removed,
+            "unit_path": removal.unit_path,
         })
         .to_string(),
     ))
@@ -3681,6 +7295,31 @@ fn start_launchd_service_response(body: &[u8]) -> Result<(&'static str, String),
     ))
 }
 
+fn start_systemd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_systemd_control_request(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let unit_name = request.unit_name.clone();
+    let output = match run_systemctl(&request.systemctl_path, &["--user", "start", &unit_name]) {
+        Ok(output) => output,
+        Err(error) => return Ok(service_error_response(error)),
+    };
+    if !output.success {
+        return Ok(systemctl_failure_response("start", &unit_name, &output));
+    }
+    Ok((
+        "200 OK",
+        json!({
+            "platform": "systemd",
+            "started": true,
+            "unit_name": unit_name,
+            "systemctl": output,
+        })
+        .to_string(),
+    ))
+}
+
 fn stop_launchd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
     let request = match parse_launchd_control_request(body) {
         Ok(request) => request,
@@ -3721,6 +7360,31 @@ fn stop_launchd_service_response(body: &[u8]) -> Result<(&'static str, String), 
     ))
 }
 
+fn stop_systemd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_systemd_control_request(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let unit_name = request.unit_name.clone();
+    let output = match run_systemctl(&request.systemctl_path, &["--user", "stop", &unit_name]) {
+        Ok(output) => output,
+        Err(error) => return Ok(service_error_response(error)),
+    };
+    if !output.success {
+        return Ok(systemctl_failure_response("stop", &unit_name, &output));
+    }
+    Ok((
+        "200 OK",
+        json!({
+            "platform": "systemd",
+            "stopped": true,
+            "unit_name": unit_name,
+            "systemctl": output,
+        })
+        .to_string(),
+    ))
+}
+
 fn status_launchd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
     let request = match parse_launchd_control_request(body) {
         Ok(request) => request,
@@ -3749,6 +7413,43 @@ fn status_launchd_service_response(body: &[u8]) -> Result<(&'static str, String)
     ))
 }
 
+fn status_systemd_service_response(body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_systemd_control_request(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    let unit_name = request.unit_name.clone();
+    let output = match run_systemctl(
+        &request.systemctl_path,
+        &["--user", "is-active", &unit_name],
+    ) {
+        Ok(output) => output,
+        Err(error) => return Ok(service_error_response(error)),
+    };
+    Ok((
+        "200 OK",
+        json!({
+            "platform": "systemd",
+            "active": output.success,
+            "unit_name": unit_name,
+            "systemctl": output,
+        })
+        .to_string(),
+    ))
+}
+
+fn systemd_options_from_request(request: SystemdServiceRequest) -> SystemdServiceOptions {
+    SystemdServiceOptions {
+        unit_name: request.unit_name,
+        program: request.bin_path,
+        interval_ms: request.interval_ms,
+        limit: request.limit,
+        execute: request.execute,
+        recover_stale_seconds: request.recover_stale_seconds,
+        unit_path: request.unit_path,
+    }
+}
+
 fn parse_launchd_control_request(
     body: &[u8],
 ) -> Result<LaunchdServiceControlRequest, (&'static str, String)> {
@@ -3760,6 +7461,15 @@ fn parse_launchd_control_request(
         &request.launchctl_path,
     )
     .map_err(service_error_response)?;
+    Ok(request)
+}
+
+fn parse_systemd_control_request(
+    body: &[u8],
+) -> Result<SystemdServiceControlRequest, (&'static str, String)> {
+    let request = parse_json_or_default::<SystemdServiceControlRequest>(body)?;
+    validate_systemd_control_inputs(&request.unit_name, &request.systemctl_path)
+        .map_err(service_error_response)?;
     Ok(request)
 }
 
@@ -3775,6 +7485,22 @@ fn launchctl_failure_response(
             "error": "service command failed",
             "detail": format!("launchctl {action} failed for {label} in {domain}: {}", output.stderr.trim()),
             "launchctl": output,
+        })
+        .to_string(),
+    )
+}
+
+fn systemctl_failure_response(
+    action: &str,
+    unit_name: &str,
+    output: &crate::service::SystemctlCommandOutput,
+) -> (&'static str, String) {
+    (
+        "409 Conflict",
+        json!({
+            "error": "service command failed",
+            "detail": format!("systemctl {action} failed for {unit_name}: {}", output.stderr.trim()),
+            "systemctl": output,
         })
         .to_string(),
     )
@@ -3875,8 +7601,19 @@ fn create_memory_response(
     if let Some(response) = reject_invalid_tag_values("tags", &request.tags) {
         return Ok(response);
     }
+    if let Some(scope) = &request.scope
+        && let Some(response) = reject_empty_text_field("scope", scope)
+    {
+        return Ok(response);
+    }
     store.update(|os| {
-        let record = MemoryRecord::new(request.topic, request.body, request.tags);
+        let record = MemoryRecord::with_access(
+            request.topic,
+            request.body,
+            request.tags,
+            request.visibility,
+            request.scope,
+        );
         let id = record.id.clone();
         os.write_memory(record);
         Ok((
@@ -3884,6 +7621,67 @@ fn create_memory_response(
             json!({
                 "id": id,
                 "memory": os.memory.iter().find(|record| record.id == id),
+            })
+            .to_string(),
+        ))
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PruneMemoryRequest {
+    max_age_days: Option<u64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn prune_memory_response(store: &Store, body: &[u8]) -> Result<(&'static str, String), StoreError> {
+    let request = match parse_json_or_default::<PruneMemoryRequest>(body) {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if matches!(request.max_age_days, Some(0)) {
+        return Ok((
+            "400 Bad Request",
+            json!({ "error": "max_age_days must be greater than 0" }).to_string(),
+        ));
+    }
+    let max_age_days = if let Some(max_age_days) = request.max_age_days {
+        max_age_days
+    } else {
+        match store.load()?.memory_policy.max_age_days {
+            Some(max_age_days) if max_age_days > 0 => max_age_days,
+            _ => {
+                return Ok((
+                    "400 Bad Request",
+                    json!({ "error": "memory max_age_days is not configured" }).to_string(),
+                ));
+            }
+        }
+    };
+    if request.dry_run {
+        let os = store.load()?;
+        let expired = os.expired_memory(chrono::Utc::now(), max_age_days);
+        return Ok((
+            "200 OK",
+            json!({
+                "dry_run": true,
+                "max_age_days": max_age_days,
+                "removed": [],
+                "expired": expired,
+            })
+            .to_string(),
+        ));
+    }
+    store.update(|os| {
+        let removed = os.prune_expired_memory(chrono::Utc::now(), max_age_days);
+        Ok((
+            "200 OK",
+            json!({
+                "dry_run": false,
+                "max_age_days": max_age_days,
+                "removed": removed,
+                "expired": [],
             })
             .to_string(),
         ))
@@ -3948,14 +7746,28 @@ fn update_memory_response(
             "use either tags or clear_tags, not both",
         ));
     }
+    if let Some(scope) = &request.scope
+        && let Some(response) = reject_empty_text_field("scope", scope)
+    {
+        return Ok(response);
+    }
+    if request.clear_scope && request.scope.is_some() {
+        return Ok(invalid_text_response(
+            "scope",
+            "use either scope or clear_scope, not both",
+        ));
+    }
     if request.topic.is_none()
         && request.body.is_none()
         && request.tags.is_none()
         && !request.clear_tags
+        && request.visibility.is_none()
+        && request.scope.is_none()
+        && !request.clear_scope
     {
         return Ok((
             "400 Bad Request",
-            json!({ "error": "memory update must include topic, body, tags, or clear_tags" })
+            json!({ "error": "memory update must include topic, body, tags, clear_tags, visibility, scope, or clear_scope" })
                 .to_string(),
         ));
     }
@@ -3964,9 +7776,21 @@ fn update_memory_response(
     } else {
         request.tags
     };
+    let scope = if request.clear_scope {
+        Some(None)
+    } else {
+        request.scope.map(Some)
+    };
     store.update(|os| {
         Ok(
-            match os.update_memory(&id, request.topic, request.body, tags) {
+            match os.update_memory(
+                &id,
+                request.topic,
+                request.body,
+                tags,
+                request.visibility,
+                scope,
+            ) {
                 Some(memory) => (
                     "200 OK",
                     json!({
@@ -4018,9 +7842,63 @@ fn parse_priority_request(input: &str) -> Result<Priority, (&'static str, String
         .ok_or_else(|| invalid_choice_response("priority", input, Priority::INPUT_VALUES))
 }
 
+fn reject_invalid_git_ref(field: &str, value: &str) -> Option<(&'static str, String)> {
+    if value.chars().any(|ch| {
+        ch.is_ascii_control() || matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return Some(invalid_text_response(
+            field,
+            &format!("{field} contains characters git refs cannot safely use"),
+        ));
+    }
+    None
+}
+
 fn parse_tool_kind_request(input: &str) -> Result<ToolKind, (&'static str, String)> {
     ToolKind::try_parse(input)
         .ok_or_else(|| invalid_choice_response("kind", input, ToolKind::INPUT_VALUES))
+}
+
+const SECRETS_BACKEND_KIND_INPUT_VALUES: &[&str] = &[
+    "environment",
+    "env",
+    "one-password",
+    "1password",
+    "1-password",
+    "op",
+    "os-keychain",
+    "keychain",
+    "macos-keychain",
+    "env-vault",
+    "envvault",
+];
+
+const SECRETS_BACKEND_KIND_VALUES: &[&str] =
+    &["environment", "one-password", "os-keychain", "env-vault"];
+
+fn parse_secrets_backend_kind_request(
+    input: &str,
+) -> Result<SecretsBackendKind, (&'static str, String)> {
+    match input.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "environment" | "env" => Ok(SecretsBackendKind::Environment),
+        "one-password" | "1password" | "1-password" | "op" => Ok(SecretsBackendKind::OnePassword),
+        "os-keychain" | "keychain" | "macos-keychain" => Ok(SecretsBackendKind::OsKeychain),
+        "env-vault" | "envvault" => Ok(SecretsBackendKind::EnvVault),
+        _ => Err(invalid_choice_response(
+            "kind",
+            input,
+            SECRETS_BACKEND_KIND_INPUT_VALUES,
+        )),
+    }
+}
+
+fn secrets_backend_kind_name(kind: &SecretsBackendKind) -> &'static str {
+    match kind {
+        SecretsBackendKind::Environment => "environment",
+        SecretsBackendKind::OnePassword => "one-password",
+        SecretsBackendKind::OsKeychain => "os-keychain",
+        SecretsBackendKind::EnvVault => "env-vault",
+    }
 }
 
 fn invalid_choice_response(field: &str, value: &str, expected: &[&str]) -> (&'static str, String) {
@@ -4098,6 +7976,79 @@ fn parse_memory_path_id(id: &str) -> Result<String, (&'static str, String)> {
     }
 }
 
+fn parse_approval_path_id(id: &str) -> Result<String, (&'static str, String)> {
+    if !contains_slug_character(id) {
+        Err(invalid_text_response(
+            "approval id",
+            "approval id must contain at least one ASCII letter, digit, or hyphen",
+        ))
+    } else {
+        Ok(id.to_owned())
+    }
+}
+
+fn parse_worker_path_id(id: &str) -> Result<String, (&'static str, String)> {
+    if !contains_slug_character(id) {
+        Err(invalid_text_response(
+            "worker id",
+            "worker id must contain at least one ASCII letter, digit, or hyphen",
+        ))
+    } else {
+        Ok(id.to_owned())
+    }
+}
+
+fn parse_eval_path_id(id: &str) -> Result<String, (&'static str, String)> {
+    if !contains_slug_character(id) {
+        Err(invalid_text_response(
+            "eval id",
+            "eval id must contain at least one ASCII letter, digit, or hyphen",
+        ))
+    } else {
+        Ok(id.to_owned())
+    }
+}
+
+fn parse_secrets_backend_path_id(id: &str) -> Result<String, (&'static str, String)> {
+    if !contains_slug_character(id) {
+        Err(invalid_text_response(
+            "secrets backend id",
+            "secrets backend id must contain at least one ASCII letter, digit, or hyphen",
+        ))
+    } else {
+        Ok(id.to_owned())
+    }
+}
+
+fn parse_registry_path_id(field: &'static str, id: &str) -> Result<String, (&'static str, String)> {
+    if !contains_slug_character(id) {
+        Err(invalid_text_response(
+            field,
+            &format!("{field} must contain at least one ASCII letter, digit, or hyphen"),
+        ))
+    } else {
+        Ok(id.to_owned())
+    }
+}
+
+fn reject_invalid_worker_id(id: &str) -> Option<(&'static str, String)> {
+    (!contains_slug_character(id)).then(|| {
+        invalid_text_response(
+            "id",
+            "worker id must contain at least one ASCII letter, digit, or hyphen",
+        )
+    })
+}
+
+fn reject_invalid_secrets_backend_id(id: &str) -> Option<(&'static str, String)> {
+    (!contains_slug_character(id)).then(|| {
+        invalid_text_response(
+            "id",
+            "secrets backend id must contain at least one ASCII letter, digit, or hyphen",
+        )
+    })
+}
+
 fn contains_slug_character(value: &str) -> bool {
     value
         .chars()
@@ -4163,6 +8114,49 @@ fn reject_empty_optional_text_field(
     value.and_then(|value| reject_empty_text_field(field, value))
 }
 
+fn reject_invalid_mcp_args(args: &[String]) -> Option<(&'static str, String)> {
+    for arg in args {
+        if let Some(response) = reject_empty_text_field("mcp argument", arg) {
+            return Some(response);
+        }
+    }
+    None
+}
+
+fn reject_invalid_mcp_env(env: &BTreeMap<String, String>) -> Option<(&'static str, String)> {
+    for key in env.keys() {
+        if !crate::models::is_valid_env_var_name(key) {
+            return Some(invalid_text_response(
+                "mcp environment key",
+                "mcp environment key must be a valid environment variable name",
+            ));
+        }
+    }
+    None
+}
+
+fn reject_invalid_workflow_stage(
+    field: &'static str,
+    stage: &str,
+) -> Option<(&'static str, String)> {
+    if stage.trim().is_empty() {
+        return Some(invalid_text_response(
+            field,
+            "workflow stage must not be empty",
+        ));
+    }
+    if stage
+        .chars()
+        .any(|ch| ch.is_ascii_control() || matches!(ch, '/' | '\\'))
+    {
+        return Some(invalid_text_response(
+            field,
+            "workflow stage must not contain path separators or control characters",
+        ));
+    }
+    None
+}
+
 fn reject_invalid_plan_steps(steps: &[String]) -> Option<(&'static str, String)> {
     if steps.is_empty() {
         return Some(invalid_text_response(
@@ -4199,6 +8193,330 @@ fn reject_invalid_capability_values(
     None
 }
 
+fn reject_invalid_marketplace_manifest(
+    manifest: &mut MarketplaceManifest,
+) -> Option<(&'static str, String)> {
+    if let Some(metadata) = &manifest.metadata {
+        if let Err(response) = parse_registry_path_id("marketplace manifest id", &metadata.id) {
+            return Some(response);
+        }
+        if let Some(response) =
+            reject_empty_text_field("marketplace manifest version", &metadata.version)
+        {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace manifest publisher",
+            metadata.publisher.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace manifest homepage",
+            metadata.homepage.as_deref(),
+        ) {
+            return Some(response);
+        }
+    }
+
+    let mut profile_ids = BTreeSet::new();
+    for profile in &mut manifest.agent_profiles {
+        if let Err(response) = parse_registry_path_id("marketplace agent profile id", &profile.id) {
+            return Some(response);
+        }
+        if !profile_ids.insert(profile.id.clone()) {
+            return Some(invalid_text_response(
+                "marketplace agent profile id",
+                &format!("duplicate marketplace agent profile id: {}", profile.id),
+            ));
+        }
+        if let Some(response) = reject_invalid_agent_name(&profile.name) {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace agent profile model",
+            profile.model.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace agent profile system_prompt",
+            profile.system_prompt.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_invalid_capability_values(
+            "marketplace agent profile capabilities",
+            &profile.capabilities,
+            true,
+        ) {
+            return Some(response);
+        }
+        profile.capabilities = normalize_list(profile.capabilities.clone());
+    }
+
+    let mut template_ids = BTreeSet::new();
+    for template in &mut manifest.workflow_templates {
+        if let Some(response) = reject_invalid_marketplace_template(template, &mut template_ids) {
+            return Some(response);
+        }
+    }
+
+    let mut server_ids = BTreeSet::new();
+    for server in &manifest.mcp_servers {
+        if let Err(response) = parse_registry_path_id("marketplace MCP server id", &server.id) {
+            return Some(response);
+        }
+        if !server_ids.insert(server.id.clone()) {
+            return Some(invalid_text_response(
+                "marketplace MCP server id",
+                &format!("duplicate marketplace MCP server id: {}", server.id),
+            ));
+        }
+        if let Some(response) = reject_empty_text_field("marketplace MCP command", &server.command)
+        {
+            return Some(response);
+        }
+        for arg in &server.args {
+            if let Some(response) = reject_empty_text_field("marketplace MCP argument", arg) {
+                return Some(response);
+            }
+        }
+        for key in server.env.keys() {
+            if !crate::models::is_valid_env_var_name(key) {
+                return Some(invalid_text_response(
+                    "marketplace MCP environment key",
+                    "marketplace MCP environment key must be a valid environment variable name",
+                ));
+            }
+        }
+    }
+
+    if manifest.agent_profiles.is_empty()
+        && manifest.workflow_templates.is_empty()
+        && manifest.mcp_servers.is_empty()
+    {
+        return Some(invalid_text_response(
+            "manifest",
+            "marketplace manifest must include at least one registry entry",
+        ));
+    }
+    None
+}
+
+fn reject_invalid_marketplace_template(
+    template: &mut WorkflowTemplate,
+    template_ids: &mut BTreeSet<String>,
+) -> Option<(&'static str, String)> {
+    if let Err(response) = parse_registry_path_id("marketplace workflow template id", &template.id)
+    {
+        return Some(response);
+    }
+    if !template_ids.insert(template.id.clone()) {
+        return Some(invalid_text_response(
+            "marketplace workflow template id",
+            &format!(
+                "duplicate marketplace workflow template id: {}",
+                template.id
+            ),
+        ));
+    }
+    if let Some(response) =
+        reject_empty_text_field("marketplace workflow template name", &template.name)
+    {
+        return Some(response);
+    }
+    if let Some(response) = reject_empty_text_field(
+        "marketplace workflow template description",
+        &template.description,
+    ) {
+        return Some(response);
+    }
+    if template.stages.is_empty() {
+        return Some(invalid_text_response(
+            "marketplace workflow template stages",
+            &format!(
+                "marketplace workflow template {} has no stages",
+                template.id
+            ),
+        ));
+    }
+    let mut stages = BTreeSet::new();
+    for stage in &template.stages {
+        if let Some(response) =
+            reject_invalid_workflow_stage("marketplace workflow template stage", stage)
+        {
+            return Some(response);
+        }
+        if !stages.insert(stage.clone()) {
+            return Some(invalid_text_response(
+                "marketplace workflow template stage",
+                &format!(
+                    "marketplace workflow template {} has duplicate stage {}",
+                    template.id, stage
+                ),
+            ));
+        }
+    }
+
+    let mut task_stages = BTreeSet::new();
+    for task in &mut template.tasks {
+        if let Some(response) =
+            reject_invalid_workflow_stage("marketplace workflow template task stage", &task.stage)
+        {
+            return Some(response);
+        }
+        if !stages.contains(&task.stage) {
+            return Some(invalid_text_response(
+                "marketplace workflow template task stage",
+                &format!(
+                    "marketplace workflow template {} task references unknown stage {}",
+                    template.id, task.stage
+                ),
+            ));
+        }
+        if !task_stages.insert(task.stage.clone()) {
+            return Some(invalid_text_response(
+                "marketplace workflow template task stage",
+                &format!(
+                    "marketplace workflow template {} has duplicate task metadata for stage {}",
+                    template.id, task.stage
+                ),
+            ));
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace workflow template task title",
+            task.title.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace workflow template task objective",
+            task.objective.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_empty_optional_text_field(
+            "marketplace workflow template task command",
+            task.command.as_deref(),
+        ) {
+            return Some(response);
+        }
+        if let Some(response) = reject_invalid_capability_values(
+            "marketplace workflow template task capabilities",
+            &task.capabilities,
+            true,
+        ) {
+            return Some(response);
+        }
+        task.capabilities = normalize_list(task.capabilities.clone());
+    }
+
+    let mut edges = BTreeSet::new();
+    for edge in &template.edges {
+        if let Some(response) =
+            reject_invalid_marketplace_template_edge(template, edge, &stages, &mut edges)
+        {
+            return Some(response);
+        }
+    }
+    if marketplace_template_has_cycle(&template.stages, &workflow_template_edges(template)) {
+        return Some(invalid_text_response(
+            "marketplace workflow template edges",
+            &format!(
+                "marketplace workflow template {} has a dependency cycle",
+                template.id
+            ),
+        ));
+    }
+    None
+}
+
+fn reject_invalid_marketplace_template_edge(
+    template: &WorkflowTemplate,
+    edge: &WorkflowTemplateEdge,
+    stages: &BTreeSet<String>,
+    edges: &mut BTreeSet<(String, String)>,
+) -> Option<(&'static str, String)> {
+    if let Some(response) =
+        reject_invalid_workflow_stage("marketplace workflow template edge from", &edge.from)
+    {
+        return Some(response);
+    }
+    if let Some(response) =
+        reject_invalid_workflow_stage("marketplace workflow template edge to", &edge.to)
+    {
+        return Some(response);
+    }
+    if edge.from == edge.to {
+        return Some(invalid_text_response(
+            "marketplace workflow template edge",
+            &format!(
+                "marketplace workflow template {} edge cannot point to itself: {}",
+                template.id, edge.from
+            ),
+        ));
+    }
+    if !stages.contains(&edge.from) {
+        return Some(invalid_text_response(
+            "marketplace workflow template edge from",
+            &format!(
+                "marketplace workflow template {} edge references unknown stage {}",
+                template.id, edge.from
+            ),
+        ));
+    }
+    if !stages.contains(&edge.to) {
+        return Some(invalid_text_response(
+            "marketplace workflow template edge to",
+            &format!(
+                "marketplace workflow template {} edge references unknown stage {}",
+                template.id, edge.to
+            ),
+        ));
+    }
+    if !edges.insert((edge.from.clone(), edge.to.clone())) {
+        return Some(invalid_text_response(
+            "marketplace workflow template edge",
+            &format!(
+                "marketplace workflow template {} has duplicate edge {} -> {}",
+                template.id, edge.from, edge.to
+            ),
+        ));
+    }
+    None
+}
+
+fn marketplace_template_has_cycle(stages: &[String], edges: &[WorkflowTemplateEdge]) -> bool {
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    stages.iter().any(|stage| {
+        marketplace_template_visit_has_cycle(stage, edges, &mut visiting, &mut visited)
+    })
+}
+
+fn marketplace_template_visit_has_cycle(
+    stage: &str,
+    edges: &[WorkflowTemplateEdge],
+    visiting: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    if visited.contains(stage) {
+        return false;
+    }
+    if !visiting.insert(stage.to_owned()) {
+        return true;
+    }
+    for edge in edges.iter().filter(|edge| edge.from == stage) {
+        if marketplace_template_visit_has_cycle(&edge.to, edges, visiting, visited) {
+            return true;
+        }
+    }
+    visiting.remove(stage);
+    visited.insert(stage.to_owned());
+    false
+}
+
 fn reject_invalid_tag_values(
     field: &'static str,
     values: &[String],
@@ -4228,19 +8546,26 @@ fn reject_invalid_tool_invocation_args(
             &format!("tool argument `{key}` cannot be both args and secret_args"),
         ));
     }
-    if let Some((key, _)) = secret_args.iter().find(|(_, env)| env.trim().is_empty()) {
+    if let Some((key, _)) = secret_args
+        .iter()
+        .find(|(_, reference)| reference.trim().is_empty())
+    {
         return Some(invalid_text_response(
             "secret_args",
-            &format!("secret tool argument `{key}` must name an environment variable"),
+            &format!(
+                "secret tool argument `{key}` must name an environment variable or backend:id reference"
+            ),
         ));
     }
     if let Some((key, _)) = secret_args
         .iter()
-        .find(|(_, env)| !is_valid_env_var_name(env))
+        .find(|(_, reference)| !is_valid_secret_reference(reference))
     {
         return Some(invalid_text_response(
             "secret_args",
-            &format!("secret tool argument `{key}` must name a valid environment variable"),
+            &format!(
+                "secret tool argument `{key}` must name a valid environment variable or backend:id reference"
+            ),
         ));
     }
     if key_matches_patterns(args, redacted_patterns) {
@@ -4330,6 +8655,38 @@ fn validate_task_dependencies_for_task(
         .collect()
 }
 
+fn workflow_stage_task_pair_response(
+    os: &OperatingSystem,
+    workflow_id: &WorkflowId,
+    from_stage: &str,
+    to_stage: &str,
+) -> Result<Option<(TaskId, TaskId)>, (&'static str, String)> {
+    let Some(workflow) = os.workflows.get(workflow_id) else {
+        return Ok(None);
+    };
+    let Some(from_task) = workflow.tasks.get(from_stage).cloned() else {
+        return Err((
+            "404 Not Found",
+            json!({
+                "error": "workflow stage not found",
+                "stage": from_stage,
+            })
+            .to_string(),
+        ));
+    };
+    let Some(to_task) = workflow.tasks.get(to_stage).cloned() else {
+        return Err((
+            "404 Not Found",
+            json!({
+                "error": "workflow stage not found",
+                "stage": to_stage,
+            })
+            .to_string(),
+        ));
+    };
+    Ok(Some((from_task, to_task)))
+}
+
 fn reject_non_positive_lease(lease_seconds: Option<i64>) -> Option<(&'static str, String)> {
     lease_seconds
         .filter(|seconds| *seconds <= 0)
@@ -4396,6 +8753,18 @@ fn default_normal_priority() -> String {
     "normal".into()
 }
 
+fn default_main_branch() -> String {
+    "main".into()
+}
+
+fn default_code_review_title() -> String {
+    "Code review".into()
+}
+
+fn default_mcp_server_enabled() -> bool {
+    true
+}
+
 fn default_parallel() -> usize {
     1
 }
@@ -4408,8 +8777,16 @@ fn default_launchd_label() -> String {
     crate::service::DEFAULT_LAUNCHD_LABEL.into()
 }
 
+fn default_systemd_unit_name() -> String {
+    crate::service::DEFAULT_SYSTEMD_UNIT.into()
+}
+
 fn default_launchctl_path() -> PathBuf {
     PathBuf::from("launchctl")
+}
+
+fn default_systemctl_path() -> PathBuf {
+    PathBuf::from("systemctl")
 }
 
 fn default_keep_runs() -> usize {
@@ -4442,11 +8819,17 @@ pub fn openapi_schema() -> serde_json::Value {
             { "name": "agents", "description": "Agent registration, heartbeats, and work claims." },
             { "name": "tasks", "description": "Task queue inspection and lifecycle transitions." },
             { "name": "workflows", "description": "Workflow creation and inspection." },
+            { "name": "approvals", "description": "Human approval gate inspection and resolution." },
+            { "name": "workers", "description": "Distributed worker node registration and heartbeat records." },
+            { "name": "evals", "description": "Benchmark evaluation records." },
+            { "name": "git", "description": "Git workspace inspection." },
+            { "name": "secrets", "description": "Secret manager backend metadata." },
             { "name": "tools", "description": "Tool catalog inspection and lookup." },
             { "name": "state", "description": "State validation and repair operations." },
             { "name": "runs", "description": "Run execution, history, logs, replay, and cancellation." },
             { "name": "events", "description": "Event stream inspection." },
             { "name": "memory", "description": "Agent memory inspection." },
+            { "name": "registry", "description": "Reusable agent profiles, workflow templates, and MCP server registry." },
             { "name": "schema", "description": "OpenAPI schema discovery." }
         ],
         "security": [
@@ -4455,7 +8838,9 @@ pub fn openapi_schema() -> serde_json::Value {
         ],
         "paths": {
             "/health": health_endpoint(),
+            "/dashboard.html": dashboard_html_endpoint(),
             "/metrics": metrics_endpoint(),
+            "/metrics/prometheus": prometheus_metrics_endpoint(),
             "/status": status_endpoint(),
             "/agents": agents_endpoint(),
             "/agents/{id}": with_id_parameter(
@@ -4490,6 +8875,46 @@ pub fn openapi_schema() -> serde_json::Value {
                 workflow_detail_endpoint(),
                 "Workflow ID. Values are normalized before lookup.",
             ),
+            "/approvals": approvals_endpoint(),
+            "/approvals/{id}/approve": with_id_parameter(
+                approval_resolve_endpoint("Approve an approval gate"),
+                "Approval ID.",
+            ),
+            "/approvals/{id}/deny": with_id_parameter(
+                approval_resolve_endpoint("Deny an approval gate"),
+                "Approval ID.",
+            ),
+            "/workers": workers_endpoint(),
+            "/workers/{id}": with_id_parameter(
+                worker_detail_endpoint(),
+                "Worker ID.",
+            ),
+            "/workers/{id}/heartbeat": with_id_parameter(
+                worker_heartbeat_endpoint(),
+                "Worker ID.",
+            ),
+            "/workers/{id}/claim": with_id_parameter(
+                worker_claim_endpoint(),
+                "Worker ID. A matching agent with the same normalized ID must exist.",
+            ),
+            "/workers/{id}/report": with_id_parameter(
+                worker_report_endpoint(),
+                "Worker ID. A matching agent with the same normalized ID must own the running task.",
+            ),
+            "/evals": evals_endpoint(),
+            "/evals/run": eval_run_endpoint(),
+            "/evals/{id}": with_id_parameter(
+                eval_detail_endpoint(),
+                "Eval ID.",
+            ),
+            "/git/status": git_status_endpoint(),
+            "/git/review-task": git_review_task_endpoint(),
+            "/secrets": secrets_endpoint(),
+            "/secrets/check": secrets_check_endpoint(),
+            "/secrets/{id}": with_id_parameter(
+                secrets_detail_endpoint(),
+                "Secrets backend ID.",
+            ),
             "/tools": tools_endpoint(),
             "/tools/{id}": with_id_parameter(
                 tool_detail_endpoint(),
@@ -4511,13 +8936,52 @@ pub fn openapi_schema() -> serde_json::Value {
                 run_replay_endpoint(),
                 "Run ID. Values are normalized before lookup.",
             ),
+            "/runs/{id}/debug": with_id_parameter(
+                run_debug_endpoint(),
+                "Run ID. Values are normalized before lookup.",
+            ),
+            "/runs/{id}/artifacts": with_id_parameter(
+                run_artifacts_endpoint(),
+                "Run ID. Values are normalized before lookup.",
+            ),
+            "/runs/{id}/artifacts/{artifact_id}": with_id_parameter(
+                with_artifact_id_parameter(run_artifact_endpoint()),
+                "Run ID. Values are normalized before lookup.",
+            ),
             "/runs/{id}/cancel": with_id_parameter(
                 run_cancel_endpoint(),
                 "Run ID. Values are normalized before lookup.",
             ),
             "/events": events_endpoint(),
             "/memory": memory_endpoint(),
+            "/memory/recall": memory_recall_endpoint(),
+            "/memory/prune": memory_prune_endpoint(),
             "/memory/{id}": with_id_parameter(memory_detail_endpoint(), "Memory ID."),
+            "/registry": registry_endpoint(),
+            "/registry/profiles": registry_profiles_endpoint(),
+            "/registry/profiles/{id}": with_id_parameter(
+                registry_profile_detail_endpoint(),
+                "Agent profile ID.",
+            ),
+            "/registry/profiles/{id}/agents": with_id_parameter(
+                registry_profile_agents_endpoint(),
+                "Agent profile ID.",
+            ),
+            "/registry/templates": registry_templates_endpoint(),
+            "/registry/templates/{id}": with_id_parameter(
+                registry_template_detail_endpoint(),
+                "Workflow template ID.",
+            ),
+            "/registry/templates/{id}/workflows": with_id_parameter(
+                registry_template_workflows_endpoint(),
+                "Workflow template ID.",
+            ),
+            "/registry/marketplace-import": registry_marketplace_import_endpoint(),
+            "/registry/mcp-servers": registry_mcp_servers_endpoint(),
+            "/registry/mcp-servers/{id}": with_id_parameter(
+                registry_mcp_server_detail_endpoint(),
+                "MCP server ID.",
+            ),
             "/openapi.json": openapi_json_endpoint()
         },
         "components": {
@@ -4561,16 +9025,91 @@ pub fn openapi_schema() -> serde_json::Value {
             "/service/launchd/status".into(),
             service_launchd_status_endpoint(),
         );
+        paths.insert("/service/systemd".into(), service_systemd_endpoint());
+        paths.insert(
+            "/service/systemd/install".into(),
+            service_systemd_install_endpoint(),
+        );
+        paths.insert(
+            "/service/systemd/uninstall".into(),
+            service_systemd_uninstall_endpoint(),
+        );
+        paths.insert(
+            "/service/systemd/start".into(),
+            service_systemd_start_endpoint(),
+        );
+        paths.insert(
+            "/service/systemd/stop".into(),
+            service_systemd_stop_endpoint(),
+        );
+        paths.insert(
+            "/service/systemd/status".into(),
+            service_systemd_status_endpoint(),
+        );
+        paths.insert(
+            "/registry/profiles/{id}/agents".into(),
+            with_id_parameter(registry_profile_agents_endpoint(), "Agent profile ID."),
+        );
         paths.insert("/state/backup".into(), state_backup_endpoint());
         paths.insert("/state/export".into(), state_export_endpoint());
         paths.insert("/state/import".into(), state_import_endpoint());
         paths.insert("/state/migrate".into(), state_migrate_endpoint());
         paths.insert("/state/prune".into(), state_prune_endpoint());
+        paths.insert("/state/sqlite".into(), state_sqlite_endpoint());
         paths.insert("/tasks/recover".into(), task_recover_endpoint());
         paths.insert(
             "/workflows/{id}/status".into(),
             with_id_parameter(
                 workflow_status_endpoint(),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/dag".into(),
+            with_id_parameter(
+                workflow_dag_endpoint(),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/tasks".into(),
+            with_id_parameter(
+                workflow_add_task_endpoint(),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/link".into(),
+            with_id_parameter(
+                workflow_edge_endpoint("Add a dependency edge between workflow stages"),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/unlink".into(),
+            with_id_parameter(
+                workflow_edge_endpoint("Remove a dependency edge between workflow stages"),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/pause".into(),
+            with_id_parameter(
+                workflow_transition_endpoint("Pause pending workflow stages"),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/resume".into(),
+            with_id_parameter(
+                workflow_transition_endpoint("Resume blocked workflow stages"),
+                "Workflow ID. Values are normalized before lookup.",
+            ),
+        );
+        paths.insert(
+            "/workflows/{id}/retry".into(),
+            with_id_parameter(
+                workflow_transition_endpoint("Retry failed, cancelled, or blocked workflow stages"),
                 "Workflow ID. Values are normalized before lookup.",
             ),
         );
@@ -4742,6 +9281,12 @@ fn operation_tag(path: &str) -> &'static str {
         "run" | "runs" => "runs",
         "events" => "events",
         "memory" => "memory",
+        "registry" => "registry",
+        "approvals" => "approvals",
+        "workers" => "workers",
+        "evals" => "evals",
+        "git" => "git",
+        "secrets" => "secrets",
         "openapi.json" => "schema",
         _ => "system",
     }
@@ -4763,6 +9308,7 @@ fn add_common_error_responses(schema: &mut serde_json::Value) {
                 continue;
             };
             add_response_if_missing(operation, "401", "Authentication required");
+            add_response_if_missing(operation, "403", "Forbidden");
             add_response_if_missing(operation, "405", "Method not allowed");
             add_response_if_missing(operation, "431", "Request headers too large");
             add_response_if_missing(operation, "500", "Server error");
@@ -4839,11 +9385,19 @@ fn standard_response_headers() -> serde_json::Value {
                 "example": "nosniff"
             }
         },
-        "Access-Control-Allow-Origin": {
-            "description": "CORS origin policy for browser clients.",
+        "X-Trace-Id": {
+            "description": "Per-request trace ID generated by the local API listener for log and client correlation.",
             "schema": {
                 "type": "string",
-                "example": "*"
+                "pattern": r"^[0-9a-fA-F-]{36}$",
+                "example": "123e4567-e89b-12d3-a456-426614174000"
+            }
+        },
+        "Access-Control-Allow-Origin": {
+            "description": "CORS origin policy for browser clients. Missing origins and loopback browser origins are allowed; other origins receive 403.",
+            "schema": {
+                "type": "string",
+                "example": "http://localhost:3000"
             }
         },
         "Access-Control-Allow-Methods": {
@@ -4894,10 +9448,11 @@ fn request_schemas() -> serde_json::Value {
                 "cwd": non_empty_string("Working directory override."),
                 "tool": id_source_string("Registered tool ID to invoke."),
                 "args": string_map("Plain tool arguments. Secret-like keys are rejected here."),
-                "secret_args": env_var_map("Tool argument keys mapped to environment variable names."),
+                "secret_args": secret_reference_map("Tool argument keys mapped to environment variable names or backend:id secret references."),
                 "priority": priority_input_schema(),
                 "required_capabilities": capability_array(),
-                "dependencies": task_id_array("Task IDs that must complete before this task is ready. Empty or malformed IDs are rejected.")
+                "dependencies": task_id_array("Task IDs that must complete before this task is ready. Empty or malformed IDs are rejected."),
+                "max_attempts": positive_integer_with_default(1)
             },
             "additionalProperties": false
         },
@@ -4920,7 +9475,9 @@ fn request_schemas() -> serde_json::Value {
             "properties": {
                 "topic": non_empty_string("Memory topic."),
                 "body": non_empty_string("Memory body."),
-                "tags": string_array("Search tags. Empty entries are rejected.")
+                "tags": string_array("Search tags. Empty entries are rejected."),
+                "visibility": memory_visibility_schema(),
+                "scope": nullable_persisted_non_empty_string_schema()
             },
             "additionalProperties": false
         },
@@ -5117,11 +9674,23 @@ fn request_schemas() -> serde_json::Value {
             },
             "additionalProperties": false
         },
+        "UnscheduledTask": {
+            "type": "object",
+            "required": ["task_id", "reason"],
+            "properties": {
+                "task_id": slug_string_schema(),
+                "reason": persisted_non_empty_string_schema()
+            },
+            "additionalProperties": false
+        },
         "RuntimeReport": runtime_report_schema(),
         "RunRecord": run_record_schema(),
         "RunOnceResponse": run_once_response_schema(),
         "RunLogsResponse": run_logs_response_schema(),
         "RunReplayResponse": run_replay_response_schema(),
+        "RunDebugResponse": run_debug_response_schema(),
+        "RunArtifactsResponse": run_artifacts_response_schema(),
+        "RunArtifactReadResponse": run_artifact_read_response_schema(),
         "RunCancelResponse": {
             "type": "object",
             "required": ["id", "cancel_requested", "run"],
@@ -5139,6 +9708,11 @@ fn request_schemas() -> serde_json::Value {
     add_agent_update_schemas(&mut schemas);
     add_task_update_schemas(&mut schemas);
     add_workflow_schemas(&mut schemas);
+    add_registry_schemas(&mut schemas);
+    add_approval_schemas(&mut schemas);
+    add_worker_eval_schemas(&mut schemas);
+    add_git_schemas(&mut schemas);
+    add_secrets_schemas(&mut schemas);
     add_task_assignment_schemas(&mut schemas);
     add_tool_update_schemas(&mut schemas);
     add_memory_update_schemas(&mut schemas);
@@ -5151,6 +9725,7 @@ fn request_schemas() -> serde_json::Value {
     add_export_schemas(&mut schemas);
     add_import_schemas(&mut schemas);
     add_migration_schemas(&mut schemas);
+    add_sqlite_state_schemas(&mut schemas);
     add_config_schemas(&mut schemas);
     add_recovery_schemas(&mut schemas);
     add_entity_schemas(&mut schemas);
@@ -5257,12 +9832,13 @@ fn add_migration_schemas(schemas: &mut serde_json::Map<String, serde_json::Value
         "MigrationReport".into(),
         json!({
             "type": "object",
-            "required": ["from_version", "to_version", "changed", "steps"],
+            "required": ["from_version", "to_version", "changed", "steps", "downgrade_notes"],
             "properties": {
                 "from_version": non_negative_integer(),
                 "to_version": non_negative_integer(),
                 "changed": { "type": "boolean" },
-                "steps": string_list_schema()
+                "steps": string_list_schema(),
+                "downgrade_notes": string_list_schema()
             },
             "additionalProperties": false
         }),
@@ -5271,13 +9847,88 @@ fn add_migration_schemas(schemas: &mut serde_json::Map<String, serde_json::Value
         "MigrateStateResponse".into(),
         json!({
             "type": "object",
-            "required": ["dry_run", "input", "output", "migration", "validation"],
+            "required": ["dry_run", "input", "output", "output_preexisting", "migration", "validation"],
             "properties": {
                 "dry_run": { "type": "boolean" },
                 "input": { "type": "string" },
                 "output": { "type": "string" },
+                "output_preexisting": { "type": "boolean" },
                 "migration": schema_ref("MigrationReport"),
                 "validation": schema_ref("ValidationReport")
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
+fn add_sqlite_state_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert(
+        "StateSqliteRequest".into(),
+        json!({
+            "type": "object",
+            "allOf": [
+                true_flags_conflict("init_only", "restore")
+            ],
+            "properties": {
+                "output": non_empty_string("Optional SQLite mirror path. Defaults to the active state path with a .sqlite extension."),
+                "init_only": { "type": "boolean", "default": false },
+                "restore": { "type": "boolean", "default": false },
+                "force": { "type": "boolean", "default": false },
+                "dry_run": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SqliteImportReport".into(),
+        json!({
+            "type": "object",
+            "required": ["imported_snapshot", "imported_runs", "imported_run_logs", "skipped_run_logs"],
+            "properties": {
+                "imported_snapshot": { "type": "boolean" },
+                "imported_runs": non_negative_integer(),
+                "imported_run_logs": non_negative_integer(),
+                "skipped_run_logs": non_negative_integer()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SqliteRestoreReport".into(),
+        json!({
+            "type": "object",
+            "required": ["restored_snapshot", "restored_runs", "validation"],
+            "properties": {
+                "restored_snapshot": { "type": "boolean" },
+                "restored_runs": non_negative_integer(),
+                "validation": schema_ref("ValidationReport")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "StateSqliteResponse".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "path",
+                "state_path",
+                "initialized",
+                "imported",
+                "dry_run",
+                "force",
+                "import",
+                "restore"
+            ],
+            "properties": {
+                "path": { "type": "string" },
+                "state_path": { "type": "string" },
+                "initialized": { "type": "boolean" },
+                "imported": { "type": "boolean" },
+                "dry_run": { "type": "boolean" },
+                "force": { "type": "boolean" },
+                "import": nullable_schema(schema_ref("SqliteImportReport")),
+                "restore": nullable_schema(schema_ref("SqliteRestoreReport"))
             },
             "additionalProperties": false
         }),
@@ -5299,10 +9950,22 @@ fn add_recovery_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>
         "RecoverTasksResponse".into(),
         json!({
             "type": "object",
-            "required": ["older_than_seconds", "recovered"],
+            "required": [
+                "older_than_seconds",
+                "recovered",
+                "recovered_runs",
+                "recovered_daemon",
+                "notes"
+            ],
             "properties": {
                 "older_than_seconds": { "type": "integer", "minimum": 0 },
-                "recovered": slug_list_schema()
+                "recovered": slug_list_schema(),
+                "recovered_runs": slug_list_schema(),
+                "recovered_daemon": { "type": "boolean" },
+                "notes": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
             },
             "additionalProperties": false
         }),
@@ -5326,11 +9989,12 @@ fn add_prune_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
         "PruneReport".into(),
         json!({
             "type": "object",
-            "required": ["dry_run", "removed_runs", "removed_log_paths", "removed_events"],
+            "required": ["dry_run", "removed_runs", "removed_log_paths", "removed_artifact_paths", "removed_events"],
             "properties": {
                 "dry_run": { "type": "boolean" },
                 "removed_runs": slug_list_schema(),
                 "removed_log_paths": string_list_schema(),
+                "removed_artifact_paths": string_list_schema(),
                 "removed_events": non_negative_integer()
             },
             "additionalProperties": false
@@ -5550,6 +10214,179 @@ fn add_service_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>)
             "additionalProperties": false
         }),
     );
+    schemas.insert(
+        "SystemdServiceRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "unit_name": non_empty_string_with_default(crate::service::DEFAULT_SYSTEMD_UNIT),
+                "bin_path": non_empty_string("Optional agent-os binary path. Defaults to the current executable."),
+                "interval_ms": { "type": "integer", "minimum": 1, "default": 1000 },
+                "limit": positive_integer_with_default(1),
+                "execute": { "type": "boolean", "default": false },
+                "recover_stale_seconds": { "type": "integer", "minimum": 0 },
+                "unit_path": non_empty_string("Optional systemd user unit path. Defaults from unit_name.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdService".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "unit_name",
+                "program",
+                "state_path",
+                "interval_ms",
+                "limit",
+                "execute",
+                "recover_stale_seconds"
+            ],
+            "properties": {
+                "unit_name": { "type": "string" },
+                "program": { "type": "string" },
+                "state_path": { "type": "string" },
+                "interval_ms": { "type": "integer", "minimum": 1 },
+                "limit": positive_integer(),
+                "execute": { "type": "boolean" },
+                "recover_stale_seconds": { "type": ["integer", "null"], "minimum": 0 }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdServiceResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "service", "unit", "unit_path"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "service": schema_ref("SystemdService"),
+                "unit": { "type": "string" },
+                "unit_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "InstallSystemdServiceResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "installed", "unit_path", "service"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "installed": { "type": "boolean" },
+                "unit_path": { "type": "string" },
+                "service": schema_ref("SystemdService")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "UninstallSystemdServiceRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "unit_name": non_empty_string_with_default(crate::service::DEFAULT_SYSTEMD_UNIT),
+                "unit_path": non_empty_string("Optional systemd user unit path. Defaults from unit_name.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "UninstallSystemdServiceResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "removed", "unit_path"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "removed": { "type": "boolean" },
+                "unit_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdServiceControlRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "unit_name": non_empty_string_with_default(crate::service::DEFAULT_SYSTEMD_UNIT),
+                "systemctl_path": non_empty_string_with_default("systemctl")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemctlCommandOutput".into(),
+        json!({
+            "type": "object",
+            "required": ["success", "status", "stdout", "stderr"],
+            "properties": {
+                "success": { "type": "boolean" },
+                "status": { "type": ["integer", "null"] },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemctlCommandErrorResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["error", "detail", "systemctl"],
+            "properties": {
+                "error": { "type": "string" },
+                "detail": { "type": "string" },
+                "systemctl": schema_ref("SystemctlCommandOutput")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdServiceStartResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "started", "unit_name", "systemctl"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "started": { "type": "boolean" },
+                "unit_name": { "type": "string" },
+                "systemctl": schema_ref("SystemctlCommandOutput")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdServiceStopResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "stopped", "unit_name", "systemctl"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "stopped": { "type": "boolean" },
+                "unit_name": { "type": "string" },
+                "systemctl": schema_ref("SystemctlCommandOutput")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SystemdServiceStatusResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "active", "unit_name", "systemctl"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["systemd"] },
+                "active": { "type": "boolean" },
+                "unit_name": { "type": "string" },
+                "systemctl": schema_ref("SystemctlCommandOutput")
+            },
+            "additionalProperties": false
+        }),
+    );
 }
 
 fn add_doctor_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
@@ -5563,7 +10400,8 @@ fn add_init_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
             "type": "object",
             "properties": {
                 "name": non_empty_string("Optional OS name override."),
-                "force": { "type": "boolean", "default": false }
+                "force": { "type": "boolean", "default": false },
+                "profile": config_profile_schema()
             },
             "additionalProperties": false
         }),
@@ -5622,6 +10460,7 @@ fn add_task_update_schemas(schemas: &mut serde_json::Map<String, serde_json::Val
                     "secret_args",
                     "cwd",
                     "required_capabilities",
+                    "max_attempts",
                 ],
                 &[
                     "clear_command",
@@ -5655,13 +10494,14 @@ fn add_task_update_schemas(schemas: &mut serde_json::Map<String, serde_json::Val
                 "tool": id_source_string("Registered tool ID to invoke."),
                 "clear_tool": { "type": "boolean", "default": false },
                 "args": string_map("Replacement plain tool arguments. Secret-like keys are rejected here."),
-                "secret_args": env_var_map("Replacement tool argument keys mapped to environment variable names."),
+                "secret_args": secret_reference_map("Replacement tool argument keys mapped to environment variable names or backend:id secret references."),
                 "clear_args": { "type": "boolean", "default": false },
                 "clear_secret_args": { "type": "boolean", "default": false },
                 "cwd": non_empty_string("Updated working directory override."),
                 "clear_cwd": { "type": "boolean", "default": false },
                 "required_capabilities": capability_array(),
-                "clear_required_capabilities": { "type": "boolean", "default": false }
+                "clear_required_capabilities": { "type": "boolean", "default": false },
+                "max_attempts": positive_integer()
             },
             "additionalProperties": false
         }),
@@ -5683,6 +10523,49 @@ fn add_workflow_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>
         }),
     );
     schemas.insert(
+        "WorkflowAddTaskRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["stage", "title"],
+            "properties": {
+                "stage": workflow_stage_schema("Workflow stage name."),
+                "title": non_empty_string("Task title for the new stage."),
+                "objective": non_empty_string("Task objective. Defaults to title."),
+                "command": non_empty_string("Optional shell command for the stage task."),
+                "required_capabilities": capability_array(),
+                "dependencies": {
+                    "type": "array",
+                    "description": "Existing workflow stages this new stage depends on.",
+                    "items": workflow_stage_schema("Workflow dependency stage.")
+                },
+                "priority": priority_input_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowEdgeRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["from", "to"],
+            "properties": {
+                "from": workflow_stage_schema("Dependency stage name."),
+                "to": workflow_stage_schema("Dependent stage name.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowNoteRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "note": non_empty_string("Optional transition note.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
         "WorkflowMutationResponse".into(),
         json!({
             "type": "object",
@@ -5699,6 +10582,123 @@ fn add_workflow_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>
                     "type": "array",
                     "items": { "type": "string" }
                 }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowAddTaskResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "stage", "task_id", "task", "progress"],
+            "properties": {
+                "id": slug_string_schema(),
+                "stage": workflow_stage_schema("Workflow stage name."),
+                "task_id": slug_string_schema(),
+                "task": schema_ref("Task"),
+                "progress": schema_ref("WorkflowProgress")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowEdgeResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "from", "to", "linked", "progress"],
+            "properties": {
+                "id": slug_string_schema(),
+                "from": workflow_stage_schema("Dependency stage name."),
+                "to": workflow_stage_schema("Dependent stage name."),
+                "linked": { "type": "boolean" },
+                "progress": schema_ref("WorkflowProgress")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowDagNode".into(),
+        json!({
+            "type": "object",
+            "required": ["stage", "task_id", "title", "status", "priority", "assigned_to", "missing"],
+            "properties": {
+                "stage": workflow_stage_schema("Workflow stage name."),
+                "task_id": slug_string_schema(),
+                "title": nullable_persisted_non_empty_string_schema(),
+                "status": nullable_schema(task_status_schema()),
+                "priority": nullable_schema(priority_schema()),
+                "assigned_to": nullable_slug_string_schema(),
+                "missing": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowDagEdge".into(),
+        json!({
+            "type": "object",
+            "required": ["from", "to", "from_task_id", "to_task_id"],
+            "properties": {
+                "from": workflow_stage_schema("Dependency stage name."),
+                "to": workflow_stage_schema("Dependent stage name."),
+                "from_task_id": slug_string_schema(),
+                "to_task_id": slug_string_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowExternalDependency".into(),
+        json!({
+            "type": "object",
+            "required": ["stage", "task_id", "dependency_task_id"],
+            "properties": {
+                "stage": workflow_stage_schema("Workflow stage name."),
+                "task_id": slug_string_schema(),
+                "dependency_task_id": slug_string_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowDag".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "objective", "priority", "nodes", "edges", "external_dependencies", "progress"],
+            "properties": {
+                "id": slug_string_schema(),
+                "objective": persisted_non_empty_string_schema(),
+                "priority": priority_schema(),
+                "nodes": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowDagNode")
+                },
+                "edges": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowDagEdge")
+                },
+                "external_dependencies": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowExternalDependency")
+                },
+                "progress": nullable_schema(schema_ref("WorkflowProgress"))
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowTransitionResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "action", "affected_tasks", "progress"],
+            "properties": {
+                "id": slug_string_schema(),
+                "action": {
+                    "type": "string",
+                    "enum": ["paused", "resumed", "retried"]
+                },
+                "affected_tasks": slug_list_schema(),
+                "progress": schema_ref("WorkflowProgress")
             },
             "additionalProperties": false
         }),
@@ -5764,6 +10764,721 @@ fn add_workflow_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>
     );
 }
 
+fn add_registry_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert(
+        "AgentProfile".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "name", "kind", "model", "capabilities", "system_prompt"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "name": persisted_non_empty_string_schema(),
+                "kind": non_empty_string("Agent kind."),
+                "model": nullable_persisted_non_empty_string_schema(),
+                "capabilities": normalized_list_schema(),
+                "system_prompt": nullable_persisted_non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowTemplate".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "name", "description", "stages", "tasks", "edges"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "name": persisted_non_empty_string_schema(),
+                "description": persisted_non_empty_string_schema(),
+                "stages": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": workflow_stage_schema("Workflow template stage.")
+                },
+                "tasks": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowTemplateTask")
+                },
+                "edges": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowTemplateEdge")
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "InstallAgentProfileRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "name": id_source_string("Optional agent display name override."),
+                "model": nullable_non_empty_string(),
+                "parallel": positive_integer_with_default(1)
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowTemplateTask".into(),
+        json!({
+            "type": "object",
+            "required": ["stage", "title", "objective", "command", "capabilities"],
+            "properties": {
+                "stage": workflow_stage_schema("Workflow template stage."),
+                "title": nullable_persisted_non_empty_string_schema(),
+                "objective": nullable_persisted_non_empty_string_schema(),
+                "command": nullable_persisted_non_empty_string_schema(),
+                "capabilities": normalized_list_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkflowTemplateEdge".into(),
+        json!({
+            "type": "object",
+            "required": ["from", "to"],
+            "properties": {
+                "from": workflow_stage_schema("Source workflow template stage."),
+                "to": workflow_stage_schema("Destination workflow template stage.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "McpServer".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "command", "args", "env", "enabled"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "command": persisted_non_empty_string_schema(),
+                "args": {
+                    "type": "array",
+                    "items": persisted_non_empty_string_schema()
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Environment variables passed to the MCP server process.",
+                    "propertyNames": { "minLength": 1, "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$" },
+                    "additionalProperties": { "type": "string" }
+                },
+                "enabled": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "RegisterMcpServerRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "command"],
+            "properties": {
+                "id": id_source_string("MCP server ID."),
+                "command": non_empty_string("MCP server stdio command."),
+                "args": {
+                    "type": "array",
+                    "items": persisted_non_empty_string_schema()
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Environment variables passed to the MCP server process.",
+                    "propertyNames": { "minLength": 1, "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$" },
+                    "additionalProperties": { "type": "string" }
+                },
+                "enabled": { "type": "boolean", "default": true }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "UpdateMcpServerRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "command": non_empty_string("MCP server stdio command."),
+                "args": {
+                    "type": "array",
+                    "items": persisted_non_empty_string_schema()
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Replacement MCP server environment map.",
+                    "propertyNames": { "minLength": 1, "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$" },
+                    "additionalProperties": { "type": "string" }
+                },
+                "enabled": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "McpServerMutationResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "mcp_server"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "mcp_server": schema_ref("McpServer")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "McpServerDeleteResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "removed", "mcp_server"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "removed": { "type": "boolean" },
+                "mcp_server": schema_ref("McpServer")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "RegistryResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["agent_profiles", "workflow_templates", "tools", "mcp_servers", "secrets_backends"],
+            "properties": {
+                "agent_profiles": string_keyed_map_schema(schema_ref("AgentProfile")),
+                "workflow_templates": string_keyed_map_schema(schema_ref("WorkflowTemplate")),
+                "tools": string_keyed_map_schema(schema_ref("ToolDefinition")),
+                "mcp_servers": string_keyed_map_schema(schema_ref("McpServer")),
+                "secrets_backends": string_keyed_map_schema(schema_ref("SecretsBackend"))
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "TemplateWorkflowRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["objective"],
+            "properties": {
+                "objective": non_empty_string("Workflow objective."),
+                "priority": priority_input_schema(),
+                "execute": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "TemplateWorkflowResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "template", "workflow", "tasks", "runs", "errors", "dag"],
+            "properties": {
+                "id": slug_string_schema(),
+                "template": persisted_non_empty_string_schema(),
+                "workflow": schema_ref("Workflow"),
+                "tasks": stage_task_map_schema(),
+                "runs": {
+                    "type": "array",
+                    "items": schema_ref("RunRecord")
+                },
+                "errors": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "dag": schema_ref("WorkflowDag")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "MarketplaceManifestMetadata".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "version", "publisher", "homepage"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "version": persisted_non_empty_string_schema(),
+                "publisher": nullable_persisted_non_empty_string_schema(),
+                "homepage": nullable_persisted_non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "MarketplaceManifest".into(),
+        json!({
+            "type": "object",
+            "required": ["metadata", "agent_profiles", "workflow_templates", "mcp_servers"],
+            "properties": {
+                "metadata": {
+                    "oneOf": [
+                        { "type": "null" },
+                        schema_ref("MarketplaceManifestMetadata")
+                    ]
+                },
+                "agent_profiles": {
+                    "type": "array",
+                    "items": schema_ref("AgentProfile")
+                },
+                "workflow_templates": {
+                    "type": "array",
+                    "items": schema_ref("WorkflowTemplate")
+                },
+                "mcp_servers": {
+                    "type": "array",
+                    "items": schema_ref("McpServer")
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "MarketplaceImportRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["manifest"],
+            "properties": {
+                "manifest": schema_ref("MarketplaceManifest"),
+                "source": persisted_non_empty_string_schema(),
+                "expect_checksum": persisted_non_empty_string_schema(),
+                "force": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "MarketplaceImportResponse".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "source",
+                "checksum",
+                "verified_checksum",
+                "manifest_id",
+                "manifest_version",
+                "imported_agent_profiles",
+                "imported_workflow_templates",
+                "imported_mcp_servers",
+                "overwritten"
+            ],
+            "properties": {
+                "source": persisted_non_empty_string_schema(),
+                "checksum": persisted_non_empty_string_schema(),
+                "verified_checksum": { "type": "boolean" },
+                "manifest_id": nullable_persisted_non_empty_string_schema(),
+                "manifest_version": nullable_persisted_non_empty_string_schema(),
+                "imported_agent_profiles": { "type": "integer", "minimum": 0 },
+                "imported_workflow_templates": { "type": "integer", "minimum": 0 },
+                "imported_mcp_servers": { "type": "integer", "minimum": 0 },
+                "overwritten": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
+fn add_approval_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert("ApprovalRequest".into(), approval_request_schema());
+    schemas.insert(
+        "ApprovalResolveRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "by": non_empty_string("Operator resolving the approval.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "ApprovalResolveResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "approval"],
+            "properties": {
+                "id": slug_string_schema(),
+                "approval": schema_ref("ApprovalRequest")
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
+fn add_worker_eval_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert(
+        "WorkerRegisterRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "endpoint"],
+            "properties": {
+                "id": id_source_string("Worker ID."),
+                "endpoint": non_empty_string("Worker endpoint."),
+                "status": agent_status_input_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerHeartbeatRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "endpoint": non_empty_string("Updated worker endpoint."),
+                "status": agent_status_input_schema(),
+                "lease_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional matching agent lease refresh in seconds."
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerReportArtifactRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["kind", "path"],
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["stdout", "stderr", "summary", "diff", "file"]
+                },
+                "path": non_empty_string("Artifact path or URI."),
+                "bytes": { "type": "integer", "minimum": 0 },
+                "content_type": non_empty_string("Artifact content type.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerReportRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["task_id"],
+            "properties": {
+                "task_id": slug_string_schema(),
+                "status": {
+                    "type": "string",
+                    "enum": ["complete", "completed", "failed"],
+                    "default": "complete"
+                },
+                "note": non_empty_string("Task output or failure note."),
+                "command": non_empty_string("Command or provider invocation executed by the worker."),
+                "cwd": non_empty_string("Worker execution directory."),
+                "exit_code": { "type": "integer" },
+                "artifacts": {
+                    "type": "array",
+                    "items": schema_ref("WorkerReportArtifactRequest")
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerMutationResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "worker"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "worker": schema_ref("WorkerNode")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerClaimResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "worker", "claimed", "assignment", "task"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "worker": schema_ref("WorkerNode"),
+                "claimed": { "type": "boolean" },
+                "assignment": nullable_schema(schema_ref("Assignment")),
+                "task": nullable_schema(schema_ref("Task"))
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerReportResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "worker", "task", "run", "reported"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "worker": schema_ref("WorkerNode"),
+                "task": schema_ref("Task"),
+                "run": schema_ref("RunRecord"),
+                "reported": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerDeleteResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "removed", "worker"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "removed": { "type": "boolean" },
+                "worker": schema_ref("WorkerNode")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "WorkerNode".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "endpoint", "status", "last_seen_at"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "endpoint": persisted_non_empty_string_schema(),
+                "status": agent_status_input_schema(),
+                "last_seen_at": date_time_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalRecordRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["target", "success"],
+            "properties": {
+                "target": non_empty_string("Eval target."),
+                "success": { "type": "boolean" },
+                "cost_micros": { "type": "integer", "minimum": 0 },
+                "latency_ms": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalRunRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["target", "command"],
+            "properties": {
+                "target": non_empty_string("Eval target."),
+                "command": non_empty_string("Shell command to evaluate."),
+                "cwd": non_empty_string("Working directory for the eval command."),
+                "success_pattern": non_empty_string("Text that stdout or stderr must contain for success."),
+                "output_schema": json_schema_object_schema("JSON schema used to validate stdout as JSON.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalMutationResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "eval"],
+            "properties": {
+                "id": slug_string_schema(),
+                "eval": schema_ref("EvalRecord")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalRunResponse".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "id",
+                "eval",
+                "command",
+                "cwd",
+                "status",
+                "stdout",
+                "stderr",
+                "success_pattern_matched",
+                "output_schema_valid",
+                "output_schema_error",
+                "timed_out"
+            ],
+            "properties": {
+                "id": slug_string_schema(),
+                "eval": schema_ref("EvalRecord"),
+                "command": persisted_non_empty_string_schema(),
+                "cwd": persisted_non_empty_string_schema(),
+                "status": { "type": ["integer", "null"] },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "success_pattern_matched": { "type": "boolean" },
+                "output_schema_valid": { "type": "boolean" },
+                "output_schema_error": nullable_persisted_non_empty_string_schema(),
+                "timed_out": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalRunDetails".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "command",
+                "cwd",
+                "status",
+                "stdout",
+                "stderr",
+                "success_pattern",
+                "success_pattern_matched",
+                "output_schema",
+                "output_schema_valid",
+                "output_schema_error",
+                "timed_out"
+            ],
+            "properties": {
+                "command": persisted_non_empty_string_schema(),
+                "cwd": persisted_non_empty_string_schema(),
+                "status": { "type": ["integer", "null"] },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "success_pattern": nullable_persisted_non_empty_string_schema(),
+                "success_pattern_matched": { "type": "boolean" },
+                "output_schema": nullable_schema(json_schema_object_schema("JSON schema used to validate stdout as JSON.")),
+                "output_schema_valid": { "type": "boolean" },
+                "output_schema_error": nullable_persisted_non_empty_string_schema(),
+                "timed_out": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "EvalRecord".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "target", "success", "cost_micros", "latency_ms", "run", "recorded_at"],
+            "properties": {
+                "id": slug_string_schema(),
+                "target": persisted_non_empty_string_schema(),
+                "success": { "type": "boolean" },
+                "cost_micros": { "type": ["integer", "null"], "minimum": 0 },
+                "latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+                "run": nullable_schema(schema_ref("EvalRunDetails")),
+                "recorded_at": date_time_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
+fn add_git_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert(
+        "GitReviewTaskRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "cwd": non_empty_string("Git workspace directory. Defaults to the API process current directory."),
+                "base": non_empty_string_with_default("main"),
+                "title": non_empty_string_with_default("Code review"),
+                "priority": priority_input_schema()
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "GitCommandResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["command", "cwd", "status", "stdout", "stderr", "dry_run"],
+            "properties": {
+                "command": {
+                    "type": "array",
+                    "items": persisted_non_empty_string_schema()
+                },
+                "cwd": persisted_non_empty_string_schema(),
+                "status": { "type": ["integer", "null"] },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "dry_run": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
+fn add_secrets_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
+    schemas.insert(
+        "SecretsRegisterRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "kind"],
+            "properties": {
+                "id": id_source_string("Secrets backend ID."),
+                "kind": secrets_backend_kind_input_schema(),
+                "reference": non_empty_string("Backend-specific reference metadata.")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SecretsMutationResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "secrets_backend"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "secrets_backend": schema_ref("SecretsBackend")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SecretsDeleteResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "removed", "secrets_backend"],
+            "properties": {
+                "id": persisted_non_empty_string_schema(),
+                "removed": { "type": "boolean" },
+                "secrets_backend": schema_ref("SecretsBackend")
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SecretCheckReference".into(),
+        json!({
+            "type": "object",
+            "required": ["task_id", "task_title", "tool_id", "arg", "env", "valid_env", "present"],
+            "properties": {
+                "task_id": slug_string_schema(),
+                "task_title": persisted_non_empty_string_schema(),
+                "tool_id": slug_string_schema(),
+                "arg": persisted_non_empty_string_schema(),
+                "env": { "type": "string" },
+                "valid_env": { "type": "boolean" },
+                "present": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "SecretCheckReport".into(),
+        json!({
+            "type": "object",
+            "required": ["total", "present", "missing", "invalid", "references"],
+            "properties": {
+                "total": { "type": "integer", "minimum": 0 },
+                "present": { "type": "integer", "minimum": 0 },
+                "missing": { "type": "integer", "minimum": 0 },
+                "invalid": { "type": "integer", "minimum": 0 },
+                "references": {
+                    "type": "array",
+                    "items": schema_ref("SecretCheckReference")
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+}
+
 fn add_tool_update_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
     schemas.insert(
         "UpdateToolRequest".into(),
@@ -5798,18 +11513,56 @@ fn add_tool_update_schemas(schemas: &mut serde_json::Map<String, serde_json::Val
 
 fn add_memory_update_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) {
     schemas.insert(
+        "PruneMemoryRequest".into(),
+        json!({
+            "type": "object",
+            "properties": {
+                "max_age_days": { "type": "integer", "minimum": 1 },
+                "dry_run": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
+        "PruneMemoryResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["dry_run", "max_age_days", "removed", "expired"],
+            "properties": {
+                "dry_run": { "type": "boolean" },
+                "max_age_days": { "type": "integer", "minimum": 1 },
+                "removed": {
+                    "type": "array",
+                    "items": schema_ref("MemoryRecord")
+                },
+                "expired": {
+                    "type": "array",
+                    "items": schema_ref("MemoryRecord")
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+    schemas.insert(
         "UpdateMemoryRequest".into(),
         json!({
             "type": "object",
-            "anyOf": update_requires_any_of(&["topic", "body", "tags"], &["clear_tags"]),
+            "anyOf": update_requires_any_of(
+                &["topic", "body", "tags", "visibility", "scope"],
+                &["clear_tags", "clear_scope"],
+            ),
             "allOf": [
-                true_flag_conflicts_with_field("clear_tags", "tags")
+                true_flag_conflicts_with_field("clear_tags", "tags"),
+                true_flag_conflicts_with_field("clear_scope", "scope")
             ],
             "properties": {
                 "topic": non_empty_string("Updated memory topic."),
                 "body": non_empty_string("Updated memory body."),
                 "tags": string_array("Replacement search tags."),
-                "clear_tags": { "type": "boolean", "default": false }
+                "clear_tags": { "type": "boolean", "default": false },
+                "visibility": memory_visibility_schema(),
+                "scope": non_empty_string("Updated memory scope."),
+                "clear_scope": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
         }),
@@ -5877,7 +11630,10 @@ fn add_entity_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
     );
     schemas.insert("ToolDefinition".into(), tool_definition_schema());
     schemas.insert("ToolInvocation".into(), tool_invocation_schema());
+    schemas.insert("MemoryPolicy".into(), memory_policy_schema());
     schemas.insert("MemoryRecord".into(), memory_record_schema());
+    schemas.insert("MemoryRecallHit".into(), memory_recall_hit_schema());
+    schemas.insert("SecretsBackend".into(), secrets_backend_schema());
     schemas.insert("Event".into(), event_schema());
     schemas.insert("DaemonState".into(), daemon_state_schema());
 }
@@ -5928,6 +11684,22 @@ fn slug_keyed_map_schema(value_schema: serde_json::Value) -> serde_json::Value {
     })
 }
 
+fn string_keyed_map_schema(value_schema: serde_json::Value) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "propertyNames": persisted_non_empty_string_schema(),
+        "additionalProperties": value_schema
+    })
+}
+
+fn json_schema_object_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": true
+    })
+}
+
 fn stage_task_map_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -5937,6 +11709,15 @@ fn stage_task_map_schema() -> serde_json::Value {
             "pattern": ".*\\S.*"
         },
         "additionalProperties": slug_string_schema()
+    })
+}
+
+fn workflow_stage_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "string",
+        "description": description,
+        "minLength": 1,
+        "pattern": r"^[^\u0000-\u001F/\\]*\S[^\u0000-\u001F/\\]*$"
     })
 }
 
@@ -6020,6 +11801,7 @@ fn operating_system_schema() -> serde_json::Value {
             "runs",
             "policy",
             "provider",
+            "memory_policy",
             "daemon",
             "tools",
             "memory",
@@ -6040,6 +11822,7 @@ fn operating_system_schema() -> serde_json::Value {
             "runs": slug_keyed_map_schema(schema_ref("RunRecord")),
             "policy": schema_ref("Policy"),
             "provider": schema_ref("ProviderSettings"),
+            "memory_policy": schema_ref("MemoryPolicy"),
             "daemon": nullable_schema(schema_ref("DaemonState")),
             "tools": slug_keyed_map_schema(schema_ref("ToolDefinition")),
             "memory": {
@@ -6108,6 +11891,8 @@ fn task_schema() -> serde_json::Value {
             "tool",
             "status",
             "assigned_to",
+            "attempts",
+            "max_attempts",
             "plan",
             "output",
             "created_at",
@@ -6125,6 +11910,8 @@ fn task_schema() -> serde_json::Value {
             "tool": nullable_schema(schema_ref("ToolInvocation")),
             "status": task_status_schema(),
             "assigned_to": nullable_slug_string_schema(),
+            "attempts": { "type": "integer", "minimum": 0 },
+            "max_attempts": { "type": "integer", "minimum": 1 },
             "plan": persisted_non_empty_string_list_schema(),
             "output": nullable_persisted_non_empty_string_schema(),
             "created_at": date_time_schema(),
@@ -6267,7 +12054,7 @@ fn tool_invocation_schema() -> serde_json::Value {
         "properties": {
             "tool_id": slug_string_schema(),
             "args": string_map("Plain tool arguments."),
-            "secret_env_args": env_var_map("Tool argument keys mapped to environment variable names.")
+            "secret_env_args": secret_reference_map("Tool argument keys mapped to environment variable names or backend:id secret references.")
         },
         "additionalProperties": false
     })
@@ -6276,14 +12063,64 @@ fn tool_invocation_schema() -> serde_json::Value {
 fn memory_record_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "required": ["id", "topic", "body", "tags", "created_at", "updated_at"],
+        "required": ["id", "topic", "body", "tags", "visibility", "scope", "created_at", "updated_at"],
         "properties": {
             "id": slug_string_schema(),
             "topic": persisted_non_empty_string_schema(),
             "body": persisted_non_empty_string_schema(),
             "tags": normalized_list_schema(),
+            "visibility": memory_visibility_schema(),
+            "scope": nullable_persisted_non_empty_string_schema(),
             "created_at": date_time_schema(),
             "updated_at": date_time_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn memory_recall_hit_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["record", "score", "snippet"],
+        "properties": {
+            "record": schema_ref("MemoryRecord"),
+            "score": non_negative_integer(),
+            "snippet": persisted_non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn memory_visibility_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["shared", "private"],
+        "default": "shared"
+    })
+}
+
+fn memory_policy_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["scope", "semantic_recall", "max_provider_memories", "max_age_days"],
+        "properties": {
+            "scope": nullable_persisted_non_empty_string_schema(),
+            "semantic_recall": { "type": "boolean", "default": false },
+            "max_provider_memories": { "type": "integer", "minimum": 1, "default": 5 },
+            "max_age_days": { "type": ["integer", "null"], "minimum": 1 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn secrets_backend_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["id", "kind", "reference"],
+        "properties": {
+            "id": persisted_non_empty_string_schema(),
+            "kind": secrets_backend_kind_schema(),
+            "reference": nullable_persisted_non_empty_string_schema()
         },
         "additionalProperties": false
     })
@@ -6389,6 +12226,11 @@ fn doctor_response_schema() -> serde_json::Value {
         "required": [
             "state_path",
             "agent_os_version",
+            "platform",
+            "service_manager",
+            "service_recommendation",
+            "shell_execution_supported",
+            "shell_execution_note",
             "state_directory",
             "state_exists",
             "state_loads",
@@ -6400,11 +12242,17 @@ fn doctor_response_schema() -> serde_json::Value {
             "config_loads",
             "config_valid",
             "config_issues",
-            "config_error"
+            "config_error",
+            "next_steps"
         ],
         "properties": {
             "state_path": { "type": "string" },
             "agent_os_version": { "type": "string" },
+            "platform": { "type": "string" },
+            "service_manager": { "type": "string", "enum": ["launchd", "systemd", "manual"] },
+            "service_recommendation": persisted_non_empty_string_schema(),
+            "shell_execution_supported": { "type": "boolean" },
+            "shell_execution_note": persisted_non_empty_string_schema(),
             "state_directory": { "type": "string" },
             "state_exists": { "type": "boolean" },
             "state_loads": { "type": "boolean" },
@@ -6422,7 +12270,11 @@ fn doctor_response_schema() -> serde_json::Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "config_error": { "type": ["string", "null"] }
+            "config_error": { "type": ["string", "null"] },
+            "next_steps": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
         },
         "additionalProperties": false
     })
@@ -6470,11 +12322,12 @@ fn config_validation_response_schema() -> serde_json::Value {
 fn app_config_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "required": ["name", "policy", "provider", "agents", "tools"],
+        "required": ["name", "policy", "provider", "memory_policy", "agents", "tools"],
         "properties": {
             "name": non_empty_string("OS name."),
             "policy": schema_ref("Policy"),
             "provider": schema_ref("ProviderSettings"),
+            "memory_policy": schema_ref("MemoryPolicy"),
             "agents": {
                 "type": "array",
                 "items": schema_ref("AgentConfig")
@@ -6500,10 +12353,15 @@ fn policy_schema() -> serde_json::Value {
             "command_timeout_seconds",
             "inherit_environment",
             "allowed_env_vars",
-            "redacted_env_patterns"
+            "redacted_env_patterns",
+            "sandbox",
+            "network",
+            "approval",
+            "autonomy",
+            "rules"
         ],
         "properties": {
-            "allow_shell": { "type": "boolean", "default": true },
+            "allow_shell": { "type": "boolean", "default": false },
             "allowed_commands": non_empty_string_list_schema(),
             "allowed_workspaces": non_empty_string_list_schema(),
             "denied_patterns": non_empty_string_list_schema(),
@@ -6519,7 +12377,45 @@ fn policy_schema() -> serde_json::Value {
             },
             "inherit_environment": { "type": "boolean", "default": false },
             "allowed_env_vars": env_var_list_schema(),
-            "redacted_env_patterns": non_empty_string_list_schema()
+            "redacted_env_patterns": non_empty_string_list_schema(),
+            "sandbox": {
+                "type": "object",
+                "required": ["process_isolation", "jailed_workspaces", "writable_paths"],
+                "properties": {
+                    "process_isolation": { "type": "boolean", "default": true },
+                    "jailed_workspaces": { "type": "boolean", "default": true },
+                    "writable_paths": non_empty_string_list_schema()
+                },
+                "additionalProperties": false
+            },
+            "network": {
+                "type": "object",
+                "required": ["mode", "allowed_hosts"],
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "default": "providers-only",
+                        "enum": ["disabled", "providers-only", "allowed"]
+                    },
+                    "allowed_hosts": non_empty_string_list_schema()
+                },
+                "additionalProperties": false
+            },
+            "approval": {
+                "type": "object",
+                "required": ["require_for_risky_actions", "risky_patterns"],
+                "properties": {
+                    "require_for_risky_actions": { "type": "boolean", "default": true },
+                    "risky_patterns": non_empty_string_list_schema()
+                },
+                "additionalProperties": false
+            },
+            "autonomy": {
+                "type": "string",
+                "default": "execute-with-approval",
+                "enum": ["observe-only", "suggest", "execute-with-approval", "execute-freely"]
+            },
+            "rules": non_empty_string_list_schema()
         },
         "additionalProperties": false
     })
@@ -6528,7 +12424,21 @@ fn policy_schema() -> serde_json::Value {
 fn provider_settings_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "required": ["kind", "model", "endpoint", "api_key_env", "request_timeout_seconds"],
+        "required": [
+            "kind",
+            "model",
+            "endpoint",
+            "api_key_env",
+            "request_timeout_seconds",
+            "max_retries",
+            "retry_backoff_ms",
+            "adapter",
+            "request_options",
+            "response_schema",
+            "plugin_command",
+            "plugin_args",
+            "plugin_env"
+        ],
         "properties": {
             "kind": {
                 "type": "string",
@@ -6550,7 +12460,52 @@ fn provider_settings_schema() -> serde_json::Value {
                 "type": "integer",
                 "minimum": 1,
                 "default": 30
-            }
+            },
+            "max_retries": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_PROVIDER_RETRIES,
+                "default": 2
+            },
+            "retry_backoff_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 250
+            },
+            "adapter": {
+                "type": ["string", "null"],
+                "pattern": r".*\S.*"
+            },
+            "request_options": {
+                "type": "object",
+                "description": "Additional provider request JSON fields such as temperature, top_p, or max_tokens. model and messages are controlled by Agent OS and cannot be overridden.",
+                "propertyNames": {
+                    "minLength": 1,
+                    "not": {
+                        "enum": ["model", "messages"]
+                    }
+                },
+                "additionalProperties": true
+            },
+            "response_schema": {
+                "type": ["object", "null"],
+                "description": "Optional lightweight response schema. Agent OS currently enforces required keys before parsing provider JSON content."
+            },
+            "plugin_command": {
+                "type": ["string", "null"],
+                "description": "Executable command for provider kind `plugin`. Agent OS sends ProviderRequest JSON on stdin and expects AgentResponse JSON or text on stdout.",
+                "pattern": r".*\S.*"
+            },
+            "plugin_args": {
+                "type": "array",
+                "items": persisted_non_empty_string_schema()
+            },
+            "plugin_env": {
+                "type": "object",
+                "description": "Environment variables passed to provider plugin commands.",
+                "propertyNames": { "minLength": 1, "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$" },
+                "additionalProperties": { "type": "string" }
+            },
         },
         "additionalProperties": false
     })
@@ -6600,7 +12555,8 @@ fn add_config_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         json!({
             "type": "object",
             "properties": {
-                "force": { "type": "boolean", "default": false }
+                "force": { "type": "boolean", "default": false },
+                "profile": config_profile_schema()
             },
             "additionalProperties": false
         }),
@@ -6609,10 +12565,11 @@ fn add_config_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
         "WriteConfigResponse".into(),
         json!({
             "type": "object",
-            "required": ["path", "written", "config"],
+            "required": ["path", "written", "profile", "config"],
             "properties": {
                 "path": { "type": "string" },
                 "written": { "type": "boolean" },
+                "profile": config_profile_schema(),
                 "config": schema_ref("AppConfig")
             },
             "additionalProperties": false
@@ -6630,81 +12587,137 @@ fn add_config_schemas(schemas: &mut serde_json::Map<String, serde_json::Value>) 
     schemas.insert("ToolConfig".into(), tool_config_schema());
 }
 
+fn config_profile_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "default": ConfigProfile::Safe.as_str(),
+        "enum": ConfigProfile::VALUES
+    })
+}
+
 fn metrics_response_schema() -> serde_json::Value {
-    let non_negative_integer = || json!({ "type": "integer", "minimum": 0 });
+    let required = vec![
+        "ok",
+        "service",
+        "agent_os_version",
+        "name",
+        "version",
+        "state_loads",
+        "state_valid",
+        "state_issue_count",
+        "state_error",
+        "agents_total",
+        "agents_online",
+        "agents_busy",
+        "agents_paused",
+        "agents_offline",
+        "tasks_total",
+        "tasks_pending",
+        "tasks_running",
+        "tasks_blocked",
+        "tasks_complete",
+        "tasks_failed",
+        "tasks_cancelled",
+        "workflows_total",
+        "runs_total",
+        "runs_running",
+        "runs_cancel_requested",
+        "runs_cancelled",
+        "runs_success",
+        "runs_failed",
+        "runs_rejected",
+        "oldest_active_run_age_ms",
+        "oldest_queued_task_age_ms",
+        "task_queue_age_ms_count",
+        "task_queue_age_ms_sum",
+        "task_queue_age_ms_buckets",
+        "run_duration_ms_count",
+        "run_duration_ms_sum",
+        "run_duration_ms_buckets",
+        "tools_total",
+        "events_total",
+        "memories_total",
+        "daemon_status",
+        "daemon_ticks",
+    ];
+    let mut properties = serde_json::Map::new();
+    for key in [
+        "state_issue_count",
+        "agents_total",
+        "agents_online",
+        "agents_busy",
+        "agents_paused",
+        "agents_offline",
+        "tasks_total",
+        "tasks_pending",
+        "tasks_running",
+        "tasks_blocked",
+        "tasks_complete",
+        "tasks_failed",
+        "tasks_cancelled",
+        "workflows_total",
+        "runs_total",
+        "runs_running",
+        "runs_cancel_requested",
+        "runs_cancelled",
+        "runs_success",
+        "runs_failed",
+        "runs_rejected",
+        "oldest_active_run_age_ms",
+        "oldest_queued_task_age_ms",
+        "task_queue_age_ms_count",
+        "task_queue_age_ms_sum",
+        "run_duration_ms_count",
+        "run_duration_ms_sum",
+        "tools_total",
+        "events_total",
+        "memories_total",
+    ] {
+        properties.insert(key.into(), non_negative_integer());
+    }
+    properties.insert("ok".into(), json!({ "type": "boolean" }));
+    properties.insert("service".into(), json!({ "type": "string" }));
+    properties.insert("agent_os_version".into(), json!({ "type": "string" }));
+    properties.insert("name".into(), json!({ "type": ["string", "null"] }));
+    properties.insert(
+        "version".into(),
+        json!({ "type": ["integer", "null"], "minimum": 0 }),
+    );
+    properties.insert("state_loads".into(), json!({ "type": "boolean" }));
+    properties.insert("state_valid".into(), json!({ "type": ["boolean", "null"] }));
+    properties.insert("state_error".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("run_duration_ms_buckets".into(), duration_buckets_schema());
+    properties.insert(
+        "task_queue_age_ms_buckets".into(),
+        duration_buckets_schema(),
+    );
+    properties.insert(
+        "daemon_status".into(),
+        json!({ "type": ["string", "null"] }),
+    );
+    properties.insert(
+        "daemon_ticks".into(),
+        json!({ "type": ["integer", "null"], "minimum": 0 }),
+    );
     json!({
         "type": "object",
-        "required": [
-            "ok",
-            "service",
-            "agent_os_version",
-            "name",
-            "version",
-            "state_loads",
-            "state_valid",
-            "state_issue_count",
-            "state_error",
-            "agents_total",
-            "agents_online",
-            "agents_busy",
-            "agents_paused",
-            "agents_offline",
-            "tasks_total",
-            "tasks_pending",
-            "tasks_running",
-            "tasks_blocked",
-            "tasks_complete",
-            "tasks_failed",
-            "tasks_cancelled",
-            "workflows_total",
-            "runs_total",
-            "runs_running",
-            "runs_cancel_requested",
-            "runs_cancelled",
-            "runs_success",
-            "runs_failed",
-            "runs_rejected",
-            "tools_total",
-            "events_total",
-            "memories_total",
-            "daemon_status",
-            "daemon_ticks"
-        ],
+        "required": required.to_vec(),
+        "properties": properties,
+        "additionalProperties": false
+    })
+}
+
+fn duration_buckets_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["le_1000", "le_5000", "le_30000", "le_60000", "le_300000", "le_inf"],
         "properties": {
-            "ok": { "type": "boolean" },
-            "service": { "type": "string" },
-            "agent_os_version": { "type": "string" },
-            "name": { "type": ["string", "null"] },
-            "version": { "type": ["integer", "null"], "minimum": 0 },
-            "state_loads": { "type": "boolean" },
-            "state_valid": { "type": ["boolean", "null"] },
-            "state_issue_count": non_negative_integer(),
-            "state_error": { "type": ["string", "null"] },
-            "agents_total": non_negative_integer(),
-            "agents_online": non_negative_integer(),
-            "agents_busy": non_negative_integer(),
-            "agents_paused": non_negative_integer(),
-            "agents_offline": non_negative_integer(),
-            "tasks_total": non_negative_integer(),
-            "tasks_pending": non_negative_integer(),
-            "tasks_running": non_negative_integer(),
-            "tasks_blocked": non_negative_integer(),
-            "tasks_complete": non_negative_integer(),
-            "tasks_failed": non_negative_integer(),
-            "tasks_cancelled": non_negative_integer(),
-            "workflows_total": non_negative_integer(),
-            "runs_total": non_negative_integer(),
-            "runs_running": non_negative_integer(),
-            "runs_cancel_requested": non_negative_integer(),
-            "runs_cancelled": non_negative_integer(),
-            "runs_success": non_negative_integer(),
-            "runs_failed": non_negative_integer(),
-            "runs_rejected": non_negative_integer(),
-            "tools_total": non_negative_integer(),
-            "events_total": non_negative_integer(),
-            "memories_total": non_negative_integer(),
-            "daemon_status": { "type": ["string", "null"] },
-            "daemon_ticks": { "type": ["integer", "null"], "minimum": 0 }
+            "le_1000": { "type": "integer", "minimum": 0 },
+            "le_5000": { "type": "integer", "minimum": 0 },
+            "le_30000": { "type": "integer", "minimum": 0 },
+            "le_60000": { "type": "integer", "minimum": 0 },
+            "le_300000": { "type": "integer", "minimum": 0 },
+            "le_inf": { "type": "integer", "minimum": 0 }
         },
         "additionalProperties": false
     })
@@ -6801,7 +12814,17 @@ fn openapi_document_schema() -> serde_json::Value {
 fn runtime_report_schema() -> serde_json::Value {
     json!({
         "type": "object",
-        "required": ["assignments", "completed_tasks", "recovered_tasks", "expired_agents", "notes"],
+        "required": [
+            "assignments",
+            "completed_tasks",
+            "recovered_tasks",
+            "recovered_runs",
+            "recovered_daemon",
+            "expired_agents",
+            "deadlocked_tasks",
+            "unscheduled_tasks",
+            "notes"
+        ],
         "properties": {
             "assignments": {
                 "type": "array",
@@ -6809,7 +12832,14 @@ fn runtime_report_schema() -> serde_json::Value {
             },
             "completed_tasks": slug_list_schema(),
             "recovered_tasks": slug_list_schema(),
+            "recovered_runs": slug_list_schema(),
+            "recovered_daemon": { "type": "boolean" },
             "expired_agents": slug_list_schema(),
+            "deadlocked_tasks": slug_list_schema(),
+            "unscheduled_tasks": {
+                "type": "array",
+                "items": schema_ref("UnscheduledTask")
+            },
             "notes": {
                 "type": "array",
                 "items": { "type": "string" }
@@ -6824,6 +12854,7 @@ fn run_record_schema() -> serde_json::Value {
         "type": "object",
         "required": [
             "id",
+            "trace_id",
             "task_id",
             "agent_id",
             "command",
@@ -6831,11 +12862,13 @@ fn run_record_schema() -> serde_json::Value {
             "status",
             "exit_code",
             "log_path",
+            "artifacts",
             "started_at",
             "finished_at"
         ],
         "properties": {
             "id": slug_string_schema(),
+            "trace_id": slug_string_schema(),
             "task_id": slug_string_schema(),
             "agent_id": nullable_slug_string_schema(),
             "command": persisted_non_empty_string_schema(),
@@ -6843,6 +12876,23 @@ fn run_record_schema() -> serde_json::Value {
             "status": run_status_schema(),
             "exit_code": { "type": ["integer", "null"] },
             "log_path": nullable_persisted_non_empty_string_schema(),
+            "artifacts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "path", "bytes", "content_type"],
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["stdout", "stderr", "summary", "diff", "file"]
+                        },
+                        "path": persisted_non_empty_string_schema(),
+                        "bytes": { "type": ["integer", "null"], "minimum": 0 },
+                        "content_type": nullable_persisted_non_empty_string_schema()
+                    },
+                    "additionalProperties": false
+                }
+            },
             "started_at": {
                 "type": "string",
                 "format": "date-time"
@@ -6906,6 +12956,215 @@ fn run_replay_response_schema() -> serde_json::Value {
             "log_tail_bytes": { "type": ["integer", "null"], "minimum": 1 },
             "log_truncated": { "type": "boolean" },
             "log_error": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_debug_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": [
+            "run",
+            "task",
+            "agent",
+            "workflows",
+            "approvals",
+            "events",
+            "log",
+            "log_tail_bytes",
+            "log_truncated",
+            "log_error",
+            "artifact_status",
+            "diagnostics"
+        ],
+        "properties": {
+            "run": schema_ref("RunRecord"),
+            "task": nullable_schema(schema_ref("Task")),
+            "agent": nullable_schema(schema_ref("Agent")),
+            "workflows": {
+                "type": "array",
+                "items": schema_ref("Workflow")
+            },
+            "approvals": {
+                "type": "array",
+                "items": approval_request_schema()
+            },
+            "events": {
+                "type": "array",
+                "items": schema_ref("Event")
+            },
+            "log": { "type": ["string", "null"] },
+            "log_tail_bytes": { "type": ["integer", "null"], "minimum": 1 },
+            "log_truncated": { "type": "boolean" },
+            "log_error": { "type": ["string", "null"] },
+            "artifact_status": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["artifact", "exists"],
+                    "properties": {
+                        "artifact": run_artifact_schema(),
+                        "exists": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "diagnostics": {
+                "type": "object",
+                "required": [
+                    "log_path",
+                    "related_events",
+                    "related_workflows",
+                    "related_approvals",
+                    "artifacts"
+                ],
+                "properties": {
+                    "log_path": { "type": ["string", "null"], "minLength": 1 },
+                    "related_events": { "type": "integer", "minimum": 0 },
+                    "related_workflows": { "type": "integer", "minimum": 0 },
+                    "related_approvals": { "type": "integer", "minimum": 0 },
+                    "artifacts": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_artifacts_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["run_id", "artifacts"],
+        "properties": {
+            "run_id": slug_string_schema(),
+            "artifacts": {
+                "type": "array",
+                "items": run_artifact_entry_schema()
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_artifact_entry_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": [
+            "id",
+            "index",
+            "name",
+            "artifact",
+            "exists",
+            "readable",
+            "bytes",
+            "checksum",
+            "error"
+        ],
+        "properties": {
+            "id": persisted_non_empty_string_schema(),
+            "index": { "type": "integer", "minimum": 0 },
+            "name": {
+                "type": "string",
+                "enum": ["stdout", "stderr", "summary", "diff", "file"]
+            },
+            "artifact": run_artifact_schema(),
+            "exists": { "type": "boolean" },
+            "readable": { "type": "boolean" },
+            "bytes": { "type": ["integer", "null"], "minimum": 0 },
+            "checksum": nullable_persisted_non_empty_string_schema(),
+            "error": { "type": ["string", "null"], "minLength": 1 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_artifact_read_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": [
+            "run_id",
+            "artifact_id",
+            "index",
+            "artifact",
+            "exists",
+            "bytes",
+            "checksum",
+            "content_type",
+            "tail_bytes",
+            "truncated",
+            "body",
+            "error"
+        ],
+        "properties": {
+            "run_id": slug_string_schema(),
+            "artifact_id": persisted_non_empty_string_schema(),
+            "index": { "type": "integer", "minimum": 0 },
+            "artifact": run_artifact_schema(),
+            "exists": { "type": "boolean" },
+            "bytes": { "type": ["integer", "null"], "minimum": 0 },
+            "checksum": nullable_persisted_non_empty_string_schema(),
+            "content_type": nullable_persisted_non_empty_string_schema(),
+            "tail_bytes": { "type": ["integer", "null"], "minimum": 1 },
+            "truncated": { "type": "boolean" },
+            "body": { "type": ["string", "null"] },
+            "error": { "type": ["string", "null"], "minLength": 1 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn approval_request_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": [
+            "id",
+            "task_id",
+            "run_id",
+            "action",
+            "reason",
+            "status",
+            "requested_at",
+            "resolved_at",
+            "resolved_by"
+        ],
+        "properties": {
+            "id": slug_string_schema(),
+            "task_id": slug_string_schema(),
+            "run_id": nullable_slug_string_schema(),
+            "action": persisted_non_empty_string_schema(),
+            "reason": persisted_non_empty_string_schema(),
+            "status": {
+                "type": "string",
+                "enum": ["pending", "approved", "denied"]
+            },
+            "requested_at": {
+                "type": "string",
+                "format": "date-time"
+            },
+            "resolved_at": {
+                "type": ["string", "null"],
+                "format": "date-time"
+            },
+            "resolved_by": nullable_persisted_non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_artifact_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "path", "bytes", "content_type"],
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["stdout", "stderr", "summary", "diff", "file"]
+            },
+            "path": persisted_non_empty_string_schema(),
+            "bytes": { "type": ["integer", "null"], "minimum": 0 },
+            "content_type": nullable_persisted_non_empty_string_schema()
         },
         "additionalProperties": false
     })
@@ -6993,14 +13252,14 @@ fn string_map(description: &str) -> serde_json::Value {
     })
 }
 
-fn env_var_map(description: &str) -> serde_json::Value {
+fn secret_reference_map(description: &str) -> serde_json::Value {
     json!({
         "type": "object",
         "description": description,
         "additionalProperties": {
             "type": "string",
             "minLength": 1,
-            "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"
+            "pattern": r"^(?:[A-Za-z_][A-Za-z0-9_]*|[A-Za-z0-9][A-Za-z0-9_-]*:[^\s\u0000][^\u0000]*)$"
         },
         "propertyNames": { "minLength": 1, "pattern": "^(?!\\s)(?!.*\\s$)[^=\\u0000]+$" },
     })
@@ -7089,6 +13348,20 @@ fn agent_status_input_schema() -> serde_json::Value {
     })
 }
 
+fn secrets_backend_kind_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": SECRETS_BACKEND_KIND_VALUES,
+    })
+}
+
+fn secrets_backend_kind_input_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": SECRETS_BACKEND_KIND_INPUT_VALUES,
+    })
+}
+
 fn daemon_status_schema() -> serde_json::Value {
     json!({
         "type": "string",
@@ -7170,6 +13443,12 @@ fn endpoint(summary: &str) -> serde_json::Value {
     })
 }
 
+fn get_endpoint(summary: &str, response_schema: serde_json::Value) -> serde_json::Value {
+    let mut endpoint = endpoint(summary);
+    endpoint["get"]["responses"]["200"]["content"] = json_response(response_schema);
+    endpoint
+}
+
 fn openapi_json_endpoint() -> serde_json::Value {
     let mut endpoint = endpoint("Get this API schema");
     endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("OpenApiDocument"));
@@ -7238,6 +13517,35 @@ fn metrics_endpoint() -> serde_json::Value {
     endpoint["get"]["responses"]["503"] = json!({
         "description": "State unavailable",
         "content": json_response(schema_ref("MetricsResponse"))
+    });
+    endpoint
+}
+
+fn prometheus_metrics_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Aggregate monitor metrics in Prometheus text format");
+    let content = json!({
+        "text/plain; version=0.0.4": {
+            "schema": {
+                "type": "string"
+            }
+        }
+    });
+    endpoint["get"]["responses"]["200"]["content"] = content.clone();
+    endpoint["get"]["responses"]["503"] = json!({
+        "description": "State unavailable",
+        "content": json_response(schema_ref("ErrorResponse"))
+    });
+    endpoint
+}
+
+fn dashboard_html_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Render the local operator dashboard");
+    endpoint["get"]["responses"]["200"]["content"] = json!({
+        "text/html": {
+            "schema": {
+                "type": "string"
+            }
+        }
     });
     endpoint
 }
@@ -7523,6 +13831,43 @@ fn workflow_status_endpoint() -> serde_json::Value {
     endpoint
 }
 
+fn workflow_dag_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Get workflow DAG nodes and dependency edges");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("WorkflowDag"));
+    endpoint
+}
+
+fn workflow_add_task_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_body(
+        "Add a task stage to a workflow DAG",
+        schema_ref("WorkflowAddTaskRequest"),
+    );
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("WorkflowAddTaskResponse"))
+    });
+    endpoint["post"]["responses"]["422"] = error_response_with_description("Unprocessable request");
+    endpoint
+}
+
+fn workflow_edge_endpoint(summary: &str) -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_body(summary, schema_ref("WorkflowEdgeRequest"));
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkflowEdgeResponse"));
+    endpoint
+}
+
+fn workflow_transition_endpoint(summary: &str) -> serde_json::Value {
+    let mut endpoint =
+        mutation_endpoint_with_optional_body(summary, schema_ref("WorkflowNoteRequest"));
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkflowTransitionResponse"));
+    endpoint
+}
+
 fn workflow_run_endpoint() -> serde_json::Value {
     let mut endpoint = mutation_endpoint("Execute the next runnable workflow stage");
     endpoint["post"]["requestBody"] = optional_request_body(schema_ref("RunWorkflowRequest"));
@@ -7536,6 +13881,402 @@ fn workflow_cancel_endpoint() -> serde_json::Value {
     endpoint["post"]["requestBody"] = optional_request_body(schema_ref("FinishTaskRequest"));
     endpoint["post"]["responses"]["200"]["content"] =
         json_response(schema_ref("WorkflowCancelResponse"));
+    endpoint
+}
+
+fn approvals_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("List approval gates");
+    endpoint["get"]["responses"]["200"]["content"] = array_response(schema_ref("ApprovalRequest"));
+    endpoint
+}
+
+fn approval_resolve_endpoint(summary: &str) -> serde_json::Value {
+    let mut endpoint =
+        mutation_endpoint_with_optional_body(summary, schema_ref("ApprovalResolveRequest"));
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("ApprovalResolveResponse"));
+    endpoint
+}
+
+fn workers_endpoint() -> serde_json::Value {
+    let mut endpoint = collection_endpoint_with_body(
+        "List distributed worker nodes",
+        "Register a distributed worker node",
+        schema_ref("WorkerRegisterRequest"),
+    );
+    endpoint["get"]["responses"]["200"]["content"] = array_response(schema_ref("WorkerNode"));
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("WorkerMutationResponse"))
+    });
+    endpoint["get"]["parameters"] = json!([
+        {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "description": "Filter workers by status. Aliases `up`, `pause`, and `down` map to `online`, `paused`, and `offline`.",
+            "schema": agent_status_input_schema()
+        },
+        {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Filter workers seen at or after this RFC3339 timestamp.",
+            "schema": date_time_schema()
+        },
+        {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Filter workers seen at or before this RFC3339 timestamp.",
+            "schema": date_time_schema()
+        },
+        {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive worker text search over ID, endpoint, and status.",
+            "schema": non_empty_string("Worker search query.")
+        },
+        {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of recently seen workers to return.",
+            "schema": positive_integer()
+        }
+    ]);
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
+fn worker_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = detail_delete_endpoint("Get one distributed worker", "Remove one worker");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("WorkerNode"));
+    endpoint["delete"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkerDeleteResponse"));
+    endpoint
+}
+
+fn worker_heartbeat_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Record a worker heartbeat",
+        schema_ref("WorkerHeartbeatRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkerMutationResponse"));
+    endpoint
+}
+
+fn worker_claim_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Claim the next ready task for a matching worker agent",
+        schema_ref("ClaimTaskRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkerClaimResponse"));
+    endpoint
+}
+
+fn worker_report_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_body(
+        "Report completion or failure for a claimed worker task",
+        schema_ref("WorkerReportRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("WorkerReportResponse"));
+    endpoint
+}
+
+fn evals_endpoint() -> serde_json::Value {
+    let mut endpoint = collection_endpoint_with_body(
+        "List eval records",
+        "Record an eval result",
+        schema_ref("EvalRecordRequest"),
+    );
+    endpoint["get"]["responses"]["200"]["content"] = array_response(schema_ref("EvalRecord"));
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("EvalMutationResponse"))
+    });
+    endpoint["get"]["parameters"] = json!([
+        {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "description": "Filter evals by target.",
+            "schema": non_empty_string("Eval target.")
+        },
+        {
+            "name": "success",
+            "in": "query",
+            "required": false,
+            "description": "Filter evals by success value.",
+            "schema": { "type": "boolean" }
+        },
+        {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Filter evals recorded at or after this RFC3339 timestamp.",
+            "schema": date_time_schema()
+        },
+        {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Filter evals recorded at or before this RFC3339 timestamp.",
+            "schema": date_time_schema()
+        },
+        {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive eval text search over ID, target, and success.",
+            "schema": non_empty_string("Eval search query.")
+        },
+        {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of recent evals to return.",
+            "schema": positive_integer()
+        }
+    ]);
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
+fn eval_run_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint("Run and record a local eval command");
+    endpoint["post"]["requestBody"] = request_body(schema_ref("EvalRunRequest"));
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("EvalRunResponse"))
+    });
+    endpoint
+}
+
+fn eval_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Get one eval record");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("EvalRecord"));
+    endpoint
+}
+
+fn git_status_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Inspect git status for a local workspace");
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(schema_ref("GitCommandResponse"));
+    endpoint["get"]["parameters"] = json!([
+        {
+            "name": "cwd",
+            "in": "query",
+            "required": false,
+            "description": "Workspace directory. Defaults to the API process current directory.",
+            "schema": non_empty_string("Git working directory.")
+        }
+    ]);
+    endpoint["get"]["responses"]["400"] = error_response_with_description("Invalid git request");
+    endpoint
+}
+
+fn git_review_task_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Create an Agent OS code-review task for a git diff",
+        schema_ref("GitReviewTaskRequest"),
+    );
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("TaskMutationResponse"))
+    });
+    endpoint["post"]["responses"]["400"] = error_response_with_description("Invalid git request");
+    endpoint
+}
+
+fn secrets_endpoint() -> serde_json::Value {
+    let mut endpoint = collection_endpoint_with_body(
+        "List secret manager backends",
+        "Register a secret manager backend",
+        schema_ref("SecretsRegisterRequest"),
+    );
+    endpoint["get"]["responses"]["200"]["content"] = array_response(schema_ref("SecretsBackend"));
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("SecretsMutationResponse"))
+    });
+    endpoint["get"]["parameters"] = json!([
+        {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Filter secret manager backends by kind.",
+            "schema": secrets_backend_kind_input_schema()
+        },
+        {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive secrets backend search over ID, kind, and reference.",
+            "schema": non_empty_string("Secrets backend search query.")
+        },
+        {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of backends to return.",
+            "schema": positive_integer()
+        }
+    ]);
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
+fn secrets_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = detail_delete_endpoint(
+        "Get one secret manager backend",
+        "Remove one secret manager backend",
+    );
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("SecretsBackend"));
+    endpoint["delete"]["responses"]["200"]["content"] =
+        json_response(schema_ref("SecretsDeleteResponse"));
+    endpoint
+}
+
+fn secrets_check_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Check task secret environment references without exposing values");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("SecretCheckReport"));
+    endpoint
+}
+
+fn registry_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("List reusable registry entries");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("RegistryResponse"));
+    endpoint
+}
+
+fn registry_profiles_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("List reusable agent profiles");
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(string_keyed_map_schema(schema_ref("AgentProfile")));
+    endpoint
+}
+
+fn registry_profile_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Get one reusable agent profile");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("AgentProfile"));
+    endpoint
+}
+
+fn registry_profile_agents_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Install an agent from a reusable profile",
+        schema_ref("InstallAgentProfileRequest"),
+    );
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("AgentMutationResponse"))
+    });
+    endpoint["post"]["responses"]["409"]["content"] = json_response(schema_ref("ErrorResponse"));
+    endpoint
+}
+
+fn registry_templates_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("List reusable workflow templates");
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(string_keyed_map_schema(schema_ref("WorkflowTemplate")));
+    endpoint
+}
+
+fn registry_template_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Get one reusable workflow template");
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("WorkflowTemplate"));
+    endpoint
+}
+
+fn registry_template_workflows_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_body(
+        "Create a workflow from a reusable template",
+        schema_ref("TemplateWorkflowRequest"),
+    );
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("TemplateWorkflowResponse"))
+    });
+    endpoint
+}
+
+fn registry_marketplace_import_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_body(
+        "Import marketplace registry entries",
+        schema_ref("MarketplaceImportRequest"),
+    );
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Imported",
+        "content": json_response(schema_ref("MarketplaceImportResponse"))
+    });
+    endpoint
+}
+
+fn registry_mcp_servers_endpoint() -> serde_json::Value {
+    let mut endpoint = collection_endpoint_with_body(
+        "List registered MCP servers",
+        "Register an MCP server",
+        schema_ref("RegisterMcpServerRequest"),
+    );
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(string_keyed_map_schema(schema_ref("McpServer")));
+    if let Some(responses) = endpoint["post"]["responses"].as_object_mut() {
+        responses.remove("200");
+    }
+    endpoint["post"]["responses"]["201"] = json!({
+        "description": "Created",
+        "content": json_response(schema_ref("McpServerMutationResponse"))
+    });
+    endpoint
+}
+
+fn registry_mcp_server_detail_endpoint() -> serde_json::Value {
+    let mut endpoint = detail_delete_endpoint(
+        "Get one registered MCP server",
+        "Remove one registered MCP server",
+    );
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("McpServer"));
+    endpoint["post"] = mutation_endpoint_with_body(
+        "Update one registered MCP server",
+        schema_ref("UpdateMcpServerRequest"),
+    )["post"]
+        .clone();
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("McpServerMutationResponse"));
+    endpoint["delete"]["responses"]["200"]["content"] =
+        json_response(schema_ref("McpServerDeleteResponse"));
     endpoint
 }
 
@@ -7777,6 +14518,20 @@ fn memory_endpoint() -> serde_json::Value {
             "schema": normalized_list_string_schema()
         },
         {
+            "name": "visibility",
+            "in": "query",
+            "required": false,
+            "description": "Filter memory records by visibility.",
+            "schema": memory_visibility_schema()
+        },
+        {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "description": "Filter memory records by scope. Empty values are rejected.",
+            "schema": persisted_non_empty_string_schema()
+        },
+        {
             "name": "since",
             "in": "query",
             "required": false,
@@ -7806,6 +14561,92 @@ fn memory_endpoint() -> serde_json::Value {
     ]);
     endpoint["get"]["responses"]["400"] =
         error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
+fn memory_recall_endpoint() -> serde_json::Value {
+    let mut endpoint = get_endpoint(
+        "Recall scored memory snippets",
+        json!({
+            "type": "array",
+            "items": schema_ref("MemoryRecallHit")
+        }),
+    );
+    endpoint["get"]["parameters"] = json!([
+        {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "description": "Memory recall query. Empty values are rejected.",
+            "schema": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": r".*\S.*"
+            }
+        },
+        {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "description": "Filter recall records that have this tag. Comma-separated values require all listed tags.",
+            "schema": normalized_list_string_schema()
+        },
+        {
+            "name": "visibility",
+            "in": "query",
+            "required": false,
+            "description": "Filter recall records by visibility.",
+            "schema": memory_visibility_schema()
+        },
+        {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "description": "Filter recall records by scope. Empty values are rejected.",
+            "schema": persisted_non_empty_string_schema()
+        },
+        {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Filter recall records updated at or after this RFC3339 timestamp.",
+            "schema": {
+                "type": "string",
+                "format": "date-time"
+            }
+        },
+        {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Filter recall records updated at or before this RFC3339 timestamp.",
+            "schema": {
+                "type": "string",
+                "format": "date-time"
+            }
+        },
+        {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of scored recall hits to return. Must be greater than 0.",
+            "schema": positive_integer()
+        }
+    ]);
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid memory recall query parameter");
+    endpoint
+}
+
+fn memory_prune_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Prune expired memory records",
+        schema_ref("PruneMemoryRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("PruneMemoryResponse"));
+    endpoint["post"]["responses"]["400"] =
+        error_response_with_description("Invalid memory prune request");
     endpoint
 }
 
@@ -7845,6 +14686,32 @@ fn run_replay_endpoint() -> serde_json::Value {
     endpoint
 }
 
+fn run_debug_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Debug run with replay, agent, workflow, approvals, and artifacts");
+    endpoint["get"]["parameters"] = log_tail_parameters();
+    endpoint["get"]["responses"]["200"]["content"] = json_response(schema_ref("RunDebugResponse"));
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
+fn run_artifacts_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("List run artifacts");
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(schema_ref("RunArtifactsResponse"));
+    endpoint
+}
+
+fn run_artifact_endpoint() -> serde_json::Value {
+    let mut endpoint = endpoint("Read one run artifact");
+    endpoint["get"]["parameters"] = log_tail_parameters();
+    endpoint["get"]["responses"]["200"]["content"] =
+        json_response(schema_ref("RunArtifactReadResponse"));
+    endpoint["get"]["responses"]["400"] =
+        error_response_with_description("Invalid query parameter");
+    endpoint
+}
+
 fn log_tail_parameters() -> serde_json::Value {
     json!([
         {
@@ -7869,6 +14736,34 @@ fn with_id_parameter(mut endpoint: serde_json::Value, description: &str) -> serd
             operation["parameters"] = json!(parameters);
             add_response_if_missing(operation, "400", "Invalid path parameter");
             add_response_if_missing(operation, "404", "Record not found");
+        }
+    }
+    endpoint
+}
+
+fn with_artifact_id_parameter(mut endpoint: serde_json::Value) -> serde_json::Value {
+    for method in ["get", "post", "delete"] {
+        if let Some(operation) = endpoint.get_mut(method) {
+            let mut parameters = operation
+                .get("parameters")
+                .and_then(|parameters| parameters.as_array())
+                .cloned()
+                .unwrap_or_default();
+            parameters.insert(
+                0,
+                json!({
+                    "name": "artifact_id",
+                    "in": "path",
+                    "required": true,
+                    "description": "Run artifact ID, artifact kind, or zero-based artifact index.",
+                    "schema": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": ".*\\S.*"
+                    }
+                }),
+            );
+            operation["parameters"] = json!(parameters);
         }
     }
     endpoint
@@ -8064,6 +14959,70 @@ fn service_launchd_status_endpoint() -> serde_json::Value {
     endpoint
 }
 
+fn service_systemd_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Render systemd user service unit",
+        schema_ref("SystemdServiceRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("SystemdServiceResponse"));
+    endpoint
+}
+
+fn service_systemd_install_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Install systemd user service unit",
+        schema_ref("SystemdServiceRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("InstallSystemdServiceResponse"));
+    endpoint
+}
+
+fn service_systemd_uninstall_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Uninstall systemd user service unit",
+        schema_ref("UninstallSystemdServiceRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("UninstallSystemdServiceResponse"));
+    endpoint
+}
+
+fn service_systemd_start_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Start systemd user service",
+        schema_ref("SystemdServiceControlRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("SystemdServiceStartResponse"));
+    endpoint["post"]["responses"]["409"]["content"] =
+        json_response(schema_ref("SystemctlCommandErrorResponse"));
+    endpoint
+}
+
+fn service_systemd_stop_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Stop systemd user service",
+        schema_ref("SystemdServiceControlRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("SystemdServiceStopResponse"));
+    endpoint["post"]["responses"]["409"]["content"] =
+        json_response(schema_ref("SystemctlCommandErrorResponse"));
+    endpoint
+}
+
+fn service_systemd_status_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Read systemd user service status",
+        schema_ref("SystemdServiceControlRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("SystemdServiceStatusResponse"));
+    endpoint
+}
+
 fn task_plan_endpoint() -> serde_json::Value {
     let mut endpoint =
         mutation_endpoint_with_body("Replace a task plan", schema_ref("PlanTaskRequest"));
@@ -8195,6 +15154,16 @@ fn state_migrate_endpoint() -> serde_json::Value {
     );
     endpoint["post"]["responses"]["200"]["content"] =
         json_response(schema_ref("MigrateStateResponse"));
+    endpoint
+}
+
+fn state_sqlite_endpoint() -> serde_json::Value {
+    let mut endpoint = mutation_endpoint_with_optional_body(
+        "Initialize, sync, or restore a SQLite state mirror",
+        schema_ref("StateSqliteRequest"),
+    );
+    endpoint["post"]["responses"]["200"]["content"] =
+        json_response(schema_ref("StateSqliteResponse"));
     endpoint
 }
 
@@ -8360,8 +15329,49 @@ fn response_for_detail_path(
             },
             Err(response) => response,
         }),
+        ["workflows", id, "dag"] => Some(match parse_workflow_path_id(id) {
+            Ok(id) => workflow_dag_json(os, &id, query),
+            Err(response) => response,
+        }),
+        ["registry", "profiles", id] => Some(match parse_registry_path_id("profile id", id) {
+            Ok(id) => json_detail(os.agent_profiles.get(&id), "agent profile not found"),
+            Err(response) => response,
+        }),
+        ["registry", "templates", id] => Some(match parse_registry_path_id("template id", id) {
+            Ok(id) => json_detail(
+                os.workflow_templates.get(&id),
+                "workflow template not found",
+            ),
+            Err(response) => response,
+        }),
+        ["registry", "mcp-servers", id] => {
+            Some(match parse_registry_path_id("mcp server id", id) {
+                Ok(id) => json_detail(os.mcp_servers.get(&id), "mcp server not found"),
+                Err(response) => response,
+            })
+        }
+        ["workers", id] => Some(match parse_worker_path_id(id) {
+            Ok(id) => json_detail(os.workers.get(&id), "worker not found"),
+            Err(response) => response,
+        }),
+        ["evals", id] => Some(match parse_eval_path_id(id) {
+            Ok(id) => json_detail(
+                os.evals.iter().find(|record| record.id == id),
+                "eval not found",
+            ),
+            Err(response) => response,
+        }),
+        ["secrets", "check"] => Some(("200 OK", json!(secret_check_report(os)).to_string())),
+        ["secrets", id] => Some(match parse_secrets_backend_path_id(id) {
+            Ok(id) => json_detail(os.secrets_backends.get(&id), "secrets backend not found"),
+            Err(response) => response,
+        }),
         ["tools", id] => Some(match parse_tool_path_id(id) {
             Ok(id) => json_detail(os.tools.get(&id), "tool not found"),
+            Err(response) => response,
+        }),
+        ["memory", "recall"] => Some(match memory_recall_json(os, query) {
+            Ok(recall) => ("200 OK", recall.to_string()),
             Err(response) => response,
         }),
         ["memory", id] => Some(match parse_memory_path_id(id) {
@@ -8381,6 +15391,18 @@ fn response_for_detail_path(
         }),
         ["runs", id, "replay"] => Some(match parse_run_path_id(id) {
             Ok(id) => run_replay_response(store, os, &id, query),
+            Err(response) => response,
+        }),
+        ["runs", id, "debug"] => Some(match parse_run_path_id(id) {
+            Ok(id) => run_debug_response(store, os, &id, query),
+            Err(response) => response,
+        }),
+        ["runs", id, "artifacts"] => Some(match parse_run_path_id(id) {
+            Ok(id) => run_artifacts_response(os, &id, query),
+            Err(response) => response,
+        }),
+        ["runs", id, "artifacts", artifact_id] => Some(match parse_run_path_id(id) {
+            Ok(id) => run_artifact_response(os, &id, artifact_id, query),
             Err(response) => response,
         }),
         _ => None,
@@ -8510,6 +15532,383 @@ fn run_replay_response(
     )
 }
 
+fn run_debug_response(
+    store: Option<&Store>,
+    os: &OperatingSystem,
+    id: &RunId,
+    query: &str,
+) -> (&'static str, String) {
+    let Some(run) = os.runs.get(id) else {
+        return (
+            "404 Not Found",
+            json!({ "error": "run not found" }).to_string(),
+        );
+    };
+    if let Err(response) = reject_unknown_query_keys(query, &["tail_bytes"]) {
+        return response;
+    }
+    let tail_bytes = match positive_query_usize(query, "tail_bytes") {
+        Ok(tail_bytes) => tail_bytes,
+        Err(response) => return response,
+    };
+    let mut log_truncated = false;
+    let (log, log_error, log_path) = match store {
+        Some(store) => {
+            let log_path = store.run_log_path(id);
+            match std::fs::read_to_string(&log_path) {
+                Ok(body) => {
+                    log_truncated = text_tail_was_truncated(&body, tail_bytes);
+                    (
+                        Some(tail_text_by_bytes(&body, tail_bytes)),
+                        None,
+                        Some(log_path.display().to_string()),
+                    )
+                }
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "could not read run log: {}: {error}",
+                        log_path.display()
+                    )),
+                    Some(log_path.display().to_string()),
+                ),
+            }
+        }
+        None => (None, Some("store unavailable".to_owned()), None),
+    };
+    let related_events = os
+        .events
+        .iter()
+        .filter(|event| {
+            event.message.contains(&run.id.to_string())
+                || event.message.contains(&run.task_id.to_string())
+        })
+        .collect::<Vec<_>>();
+    let workflows = os
+        .workflows
+        .values()
+        .filter(|workflow| {
+            workflow
+                .tasks
+                .values()
+                .any(|task_id| task_id == &run.task_id)
+        })
+        .collect::<Vec<_>>();
+    let approvals = os
+        .approvals
+        .values()
+        .filter(|approval| approval.task_id == run.task_id || approval.run_id.as_ref() == Some(id))
+        .collect::<Vec<_>>();
+    let artifact_status = run
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "artifact": artifact,
+                "exists": Path::new(&artifact.path).exists(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (
+        "200 OK",
+        json!({
+            "run": run,
+            "task": os.tasks.get(&run.task_id),
+            "agent": run.agent_id.as_ref().and_then(|agent_id| os.agents.get(agent_id)),
+            "workflows": workflows,
+            "approvals": approvals,
+            "events": related_events,
+            "log": log,
+            "log_tail_bytes": tail_bytes,
+            "log_truncated": log_truncated,
+            "log_error": log_error,
+            "artifact_status": artifact_status,
+            "diagnostics": {
+                "log_path": log_path,
+                "related_events": related_events.len(),
+                "related_workflows": workflows.len(),
+                "related_approvals": approvals.len(),
+                "artifacts": run.artifacts.len(),
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn run_artifacts_response(os: &OperatingSystem, id: &RunId, query: &str) -> (&'static str, String) {
+    let Some(run) = os.runs.get(id) else {
+        return (
+            "404 Not Found",
+            json!({ "error": "run not found" }).to_string(),
+        );
+    };
+    if let Err(response) = reject_unknown_query_keys(query, &[]) {
+        return response;
+    }
+    (
+        "200 OK",
+        json!({
+            "run_id": id,
+            "artifacts": run_artifact_entries(run),
+        })
+        .to_string(),
+    )
+}
+
+fn run_artifact_response(
+    os: &OperatingSystem,
+    id: &RunId,
+    artifact_id: &str,
+    query: &str,
+) -> (&'static str, String) {
+    let Some(run) = os.runs.get(id) else {
+        return (
+            "404 Not Found",
+            json!({ "error": "run not found" }).to_string(),
+        );
+    };
+    if let Err(response) = reject_unknown_query_keys(query, &["tail_bytes"]) {
+        return response;
+    }
+    let tail_bytes = match positive_query_usize(query, "tail_bytes") {
+        Ok(tail_bytes) => tail_bytes,
+        Err(response) => return response,
+    };
+    let Some((index, artifact)) = find_run_artifact(run, artifact_id) else {
+        return (
+            "404 Not Found",
+            json!({ "error": "run artifact not found" }).to_string(),
+        );
+    };
+    let artifact_id = run_artifact_id(run, index, artifact);
+    (
+        "200 OK",
+        run_artifact_read_json(run, index, &artifact_id, artifact, tail_bytes).to_string(),
+    )
+}
+
+fn run_artifact_entries(run: &RunRecord) -> Vec<serde_json::Value> {
+    run.artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            let id = run_artifact_id(run, index, artifact);
+            let status = run_artifact_file_status(artifact);
+            json!({
+                "id": id,
+                "index": index,
+                "name": run_artifact_kind_name(&artifact.kind),
+                "artifact": artifact,
+                "exists": status.exists,
+                "readable": status.readable,
+                "bytes": status.bytes.or(artifact.bytes),
+                "checksum": status.checksum,
+                "error": status.error,
+            })
+        })
+        .collect()
+}
+
+fn run_artifact_read_json(
+    run: &RunRecord,
+    index: usize,
+    artifact_id: &str,
+    artifact: &RunArtifact,
+    tail_bytes: Option<usize>,
+) -> serde_json::Value {
+    match run_artifact_body(run, artifact, tail_bytes) {
+        Ok(body) => json!({
+            "run_id": run.id,
+            "artifact_id": artifact_id,
+            "index": index,
+            "artifact": artifact,
+            "exists": true,
+            "bytes": body.bytes,
+            "checksum": body.checksum,
+            "content_type": body.content_type,
+            "tail_bytes": tail_bytes,
+            "truncated": body.truncated,
+            "body": body.body,
+            "error": serde_json::Value::Null,
+        }),
+        Err(error) => json!({
+            "run_id": run.id,
+            "artifact_id": artifact_id,
+            "index": index,
+            "artifact": artifact,
+            "exists": false,
+            "bytes": artifact.bytes,
+            "checksum": serde_json::Value::Null,
+            "content_type": artifact.content_type,
+            "tail_bytes": tail_bytes,
+            "truncated": false,
+            "body": serde_json::Value::Null,
+            "error": error,
+        }),
+    }
+}
+
+struct ArtifactBody {
+    body: String,
+    bytes: u64,
+    checksum: String,
+    content_type: String,
+    truncated: bool,
+}
+
+fn run_artifact_body(
+    run: &RunRecord,
+    artifact: &RunArtifact,
+    tail_bytes: Option<usize>,
+) -> Result<ArtifactBody, String> {
+    if matches!(artifact.kind, RunArtifactKind::Summary) && artifact.path.starts_with("run:") {
+        let body = format!(
+            "run: {}\nstatus: {}\ntask: {}\nagent: {}\ncommand: {}\ncwd: {}\nexit: {}\nstarted: {}\nfinished: {}\n",
+            run.id,
+            run.status,
+            run.task_id,
+            run.agent_id
+                .as_ref()
+                .map(AgentId::to_string)
+                .unwrap_or_else(|| "-".into()),
+            run.command,
+            run.cwd,
+            run.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".into()),
+            run.started_at.to_rfc3339(),
+            run.finished_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+        );
+        return Ok(artifact_body_from_string(
+            body,
+            tail_bytes,
+            artifact
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "text/plain".into()),
+        ));
+    }
+
+    let bytes = std::fs::read(&artifact.path)
+        .map_err(|error| format!("could not read artifact {}: {error}", artifact.path))?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(artifact_body_from_string(
+        body,
+        tail_bytes,
+        artifact
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".into()),
+    ))
+}
+
+fn artifact_body_from_string(
+    body: String,
+    tail_bytes: Option<usize>,
+    content_type: String,
+) -> ArtifactBody {
+    let bytes = body.len() as u64;
+    let checksum = fnv1a64_checksum(body.as_bytes());
+    let truncated = text_tail_was_truncated(&body, tail_bytes);
+    let body = tail_text_by_bytes(&body, tail_bytes);
+    ArtifactBody {
+        bytes,
+        checksum,
+        content_type,
+        truncated,
+        body,
+    }
+}
+
+struct ArtifactFileStatus {
+    exists: bool,
+    readable: bool,
+    bytes: Option<u64>,
+    checksum: Option<String>,
+    error: Option<String>,
+}
+
+fn run_artifact_file_status(artifact: &RunArtifact) -> ArtifactFileStatus {
+    if matches!(artifact.kind, RunArtifactKind::Summary) && artifact.path.starts_with("run:") {
+        return ArtifactFileStatus {
+            exists: true,
+            readable: true,
+            bytes: None,
+            checksum: None,
+            error: None,
+        };
+    }
+    match std::fs::read(&artifact.path) {
+        Ok(bytes) => ArtifactFileStatus {
+            exists: true,
+            readable: true,
+            bytes: Some(bytes.len() as u64),
+            checksum: Some(fnv1a64_checksum(&bytes)),
+            error: None,
+        },
+        Err(error) => ArtifactFileStatus {
+            exists: Path::new(&artifact.path).exists(),
+            readable: false,
+            bytes: artifact.bytes,
+            checksum: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn fnv1a64_checksum(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn find_run_artifact<'a>(
+    run: &'a RunRecord,
+    artifact_id: &str,
+) -> Option<(usize, &'a RunArtifact)> {
+    let artifact_id = artifact_id.trim();
+    if artifact_id.is_empty() {
+        return None;
+    }
+    if let Ok(index) = artifact_id.parse::<usize>() {
+        return run.artifacts.get(index).map(|artifact| (index, artifact));
+    }
+    run.artifacts.iter().enumerate().find(|(index, artifact)| {
+        run_artifact_id(run, *index, artifact) == artifact_id
+            || run_artifact_kind_name(&artifact.kind) == artifact_id
+    })
+}
+
+fn run_artifact_id(run: &RunRecord, index: usize, artifact: &RunArtifact) -> String {
+    let kind = run_artifact_kind_name(&artifact.kind);
+    let count = run
+        .artifacts
+        .iter()
+        .filter(|candidate| candidate.kind == artifact.kind)
+        .count();
+    if count == 1 {
+        kind.to_owned()
+    } else {
+        format!("{kind}-{index}")
+    }
+}
+
+fn run_artifact_kind_name(kind: &RunArtifactKind) -> &'static str {
+    match kind {
+        RunArtifactKind::Stdout => "stdout",
+        RunArtifactKind::Stderr => "stderr",
+        RunArtifactKind::Summary => "summary",
+        RunArtifactKind::Diff => "diff",
+        RunArtifactKind::File => "file",
+    }
+}
+
 fn status_json(os: &OperatingSystem) -> serde_json::Value {
     let pending = os
         .tasks
@@ -8586,10 +15985,31 @@ fn doctor_json(store: &Store, config_path: Option<&Path>) -> serde_json::Value {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| ".".into());
     let config = config_health_json(config_path);
+    let state_path = store.path().display().to_string();
+    let config_path_text = config["config_path"].as_str().unwrap_or("").to_string();
+    let config_exists = config["config_exists"].as_bool().unwrap_or(false);
+    let config_loads = config["config_loads"].as_bool().unwrap_or(false);
+    let config_valid = config["config_valid"].as_bool();
+    let next_steps = doctor_next_steps(
+        &state_directory,
+        &state_path,
+        state_exists,
+        state_loads,
+        state_valid,
+        &config_path_text,
+        config_exists,
+        config_loads,
+        config_valid,
+    );
 
     json!({
         "agent_os_version": env!("CARGO_PKG_VERSION"),
-        "state_path": store.path().display().to_string(),
+        "platform": doctor_platform(),
+        "service_manager": doctor_service_manager(),
+        "service_recommendation": doctor_service_recommendation(),
+        "shell_execution_supported": doctor_shell_execution_supported(),
+        "shell_execution_note": doctor_shell_execution_note(),
+        "state_path": state_path,
         "state_directory": state_directory,
         "state_exists": state_exists,
         "state_loads": state_loads,
@@ -8602,7 +16022,101 @@ fn doctor_json(store: &Store, config_path: Option<&Path>) -> serde_json::Value {
         "config_valid": config["config_valid"].clone(),
         "config_issues": config["config_issues"].clone(),
         "config_error": config["config_error"].clone(),
+        "next_steps": next_steps,
     })
+}
+
+fn doctor_platform() -> &'static str {
+    std::env::consts::OS
+}
+
+fn doctor_service_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "launchd"
+    } else if cfg!(target_os = "linux") {
+        "systemd"
+    } else {
+        "manual"
+    }
+}
+
+fn doctor_service_recommendation() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "agent-os service install && agent-os service start"
+    } else if cfg!(target_os = "linux") {
+        "agent-os service install-systemd && agent-os service start-systemd"
+    } else if cfg!(target_os = "windows") {
+        "run agent-os daemon run from a supervised terminal or external Windows service wrapper"
+    } else {
+        "run agent-os daemon run under the local platform supervisor"
+    }
+}
+
+fn doctor_shell_execution_supported() -> bool {
+    cfg!(unix)
+}
+
+fn doctor_shell_execution_note() -> &'static str {
+    if cfg!(unix) {
+        "shell tasks execute with sh -c and can use Unix process-group cancellation when enabled"
+    } else {
+        "shell tasks require a Unix-like sh; use provider planning, built-in file tools, or an external supervisor on this platform"
+    }
+}
+
+fn shell_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doctor_next_steps(
+    state_directory: &str,
+    state_path: &str,
+    state_exists: bool,
+    state_loads: bool,
+    state_valid: Option<bool>,
+    config_path: &str,
+    config_exists: bool,
+    config_loads: bool,
+    config_valid: Option<bool>,
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    let state_arg = shell_arg(state_directory);
+
+    if !state_exists {
+        steps.push(format!("agent-os --state {state_arg} init"));
+    } else if !state_loads {
+        steps.push(format!(
+            "Restore or repair {}, then rerun agent-os --state {state_arg} doctor",
+            shell_arg(state_path)
+        ));
+    } else if state_valid == Some(false) {
+        steps.push(format!(
+            "agent-os --state {state_arg} state repair --dry-run"
+        ));
+    }
+
+    if !config_path.is_empty() {
+        let config_arg = shell_arg(config_path);
+        if !config_exists {
+            steps.push(format!(
+                "agent-os --config {config_arg} config init --profile safe"
+            ));
+        } else if !config_loads || config_valid == Some(false) {
+            steps.push(format!(
+                "Fix config issues, then run agent-os --config {config_arg} config validate"
+            ));
+        }
+    }
+
+    steps
 }
 
 pub fn metrics_json(os: &OperatingSystem) -> serde_json::Value {
@@ -8621,6 +16135,8 @@ pub fn metrics_json(os: &OperatingSystem) -> serde_json::Value {
     };
     let run_status_count =
         |status: RunStatus| os.runs.values().filter(|run| run.status == status).count();
+    let run_duration = run_duration_metrics(os);
+    let task_queue_age = task_queue_age_metrics(os);
 
     json!({
         "ok": validation.valid,
@@ -8652,12 +16168,274 @@ pub fn metrics_json(os: &OperatingSystem) -> serde_json::Value {
         "runs_success": run_status_count(RunStatus::Success),
         "runs_failed": run_status_count(RunStatus::Failed),
         "runs_rejected": run_status_count(RunStatus::Rejected),
+        "oldest_active_run_age_ms": oldest_active_run_age_ms(os),
+        "oldest_queued_task_age_ms": oldest_queued_task_age_ms(os),
+        "task_queue_age_ms_count": task_queue_age.count,
+        "task_queue_age_ms_sum": task_queue_age.sum,
+        "task_queue_age_ms_buckets": task_queue_age.buckets,
+        "run_duration_ms_count": run_duration.count,
+        "run_duration_ms_sum": run_duration.sum,
+        "run_duration_ms_buckets": run_duration.buckets,
         "tools_total": os.tools.len(),
         "events_total": os.events.len(),
         "memories_total": os.memory.len(),
         "daemon_status": os.daemon.as_ref().map(|daemon| daemon.status.to_string()),
         "daemon_ticks": os.daemon.as_ref().map(|daemon| daemon.ticks),
     })
+}
+
+fn metrics_response_body(metrics: serde_json::Value, path: &str) -> String {
+    if is_prometheus_metrics_path(path) {
+        metrics_prometheus(&metrics)
+    } else {
+        metrics.to_string()
+    }
+}
+
+pub fn metrics_prometheus(metrics: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    lines.push("# HELP agent_os_build_info Agent OS build information.".to_owned());
+    lines.push("# TYPE agent_os_build_info gauge".to_owned());
+    lines.push(format!(
+        "agent_os_build_info{{version=\"{}\"}} 1",
+        prometheus_label_value(
+            metrics
+                .get("agent_os_version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+        )
+    ));
+
+    for (name, key, help) in [
+        ("agent_os_up", "ok", "Whether Agent OS state is healthy."),
+        (
+            "agent_os_state_loads",
+            "state_loads",
+            "Whether durable state loaded.",
+        ),
+        (
+            "agent_os_state_valid",
+            "state_valid",
+            "Whether durable state validates.",
+        ),
+        (
+            "agent_os_state_issue_count",
+            "state_issue_count",
+            "State validation issue count.",
+        ),
+        ("agent_os_agents_total", "agents_total", "Total agents."),
+        ("agent_os_agents_online", "agents_online", "Online agents."),
+        ("agent_os_agents_busy", "agents_busy", "Busy agents."),
+        ("agent_os_agents_paused", "agents_paused", "Paused agents."),
+        (
+            "agent_os_agents_offline",
+            "agents_offline",
+            "Offline agents.",
+        ),
+        ("agent_os_tasks_total", "tasks_total", "Total tasks."),
+        ("agent_os_tasks_pending", "tasks_pending", "Pending tasks."),
+        ("agent_os_tasks_running", "tasks_running", "Running tasks."),
+        ("agent_os_tasks_blocked", "tasks_blocked", "Blocked tasks."),
+        (
+            "agent_os_tasks_complete",
+            "tasks_complete",
+            "Complete tasks.",
+        ),
+        ("agent_os_tasks_failed", "tasks_failed", "Failed tasks."),
+        (
+            "agent_os_tasks_cancelled",
+            "tasks_cancelled",
+            "Cancelled tasks.",
+        ),
+        (
+            "agent_os_workflows_total",
+            "workflows_total",
+            "Total workflows.",
+        ),
+        ("agent_os_runs_total", "runs_total", "Total runs."),
+        ("agent_os_runs_running", "runs_running", "Running runs."),
+        (
+            "agent_os_runs_cancel_requested",
+            "runs_cancel_requested",
+            "Runs with cancellation requested.",
+        ),
+        (
+            "agent_os_runs_cancelled",
+            "runs_cancelled",
+            "Cancelled runs.",
+        ),
+        ("agent_os_runs_success", "runs_success", "Successful runs."),
+        ("agent_os_runs_failed", "runs_failed", "Failed runs."),
+        ("agent_os_runs_rejected", "runs_rejected", "Rejected runs."),
+        (
+            "agent_os_oldest_active_run_age_ms",
+            "oldest_active_run_age_ms",
+            "Age of the oldest running or cancel-requested run in milliseconds.",
+        ),
+        (
+            "agent_os_oldest_queued_task_age_ms",
+            "oldest_queued_task_age_ms",
+            "Age of the oldest pending or blocked task in milliseconds.",
+        ),
+        ("agent_os_tools_total", "tools_total", "Total tools."),
+        ("agent_os_events_total", "events_total", "Total events."),
+        (
+            "agent_os_memories_total",
+            "memories_total",
+            "Total memory records.",
+        ),
+        (
+            "agent_os_daemon_ticks",
+            "daemon_ticks",
+            "Daemon tick count.",
+        ),
+    ] {
+        push_prometheus_gauge(&mut lines, name, key, help, metrics);
+    }
+
+    push_prometheus_histogram(
+        &mut lines,
+        "agent_os_task_queue_age_ms",
+        "Pending and blocked task age histogram in milliseconds.",
+        "task_queue_age_ms_buckets",
+        "task_queue_age_ms_sum",
+        "task_queue_age_ms_count",
+        metrics,
+    );
+    push_prometheus_histogram(
+        &mut lines,
+        "agent_os_run_duration_ms",
+        "Finished run duration histogram in milliseconds.",
+        "run_duration_ms_buckets",
+        "run_duration_ms_sum",
+        "run_duration_ms_count",
+        metrics,
+    );
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn push_prometheus_histogram(
+    lines: &mut Vec<String>,
+    name: &str,
+    help: &str,
+    buckets_key: &str,
+    sum_key: &str,
+    count_key: &str,
+    metrics: &serde_json::Value,
+) {
+    lines.push(format!("# HELP {name} {help}"));
+    lines.push(format!("# TYPE {name} histogram"));
+    let buckets = metrics
+        .get(buckets_key)
+        .and_then(serde_json::Value::as_object);
+    for (key, le) in [
+        ("le_1000", "1000"),
+        ("le_5000", "5000"),
+        ("le_30000", "30000"),
+        ("le_60000", "60000"),
+        ("le_300000", "300000"),
+        ("le_inf", "+Inf"),
+    ] {
+        let value = buckets
+            .and_then(|buckets| buckets.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        lines.push(format!("{name}_bucket{{le=\"{le}\"}} {value}"));
+    }
+    lines.push(format!("{name}_sum {}", metric_value(metrics, sum_key)));
+    lines.push(format!("{name}_count {}", metric_value(metrics, count_key)));
+}
+
+fn push_prometheus_gauge(
+    lines: &mut Vec<String>,
+    name: &str,
+    key: &str,
+    help: &str,
+    metrics: &serde_json::Value,
+) {
+    lines.push(format!("# HELP {name} {help}"));
+    lines.push(format!("# TYPE {name} gauge"));
+    lines.push(format!("{name} {}", metric_value(metrics, key)));
+}
+
+fn metric_value(metrics: &serde_json::Value, key: &str) -> u64 {
+    match metrics.get(key) {
+        Some(value) if value.is_boolean() => u64::from(value.as_bool().unwrap_or(false)),
+        Some(value) => value.as_u64().unwrap_or(0),
+        None => 0,
+    }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', r#"\""#)
+}
+
+struct DurationMetrics {
+    count: u64,
+    sum: u64,
+    buckets: serde_json::Value,
+}
+
+fn run_duration_metrics(os: &OperatingSystem) -> DurationMetrics {
+    duration_metrics(os.runs.values().filter_map(|run| {
+        let finished_at = run.finished_at?;
+        Some((finished_at - run.started_at).num_milliseconds().max(0))
+    }))
+}
+
+fn task_queue_age_metrics(os: &OperatingSystem) -> DurationMetrics {
+    let now = chrono::Utc::now();
+    duration_metrics(
+        os.tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked))
+            .map(|task| (now - task.created_at).num_milliseconds().max(0)),
+    )
+}
+
+fn duration_metrics(durations: impl IntoIterator<Item = i64>) -> DurationMetrics {
+    let bucket_limits = [1_000_i64, 5_000, 30_000, 60_000, 300_000];
+    let mut durations = durations.into_iter().collect::<Vec<_>>();
+    durations.sort_unstable();
+    let sum = durations.iter().copied().sum::<i64>().max(0) as u64;
+    let mut buckets = serde_json::Map::new();
+    for limit in bucket_limits {
+        let count = durations
+            .iter()
+            .filter(|duration| **duration <= limit)
+            .count() as u64;
+        buckets.insert(format!("le_{limit}"), json!(count));
+    }
+    buckets.insert("le_inf".into(), json!(durations.len() as u64));
+    DurationMetrics {
+        count: durations.len() as u64,
+        sum,
+        buckets: serde_json::Value::Object(buckets),
+    }
+}
+
+fn oldest_active_run_age_ms(os: &OperatingSystem) -> u64 {
+    let now = chrono::Utc::now();
+    os.runs
+        .values()
+        .filter(|run| matches!(run.status, RunStatus::Running | RunStatus::CancelRequested))
+        .map(|run| (now - run.started_at).num_milliseconds().max(0) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+fn oldest_queued_task_age_ms(os: &OperatingSystem) -> u64 {
+    let now = chrono::Utc::now();
+    os.tasks
+        .values()
+        .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked))
+        .map(|task| (now - task.created_at).num_milliseconds().max(0) as u64)
+        .max()
+        .unwrap_or(0)
 }
 
 fn health_json(os: &OperatingSystem, config_path: Option<&Path>) -> serde_json::Value {
@@ -8774,6 +16552,28 @@ pub fn metrics_unavailable_json(error: String) -> serde_json::Value {
         "runs_success": 0,
         "runs_failed": 0,
         "runs_rejected": 0,
+        "oldest_active_run_age_ms": 0,
+        "oldest_queued_task_age_ms": 0,
+        "task_queue_age_ms_count": 0,
+        "task_queue_age_ms_sum": 0,
+        "task_queue_age_ms_buckets": {
+            "le_1000": 0,
+            "le_5000": 0,
+            "le_30000": 0,
+            "le_60000": 0,
+            "le_300000": 0,
+            "le_inf": 0
+        },
+        "run_duration_ms_count": 0,
+        "run_duration_ms_sum": 0,
+        "run_duration_ms_buckets": {
+            "le_1000": 0,
+            "le_5000": 0,
+            "le_30000": 0,
+            "le_60000": 0,
+            "le_300000": 0,
+            "le_inf": 0
+        },
         "tools_total": 0,
         "events_total": 0,
         "memories_total": 0,
@@ -8808,9 +16608,12 @@ fn health_unavailable_json(error: String, config_path: Option<&Path>) -> serde_j
 mod tests {
     use super::*;
     use crate::models::{
-        Agent, AgentKind, EventKind, OperatingSystem, Priority, RunRecord, Task, TaskStatus,
-        ToolId, ToolInvocation,
+        Agent, AgentKind, AgentStatus, ApprovalRequest, EvalRecord, EventKind, MemoryRecord,
+        OperatingSystem, Priority, RunArtifact, RunArtifactKind, RunRecord, Task, TaskStatus,
+        ToolDefinition, ToolId, ToolInvocation, ToolKind, WorkerNode,
     };
+    use chrono::Utc;
+    use proptest::prelude::*;
     use std::fs;
     use std::io::Cursor;
 
@@ -8830,6 +16633,747 @@ mod tests {
         assert_eq!(status, "200 OK");
         assert_eq!(value["name"], "api-test");
         assert_eq!(value["tasks_pending"], 1);
+    }
+
+    #[test]
+    fn git_status_endpoint_reports_workspace_status() {
+        let git_available = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !git_available {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::write(dir.path().join("note.txt"), "hello\n").expect("write file");
+
+        let cwd = url::form_urlencoded::byte_serialize(dir.path().to_string_lossy().as_bytes())
+            .collect::<String>();
+        let os = OperatingSystem::new("api-test");
+        let (status, body) = response_for_path(&os, &format!("/git/status?cwd={cwd}"));
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(
+            value["command"],
+            serde_json::json!(["git", "status", "--short", "--branch"])
+        );
+        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["status"], 0);
+        assert!(
+            value["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("note.txt")
+        );
+    }
+
+    #[test]
+    fn git_review_task_endpoint_creates_review_task() {
+        let git_available = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !git_available {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let store = Store::new(dir.path().join("state.json"));
+        store
+            .save(&OperatingSystem::new("api-test"))
+            .expect("save state");
+        let body = serde_json::to_vec(&json!({
+            "cwd": repo,
+            "base": "main",
+            "title": "API git review",
+            "priority": "high"
+        }))
+        .expect("review request");
+
+        let (status, body) = response_for_mutation(&store, "POST", "/git/review-task", &body);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "201 Created");
+        assert_eq!(value["task"]["title"], "API git review");
+        assert_eq!(value["task"]["priority"], "high");
+        assert_eq!(value["task"]["required_capabilities"][0], "review");
+        assert_eq!(
+            value["task"]["cwd"],
+            fs::canonicalize(&repo)
+                .expect("canonical repo")
+                .display()
+                .to_string()
+        );
+        assert!(
+            value["task"]["command"]
+                .as_str()
+                .expect("review command")
+                .contains("git diff --stat main...HEAD")
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/git/review-task",
+            br#"{"base":"bad branch"}"#,
+        );
+        let invalid: serde_json::Value = serde_json::from_str(&body).expect("invalid json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(
+            invalid["error"],
+            "base contains characters git refs cannot safely use"
+        );
+    }
+
+    #[test]
+    fn dashboard_endpoint_includes_workers_and_evals() {
+        let mut os = OperatingSystem::new("api-test");
+        os.workers.insert(
+            "remote-a".into(),
+            WorkerNode {
+                id: "remote-a".into(),
+                endpoint: "http://127.0.0.1:9000".into(),
+                status: AgentStatus::Online,
+                last_seen_at: Utc::now(),
+            },
+        );
+        os.evals.push(EvalRecord {
+            id: "eval-test".into(),
+            target: "ci-fix".into(),
+            success: true,
+            cost_micros: Some(123),
+            latency_ms: Some(456),
+            run: None,
+            recorded_at: Utc::now(),
+        });
+
+        let (status, body) = response_for_path(&os, "/dashboard");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(value["workers"][0]["id"], "remote-a");
+        assert_eq!(value["evals"][0]["id"], "eval-test");
+    }
+
+    #[test]
+    fn dashboard_html_endpoint_renders_operator_sections() {
+        let mut os = OperatingSystem::new("api-test");
+        os.register_agent(Agent::new(
+            "Dashboard agent",
+            AgentKind::Builder,
+            Some("planner".into()),
+            vec!["ui".into()],
+            2,
+        ));
+        let task = Task::new(
+            "Build dashboard",
+            "Render operator UI",
+            Priority::High,
+            vec!["ui".into()],
+        );
+        let task_id = task.id.clone();
+        os.create_task(task);
+        let review = Task::new(
+            "Review dashboard",
+            "Review operator UI",
+            Priority::High,
+            vec![],
+        );
+        let review_id = review.id.clone();
+        os.create_task(review);
+        if let Some(review) = os.tasks.get_mut(&review_id) {
+            review.dependencies.push(task_id.clone());
+        }
+        os.register_tool(ToolDefinition::new(
+            "Dashboard writer",
+            ToolKind::FileWrite,
+            "Write dashboard notes",
+            vec!["rust".into()],
+            "notes/{name}.txt",
+            Some("workspace".into()),
+        ));
+        os.create_workflow(Workflow::new(
+            "Dashboard DAG",
+            Priority::High,
+            BTreeMap::from([
+                ("build".into(), task_id.clone()),
+                ("review".into(), review_id),
+            ]),
+        ));
+        os.request_approval(ApprovalRequest::new(
+            task_id.clone(),
+            None,
+            "deploy production",
+            "requires operator review",
+        ));
+        os.workers.insert(
+            "remote-dashboard".into(),
+            WorkerNode {
+                id: "remote-dashboard".into(),
+                endpoint: "http://127.0.0.1:9200".into(),
+                status: AgentStatus::Online,
+                last_seen_at: Utc::now(),
+            },
+        );
+        os.evals.push(EvalRecord {
+            id: "eval-dashboard".into(),
+            target: "dashboard-smoke".into(),
+            success: false,
+            cost_micros: None,
+            latency_ms: Some(42),
+            run: None,
+            recorded_at: Utc::now(),
+        });
+        let mut run = RunRecord::new(task_id, None, "printf dashboard", ".");
+        run.artifacts
+            .push(RunArtifact::new(RunArtifactKind::Stdout, "stdout.log"));
+        os.runs.insert(run.id.clone(), run);
+        os.write_memory(MemoryRecord::new(
+            "release context",
+            "dashboard should show memory",
+            vec!["release".into()],
+        ));
+        os.policy.autonomy = AutonomyLevel::ExecuteWithApproval;
+        os.policy.allow_shell = false;
+        os.policy.allowed_workspaces = vec![".".into(), "src".into()];
+        os.policy.rules = vec!["deny writes outside src".into()];
+        os.memory_policy.semantic_recall = true;
+        os.memory_policy.scope = Some("dashboard".into());
+        os.provider.kind = ProviderKind::Plugin;
+        os.provider.model = "planner-plugin".into();
+        os.provider.plugin_command = Some("agent-os-provider-plugin".into());
+        os.provider.plugin_args = vec!["--mode".into(), "strict".into()];
+        os.provider.plugin_env = BTreeMap::from([("PLUGIN_TOKEN".into(), "env:token".into())]);
+        os.provider.request_options = BTreeMap::from([("temperature".into(), json!(0.1))]);
+        os.provider.response_schema = Some(json!({
+            "type": "object",
+            "required": ["summary"]
+        }));
+        os.mcp_servers.insert(
+            "local-tools".into(),
+            McpServer {
+                id: "local-tools".into(),
+                command: "agent-os-mcp".into(),
+                args: vec!["--stdio".into()],
+                env: BTreeMap::from([("AGENT_OS_TOKEN".into(), "test-token".into())]),
+                enabled: true,
+            },
+        );
+
+        let (status, body) = response_for_path(&os, "/dashboard.html");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(
+            response_content_type("GET", "/dashboard.html", status),
+            "text/html; charset=utf-8"
+        );
+        assert!(body.contains("<h1>api-test</h1>"), "{body}");
+        for section in [
+            "Metrics",
+            "Agents",
+            "Tasks",
+            "Tools",
+            "Runs",
+            "Scheduler &amp; Daemon",
+            "Workflows",
+            "Workflow DAG Editor",
+            "Registry Templates",
+            "MCP Servers",
+            "Git Workspace",
+            "Service Definitions",
+            "State Maintenance",
+            "Policy Posture",
+            "Provider Boundary",
+            "Approvals",
+            "Workers",
+            "Evals",
+            "Run Inspector",
+            "Run Artifacts",
+            "Secrets",
+            "Memory",
+            "Timeline",
+        ] {
+            assert!(body.contains(section), "{section} missing from dashboard");
+        }
+        assert!(body.contains("Dashboard agent"), "{body}");
+        assert!(body.contains("data-endpoint=\"/agents\""), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/agents/{agent_id}\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/agents/{agent_id}/heartbeat\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/agents/{agent_id}/claim\""),
+            "{body}"
+        );
+        assert!(body.contains("Create Agent"), "{body}");
+        assert!(body.contains("Inspect Agent"), "{body}");
+        assert!(body.contains("Update Agent"), "{body}");
+        assert!(body.contains("Heartbeat Agent"), "{body}");
+        assert!(body.contains("Claim Agent Task"), "{body}");
+        assert!(body.contains("Remove Agent"), "{body}");
+        assert!(body.contains("name=\"agent_id\""), "{body}");
+        assert!(body.contains("name=\"clear_model\""), "{body}");
+        assert!(body.contains("Build dashboard"), "{body}");
+        assert!(body.contains("data-endpoint=\"/tasks\""), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/tasks/{task_id}\""),
+            "{body}"
+        );
+        for endpoint in [
+            "/assign",
+            "/priority",
+            "/dependencies",
+            "/plan",
+            "/complete",
+            "/fail",
+            "/block",
+            "/cancel",
+            "/retry",
+            "/unblock",
+        ] {
+            assert!(
+                body.contains(&format!(
+                    "data-endpoint-template=\"/tasks/{{task_id}}{endpoint}\""
+                )),
+                "{endpoint} missing from task dashboard controls: {body}"
+            );
+        }
+        assert!(body.contains("data-endpoint=\"/tasks/recover\""), "{body}");
+        assert!(body.contains("Create Task"), "{body}");
+        assert!(body.contains("Inspect Task"), "{body}");
+        assert!(body.contains("Update Task"), "{body}");
+        assert!(body.contains("Assign Task"), "{body}");
+        assert!(body.contains("Set Priority"), "{body}");
+        assert!(body.contains("Set Dependencies"), "{body}");
+        assert!(body.contains("Set Plan"), "{body}");
+        assert!(body.contains("Complete Task"), "{body}");
+        assert!(body.contains("Retry Task"), "{body}");
+        assert!(body.contains("Remove Task"), "{body}");
+        assert!(body.contains("Recover Tasks"), "{body}");
+        assert!(body.contains("name=\"task_id\""), "{body}");
+        assert!(body.contains("name=\"max_attempts\""), "{body}");
+        assert!(body.contains("name=\"clear_command\""), "{body}");
+        assert!(
+            body.contains("name=\"clear_required_capabilities\""),
+            "{body}"
+        );
+        assert!(body.contains("data-endpoint=\"/run\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/daemon\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/daemon/stop\""), "{body}");
+        assert!(body.contains("Run Scheduler"), "{body}");
+        assert!(body.contains("Inspect Daemon"), "{body}");
+        assert!(body.contains("Request Stop"), "{body}");
+        assert!(body.contains("name=\"dry_run\""), "{body}");
+        assert!(body.contains("name=\"recover_stale_seconds\""), "{body}");
+        assert!(body.contains("not-started"), "{body}");
+        assert!(body.contains("Dashboard writer"), "{body}");
+        assert!(body.contains("notes/{name}.txt"), "{body}");
+        assert!(body.contains("data-endpoint=\"/tools\""), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/tools/{tool_id}\""),
+            "{body}"
+        );
+        assert!(body.contains("Create Tool"), "{body}");
+        assert!(body.contains("Inspect Tool"), "{body}");
+        assert!(body.contains("Update Tool"), "{body}");
+        assert!(body.contains("Remove Tool"), "{body}");
+        assert!(body.contains("name=\"tool_id\""), "{body}");
+        assert!(body.contains("name=\"command_template\""), "{body}");
+        assert!(
+            body.contains("name=\"clear_required_capabilities\""),
+            "{body}"
+        );
+        assert!(body.contains("name=\"clear_cwd\""), "{body}");
+        assert!(body.contains("build -&gt; review"), "{body}");
+        assert!(body.contains("data-dashboard-form"), "{body}");
+        assert!(body.contains("/workflows/"), "{body}");
+        assert!(body.contains("/tasks"), "{body}");
+        assert!(body.contains("/link"), "{body}");
+        assert!(body.contains("/unlink"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/registry/templates/"),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/registry/marketplace-import\""),
+            "{body}"
+        );
+        assert!(body.contains("Agent Profiles"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/registry/profiles/"),
+            "{body}"
+        );
+        assert!(body.contains("/agents\""), "{body}");
+        assert!(body.contains("Install Agent"), "{body}");
+        assert!(body.contains("data-json=\"true\""), "{body}");
+        assert!(body.contains("Import Marketplace"), "{body}");
+        assert!(body.contains("Workflow Templates"), "{body}");
+        assert!(body.contains("/workflows\""), "{body}");
+        assert!(body.contains("Create Workflow"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/registry/mcp-servers\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/registry/mcp-servers/local-tools\""),
+            "{body}"
+        );
+        assert!(body.contains("Register MCP Server"), "{body}");
+        assert!(body.contains("Update MCP"), "{body}");
+        assert!(body.contains("Remove MCP"), "{body}");
+        assert!(body.contains("data-method=\"DELETE\""), "{body}");
+        assert!(body.contains("AGENT_OS_TOKEN"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/git/review-task\""),
+            "{body}"
+        );
+        assert!(body.contains("data-dashboard-query"), "{body}");
+        assert!(body.contains("data-endpoint=\"/git/status\""), "{body}");
+        assert!(body.contains("Inspect Status"), "{body}");
+        assert!(body.contains("Review Task"), "{body}");
+        assert!(body.contains("Create Review Task"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd/install\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd/uninstall\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd/start\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd/stop\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/launchd/status\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd/install\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd/uninstall\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd/start\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd/stop\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint=\"/service/systemd/status\""),
+            "{body}"
+        );
+        assert!(body.contains("data-dashboard-result=\"json\""), "{body}");
+        assert!(body.contains("Render Launchd"), "{body}");
+        assert!(body.contains("Install Launchd"), "{body}");
+        assert!(body.contains("Uninstall Launchd"), "{body}");
+        assert!(body.contains("Start Launchd"), "{body}");
+        assert!(body.contains("Stop Launchd"), "{body}");
+        assert!(body.contains("Launchd Status"), "{body}");
+        assert!(body.contains("Render Systemd"), "{body}");
+        assert!(body.contains("Install Systemd"), "{body}");
+        assert!(body.contains("Uninstall Systemd"), "{body}");
+        assert!(body.contains("Start Systemd"), "{body}");
+        assert!(body.contains("Stop Systemd"), "{body}");
+        assert!(body.contains("Systemd Status"), "{body}");
+        assert!(body.contains("name=\"recover_stale_seconds\""), "{body}");
+        assert!(body.contains("name=\"no_logs\""), "{body}");
+        assert!(body.contains("name=\"launchctl_path\""), "{body}");
+        assert!(body.contains("name=\"systemctl_path\""), "{body}");
+        assert!(body.contains("name=\"unit_path\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/validate\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/export\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/import\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/migrate\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/sqlite\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/backup\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/repair\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/state/prune\""), "{body}");
+        assert!(body.contains("Validate State"), "{body}");
+        assert!(body.contains("Read Snapshot"), "{body}");
+        assert!(body.contains("Export State"), "{body}");
+        assert!(body.contains("Import State"), "{body}");
+        assert!(body.contains("Migrate State"), "{body}");
+        assert!(body.contains("SQLite Mirror"), "{body}");
+        assert!(body.contains("Sync SQLite"), "{body}");
+        assert!(body.contains("Backup State"), "{body}");
+        assert!(body.contains("Repair State"), "{body}");
+        assert!(body.contains("Prune State"), "{body}");
+        assert!(body.contains("name=\"path\""), "{body}");
+        assert!(body.contains("name=\"input\""), "{body}");
+        assert!(body.contains("name=\"init_only\""), "{body}");
+        assert!(body.contains("name=\"restore\""), "{body}");
+        assert!(body.contains("name=\"keep_runs\""), "{body}");
+        assert!(body.contains("name=\"keep_events\""), "{body}");
+        assert!(body.contains("execute-with-approval"), "{body}");
+        assert!(body.contains("Shell disabled"), "{body}");
+        assert!(body.contains("Workspace jail enabled"), "{body}");
+        assert!(body.contains("semantic recall"), "{body}");
+        assert!(body.contains("deny writes outside src"), "{body}");
+        assert!(
+            body.contains("data-endpoint=\"/config/validate\""),
+            "{body}"
+        );
+        assert!(body.contains("data-endpoint=\"/config\""), "{body}");
+        assert!(body.contains("Inspect Config"), "{body}");
+        assert!(body.contains("Validate Config"), "{body}");
+        assert!(body.contains("Write Config Profile"), "{body}");
+        assert!(body.contains("Write Config"), "{body}");
+        assert!(body.contains("name=\"profile\""), "{body}");
+        assert!(body.contains("name=\"force\""), "{body}");
+        assert!(body.contains("autonomous"), "{body}");
+        assert!(body.contains("ci"), "{body}");
+        assert!(body.contains("planner-plugin"), "{body}");
+        assert!(body.contains("agent-os-provider-plugin"), "{body}");
+        assert!(body.contains("schema configured"), "{body}");
+        assert!(body.contains("temperature"), "{body}");
+        assert!(body.contains("PLUGIN_TOKEN"), "{body}");
+        assert!(body.contains("data-list=\"true\""), "{body}");
+        assert!(body.contains("deploy production"), "{body}");
+        assert!(body.contains("data-endpoint=\"/approvals/"), "{body}");
+        assert!(body.contains("/approve\""), "{body}");
+        assert!(body.contains("/deny\""), "{body}");
+        assert!(body.contains("name=\"by\""), "{body}");
+        assert!(body.contains("Approve"), "{body}");
+        assert!(body.contains("Deny"), "{body}");
+        assert!(body.contains("data-endpoint=\"/workers\""), "{body}");
+        assert!(body.contains("Register Worker"), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/workers/{worker_id}/heartbeat\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/workers/{worker_id}/claim\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/workers/{worker_id}/report\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/workers/{worker_id}\""),
+            "{body}"
+        );
+        assert!(body.contains("Heartbeat Worker"), "{body}");
+        assert!(body.contains("Claim Task"), "{body}");
+        assert!(body.contains("Report Task"), "{body}");
+        assert!(body.contains("Remove Worker"), "{body}");
+        assert!(body.contains("name=\"worker_id\""), "{body}");
+        assert!(body.contains("name=\"lease_seconds\""), "{body}");
+        assert!(body.contains("name=\"artifacts\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/evals\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/evals/run\""), "{body}");
+        assert!(body.contains("Record Eval"), "{body}");
+        assert!(body.contains("Run Eval"), "{body}");
+        assert!(body.contains("name=\"success_pattern\""), "{body}");
+        assert!(body.contains("name=\"output_schema\""), "{body}");
+        assert!(body.contains("data-bool=\"true\""), "{body}");
+        assert!(body.contains("data-number=\"true\""), "{body}");
+        assert!(body.contains("remote-dashboard"), "{body}");
+        assert!(body.contains("dashboard-smoke"), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/runs/{run_id}/debug\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/runs/{run_id}/replay\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/runs/{run_id}/artifacts\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/runs/{run_id}/artifacts/{artifact_id}\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("data-endpoint-template=\"/runs/{run_id}/cancel\""),
+            "{body}"
+        );
+        assert!(body.contains("data-path=\"true\""), "{body}");
+        assert!(body.contains("Debug Run"), "{body}");
+        assert!(body.contains("Replay Run"), "{body}");
+        assert!(body.contains("List Artifacts"), "{body}");
+        assert!(body.contains("Read Artifact"), "{body}");
+        assert!(body.contains("Cancel Run"), "{body}");
+        assert!(body.contains("name=\"artifact_id\""), "{body}");
+        assert!(body.contains("stdout.log"), "{body}");
+        assert!(body.contains("data-endpoint=\"/secrets\""), "{body}");
+        assert!(body.contains("Register Secret Backend"), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/secrets/{backend_id}\""),
+            "{body}"
+        );
+        assert!(body.contains("Inspect Backend"), "{body}");
+        assert!(body.contains("Remove Backend"), "{body}");
+        assert!(body.contains("name=\"backend_id\""), "{body}");
+        assert!(body.contains("data-endpoint=\"/secrets/check\""), "{body}");
+        assert!(body.contains("Check Secrets"), "{body}");
+        assert!(body.contains("data-endpoint=\"/memory\""), "{body}");
+        assert!(body.contains("Add Memory"), "{body}");
+        assert!(body.contains("data-endpoint=\"/memory/recall\""), "{body}");
+        assert!(
+            body.contains("data-endpoint-template=\"/memory/{memory_id}\""),
+            "{body}"
+        );
+        assert!(body.contains("data-endpoint=\"/memory/prune\""), "{body}");
+        assert!(body.contains("Recall Memory"), "{body}");
+        assert!(body.contains("Inspect Memory"), "{body}");
+        assert!(body.contains("Update Memory"), "{body}");
+        assert!(body.contains("Prune Memory"), "{body}");
+        assert!(body.contains("Remove Memory"), "{body}");
+        assert!(body.contains("name=\"memory_id\""), "{body}");
+        assert!(body.contains("name=\"clear_tags\""), "{body}");
+        assert!(body.contains("name=\"clear_scope\""), "{body}");
+        assert!(body.contains("release context"), "{body}");
+    }
+
+    #[test]
+    fn metrics_reports_run_duration_histogram() {
+        let mut os = OperatingSystem::new("api-test");
+        let task = Task::new("Task", "Objective", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        os.create_task(task);
+        let mut fast = RunRecord::new(task_id.clone(), None, "fast", ".");
+        fast.status = RunStatus::Success;
+        fast.exit_code = Some(0);
+        fast.finished_at = Some(fast.started_at + chrono::Duration::milliseconds(750));
+        let mut slow = RunRecord::new(task_id, None, "slow", ".");
+        slow.status = RunStatus::Failed;
+        slow.exit_code = Some(1);
+        slow.finished_at = Some(slow.started_at + chrono::Duration::milliseconds(45_000));
+        os.runs.insert(fast.id.clone(), fast);
+        os.runs.insert(slow.id.clone(), slow);
+
+        let metrics = metrics_json(&os);
+
+        assert_eq!(metrics["run_duration_ms_count"], 2);
+        assert_eq!(metrics["run_duration_ms_sum"], 45_750);
+        assert_eq!(metrics["run_duration_ms_buckets"]["le_1000"], 1);
+        assert_eq!(metrics["run_duration_ms_buckets"]["le_30000"], 1);
+        assert_eq!(metrics["run_duration_ms_buckets"]["le_60000"], 2);
+        assert_eq!(metrics["run_duration_ms_buckets"]["le_inf"], 2);
+    }
+
+    #[test]
+    fn metrics_reports_task_queue_age_histogram() {
+        let mut os = OperatingSystem::new("api-test");
+        let mut fresh = Task::new("Fresh", "Objective", Priority::Normal, vec![]);
+        fresh.created_at = chrono::Utc::now() - chrono::Duration::milliseconds(750);
+        let mut stale = Task::new("Stale", "Objective", Priority::Normal, vec![]);
+        stale.status = TaskStatus::Blocked;
+        stale.created_at = chrono::Utc::now() - chrono::Duration::milliseconds(45_000);
+        let mut finished = Task::new("Finished", "Objective", Priority::Normal, vec![]);
+        finished.status = TaskStatus::Complete;
+        finished.created_at = chrono::Utc::now() - chrono::Duration::milliseconds(300_000);
+        os.create_task(fresh);
+        os.create_task(stale);
+        os.create_task(finished);
+
+        let metrics = metrics_json(&os);
+
+        assert_eq!(metrics["task_queue_age_ms_count"], 2);
+        assert!(metrics["task_queue_age_ms_sum"].as_u64().unwrap() >= 45_750);
+        assert!(metrics["oldest_queued_task_age_ms"].as_u64().unwrap() >= 45_000);
+        assert_eq!(metrics["task_queue_age_ms_buckets"]["le_1000"], 1);
+        assert_eq!(metrics["task_queue_age_ms_buckets"]["le_30000"], 1);
+        assert_eq!(metrics["task_queue_age_ms_buckets"]["le_60000"], 2);
+        assert_eq!(metrics["task_queue_age_ms_buckets"]["le_inf"], 2);
+    }
+
+    #[test]
+    fn metrics_reports_oldest_active_run_age() {
+        let mut os = OperatingSystem::new("api-test");
+        let task = Task::new("Task", "Objective", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        os.create_task(task);
+        let mut active = RunRecord::new(task_id.clone(), None, "active", ".");
+        active.started_at = chrono::Utc::now() - chrono::Duration::milliseconds(2_500);
+        let mut cancelling = RunRecord::new(task_id.clone(), None, "cancelling", ".");
+        cancelling.status = RunStatus::CancelRequested;
+        cancelling.started_at = chrono::Utc::now() - chrono::Duration::milliseconds(5_000);
+        let mut finished = RunRecord::new(task_id, None, "finished", ".");
+        finished.status = RunStatus::Success;
+        finished.started_at = chrono::Utc::now() - chrono::Duration::milliseconds(30_000);
+        finished.finished_at = Some(finished.started_at + chrono::Duration::milliseconds(1_000));
+        os.runs.insert(active.id.clone(), active);
+        os.runs.insert(cancelling.id.clone(), cancelling);
+        os.runs.insert(finished.id.clone(), finished);
+
+        let metrics = metrics_json(&os);
+
+        assert!(metrics["oldest_active_run_age_ms"].as_u64().unwrap() >= 5_000);
+    }
+
+    #[test]
+    fn prometheus_metrics_endpoint_reports_counter_snapshot() {
+        let mut os = OperatingSystem::new("api-test");
+        os.create_task(Task::new(
+            "Task",
+            "Objective",
+            Priority::Normal,
+            vec!["plan".into()],
+        ));
+
+        let (status, body) = response_for_path(&os, "/metrics/prometheus");
+
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("# TYPE agent_os_tasks_total gauge"));
+        assert!(body.contains("agent_os_tasks_total 1"));
+        assert!(body.contains("# TYPE agent_os_oldest_active_run_age_ms gauge"));
+        assert!(body.contains("# TYPE agent_os_oldest_queued_task_age_ms gauge"));
+        assert!(body.contains("agent_os_task_queue_age_ms_bucket{le=\"+Inf\"} 1"));
+        assert!(body.contains("agent_os_run_duration_ms_bucket{le=\"+Inf\"} 0"));
+        assert!(body.contains("agent_os_build_info{version=\""));
     }
 
     #[test]
@@ -9845,6 +18389,13 @@ mod tests {
             "UI notes",
             vec!["frontend".into()],
         ));
+        os.write_memory(MemoryRecord::with_access(
+            "Private Rust",
+            "Scheduler notes",
+            vec!["OpsTag".into()],
+            MemoryVisibility::Private,
+            Some("client-a".into()),
+        ));
         let mut latest_rust =
             MemoryRecord::new("Latest Rust", "Scheduler notes", vec!["OpsTag".into()]);
         latest_rust.created_at = base + chrono::Duration::seconds(1);
@@ -9865,9 +18416,50 @@ mod tests {
         let records: serde_json::Value = serde_json::from_str(&body).expect("json");
 
         assert_eq!(status, "200 OK");
-        assert_eq!(records.as_array().expect("records").len(), 2);
-        assert_eq!(records[0]["topic"], "Latest Rust");
-        assert_eq!(records[1]["topic"], "Rust");
+        assert_eq!(records.as_array().expect("records").len(), 3);
+        assert!(
+            records
+                .as_array()
+                .expect("records")
+                .iter()
+                .any(|record| record["topic"] == "Latest Rust")
+        );
+        assert!(
+            records
+                .as_array()
+                .expect("records")
+                .iter()
+                .any(|record| record["topic"] == "Rust")
+        );
+
+        let (status, body) = response_for_path(
+            &os,
+            "/memory/recall?query=scheduler&tag=opsTag&visibility=shared&limit=1",
+        );
+        let recall: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(recall.as_array().expect("recall").len(), 1);
+        assert_eq!(recall[0]["record"]["topic"], "Latest Rust");
+        assert!(recall[0]["score"].as_u64().expect("score") > 0);
+        assert!(
+            recall[0]["snippet"]
+                .as_str()
+                .expect("snippet")
+                .contains("Scheduler")
+        );
+
+        let (status, body) = response_for_path(&os, "/memory/recall");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(value["error"], "query is required for memory recall");
+
+        let (status, body) = response_for_path(&os, "/memory?visibility=private&scope=client-a");
+        let records: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(records.as_array().expect("records").len(), 1);
+        assert_eq!(records[0]["topic"], "Private Rust");
 
         let (status, body) = response_for_path(&os, "/memory?tag=frontend");
         let records: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -9905,6 +18497,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(status, "400 Bad Request");
         assert_eq!(value["error"], "limit must not be repeated");
+
+        let (status, body) = response_for_path(&os, "/memory?visibility=secret");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(value["error"], "visibility must be shared or private");
 
         let (status, body) = response_for_path(&os, "/memory?since=%20%20");
         let value: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -9963,6 +18560,29 @@ mod tests {
 
         assert_eq!(status, "200 OK");
         assert_eq!(value["memory"]["tags"], serde_json::json!([]));
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/memory/{memory_id}"),
+            br#"{"visibility":"private","scope":"client-a"}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(value["memory"]["visibility"], "private");
+        assert_eq!(value["memory"]["scope"], "client-a");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/memory/{memory_id}"),
+            br#"{"clear_scope":true}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(value["memory"]["scope"], serde_json::Value::Null);
 
         let (status, body) = response_for_mutation(
             &store,
@@ -10177,6 +18797,94 @@ mod tests {
     }
 
     #[test]
+    fn malformed_request_lines_are_rejected_by_parser_boundary() {
+        for request in [
+            b"\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET status HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"G ET /status HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /status HTTP/2\r\nhost: localhost\r\n\r\n".as_slice(),
+        ] {
+            let mut reader = Cursor::new(request);
+
+            let error = match read_http_request(&mut reader) {
+                Ok(_) => panic!("malformed request line should fail"),
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                HttpRequestError::MissingRequestLine
+                    | HttpRequestError::MalformedRequestLine { .. }
+                    | HttpRequestError::UnsupportedHttpVersion { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn non_utf8_http_headers_are_rejected() {
+        let mut reader = Cursor::new(b"GET /status HTTP/1.1\r\nx-binary: \xFF\r\n\r\n".as_slice());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("non-utf8 headers should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, HttpRequestError::InvalidHeaderUtf8));
+    }
+
+    proptest! {
+        #[test]
+        fn http_parser_handles_arbitrary_bounded_bytes_without_panicking(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let mut reader = Cursor::new(bytes);
+
+            match read_http_request(&mut reader) {
+                Ok(request) => {
+                    prop_assert!(request.headers.len() <= MAX_HTTP_HEADER_BYTES);
+                    prop_assert!(request.body.len() <= MAX_HTTP_BODY_BYTES);
+                    prop_assert!(parse_http_request_line(request.request_line.as_deref()).is_ok());
+                }
+                Err(error) => {
+                    let (status, body) = http_request_error_response(&error);
+                    prop_assert!(
+                        matches!(
+                            status,
+                            "400 Bad Request"
+                                | "413 Payload Too Large"
+                                | "431 Request Header Fields Too Large"
+                                | "500 Internal Server Error"
+                        ),
+                        "unexpected status: {status}"
+                    );
+                    prop_assert!(body.contains("\"error\":\"invalid http request\""));
+                }
+            }
+        }
+
+        #[test]
+        fn http_parser_round_trips_generated_valid_requests(
+            path in "/[A-Za-z0-9_./-]{0,64}",
+            body in proptest::collection::vec(any::<u8>(), 0..4096),
+            host in "[A-Za-z0-9.-]{1,64}"
+        ) {
+            let mut request = format!(
+                "POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n",
+                body.len()
+            ).into_bytes();
+            request.extend_from_slice(&body);
+            request.extend_from_slice(b"ignored trailing bytes");
+            let mut reader = Cursor::new(request);
+
+            let parsed = read_http_request(&mut reader).expect("generated request should parse");
+            let (method, parsed_path) = parse_http_request_line(parsed.request_line.as_deref())
+                .expect("generated request line should parse");
+
+            prop_assert_eq!(method, "POST");
+            prop_assert_eq!(parsed_path, path.as_str());
+            prop_assert_eq!(parsed.body, body);
+        }
+    }
+
+    #[test]
     fn conflicting_content_length_headers_are_rejected() {
         let request = b"POST /memory HTTP/1.1\r\ncontent-length: 0\r\ncontent-length: 2\r\n\r\n{}";
         let mut reader = Cursor::new(request.as_slice());
@@ -10193,6 +18901,95 @@ mod tests {
                 second: 2
             }
         ));
+    }
+
+    #[test]
+    fn declared_oversized_bodies_are_rejected_without_body_bytes() {
+        let request = format!(
+            "POST /memory HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        let mut reader = Cursor::new(request.into_bytes());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("oversized declared body should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, HttpRequestError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn duplicate_matching_content_length_headers_are_rejected() {
+        let request =
+            b"POST /memory HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\ncontent-length: 2\r\n\r\n{}";
+        let mut reader = Cursor::new(request.as_slice());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("duplicate content-length headers should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, HttpRequestError::DuplicateContentLength));
+    }
+
+    #[test]
+    fn transfer_encoding_headers_are_rejected() {
+        let request =
+            b"POST /memory HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut reader = Cursor::new(request.as_slice());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("unsupported transfer-encoding should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            HttpRequestError::UnsupportedTransferEncoding { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_header_lines_are_rejected() {
+        let mut reader = Cursor::new(b"GET /status HTTP/1.1\r\nhost localhost\r\n\r\n".as_slice());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("malformed header line should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            HttpRequestError::MalformedHeaderLine { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_header_names_are_rejected() {
+        let mut reader =
+            Cursor::new(b"GET /status HTTP/1.1\r\nbad header: value\r\n\r\n".as_slice());
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("invalid header name should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, HttpRequestError::InvalidHeaderName { .. }));
+    }
+
+    #[test]
+    fn duplicate_host_headers_are_rejected() {
+        let mut reader = Cursor::new(
+            b"GET /status HTTP/1.1\r\nhost: localhost\r\nhost: 127.0.0.1\r\n\r\n".as_slice(),
+        );
+
+        let error = match read_http_request(&mut reader) {
+            Ok(_) => panic!("duplicate host header should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, HttpRequestError::DuplicateHostHeader));
     }
 
     #[test]
@@ -10220,6 +19017,76 @@ mod tests {
                 .contains("state validation failed")
         );
         assert!(store.load().expect("load").tasks.is_empty());
+    }
+
+    #[test]
+    fn state_sqlite_api_syncs_and_restores_mirror() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let sqlite_path = dir.path().join("mirror.sqlite");
+        let mut os = OperatingSystem::new("api-test");
+        os.create_task(Task::new(
+            "Mirror task",
+            "Check SQLite sync",
+            Priority::Normal,
+            vec!["rust".into()],
+        ));
+        store.save(&os).expect("save state");
+
+        let request = serde_json::json!({
+            "output": sqlite_path.display().to_string()
+        })
+        .to_string();
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/state/sqlite", request.as_bytes());
+        let synced: serde_json::Value = serde_json::from_str(&body).expect("sync json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(synced["path"], sqlite_path.display().to_string());
+        assert_eq!(synced["state_path"], store.path().display().to_string());
+        assert_eq!(synced["initialized"], true);
+        assert_eq!(synced["imported"], true);
+        assert_eq!(synced["import"]["imported_snapshot"], true);
+        assert_eq!(synced["import"]["imported_runs"], 0);
+        assert!(synced["restore"].is_null());
+
+        let sqlite = SqliteStore::new(&sqlite_path);
+        assert_eq!(sqlite.task_record_count().expect("task count"), 1);
+        assert_eq!(sqlite.load_snapshot().expect("snapshot").tasks.len(), 1);
+
+        let request = serde_json::json!({
+            "output": sqlite_path.display().to_string(),
+            "restore": true,
+            "force": true,
+            "dry_run": true
+        })
+        .to_string();
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/state/sqlite", request.as_bytes());
+        let restored: serde_json::Value = serde_json::from_str(&body).expect("restore json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(restored["imported"], false);
+        assert_eq!(restored["dry_run"], true);
+        assert!(restored["import"].is_null());
+        assert_eq!(restored["restore"]["restored_snapshot"], false);
+        assert_eq!(restored["restore"]["restored_runs"], 0);
+        assert_eq!(restored["restore"]["validation"]["valid"], true);
+
+        let request = serde_json::json!({
+            "init_only": true,
+            "restore": true
+        })
+        .to_string();
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/state/sqlite", request.as_bytes());
+        let conflict: serde_json::Value = serde_json::from_str(&body).expect("conflict json");
+
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(
+            conflict["error"],
+            "init_only cannot be combined with restore"
+        );
     }
 
     #[test]
@@ -10342,6 +19209,977 @@ mod tests {
     }
 
     #[test]
+    fn workflow_api_edits_dag_and_transitions_stages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("api-test");
+        let mut plan = Task::new("Plan", "Plan the work", Priority::Normal, vec![]);
+        let plan_id = plan.id.clone();
+        let mut build = Task::new("Build", "Build the work", Priority::Normal, vec![]);
+        build.dependencies.push(plan_id.clone());
+        let build_id = build.id.clone();
+        os.ensure_unique_task_id(&mut plan);
+        os.ensure_unique_task_id(&mut build);
+        os.create_task(plan);
+        os.create_task(build);
+        let workflow = Workflow::new(
+            "Ship workflow",
+            Priority::Normal,
+            BTreeMap::from([
+                ("plan".into(), plan_id.clone()),
+                ("build".into(), build_id.clone()),
+            ]),
+        );
+        let workflow_id = workflow.id.clone();
+        os.create_workflow(workflow);
+        store.save(&os).expect("save state");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/tasks"),
+            br#"{"stage":"review","title":"Review","dependencies":["build"],"required_capabilities":["review"],"priority":"high"}"#,
+        );
+        let add: serde_json::Value = serde_json::from_str(&body).expect("add json");
+        let review_id = TaskId::from_slug(add["task_id"].as_str().expect("review id"));
+        assert_eq!(status, "201 Created");
+        assert_eq!(add["stage"], "review");
+        assert_eq!(add["task"]["priority"], "high");
+        assert_eq!(add["progress"]["total_tasks"], 3);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/link"),
+            br#"{"from":"plan","to":"review"}"#,
+        );
+        let link: serde_json::Value = serde_json::from_str(&body).expect("link json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(link["linked"], true);
+        assert!(
+            store
+                .load()
+                .expect("load")
+                .tasks
+                .get(&review_id)
+                .expect("review task")
+                .dependencies
+                .contains(&plan_id)
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/unlink"),
+            br#"{"from":"build","to":"review"}"#,
+        );
+        let unlink: serde_json::Value = serde_json::from_str(&body).expect("unlink json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(unlink["linked"], false);
+        assert!(
+            !store
+                .load()
+                .expect("load")
+                .tasks
+                .get(&review_id)
+                .expect("review task")
+                .dependencies
+                .contains(&build_id)
+        );
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, &format!("/workflows/{workflow_id}/dag"));
+        let dag: serde_json::Value = serde_json::from_str(&body).expect("dag json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(dag["id"], workflow_id.to_string());
+        assert_eq!(dag["nodes"].as_array().expect("nodes").len(), 3);
+        assert_eq!(dag["edges"].as_array().expect("edges").len(), 2);
+        assert!(dag["edges"].as_array().expect("edges").iter().any(|edge| {
+            edge["from"] == "plan"
+                && edge["to"] == "build"
+                && edge["from_task_id"] == plan_id.to_string()
+                && edge["to_task_id"] == build_id.to_string()
+        }));
+        assert!(dag["edges"].as_array().expect("edges").iter().any(|edge| {
+            edge["from"] == "plan"
+                && edge["to"] == "review"
+                && edge["from_task_id"] == plan_id.to_string()
+                && edge["to_task_id"] == review_id.to_string()
+        }));
+        assert_eq!(
+            dag["external_dependencies"]
+                .as_array()
+                .expect("external")
+                .len(),
+            0
+        );
+        assert_eq!(dag["progress"]["total_tasks"], 3);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/pause"),
+            b"",
+        );
+        let pause: serde_json::Value = serde_json::from_str(&body).expect("pause json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(pause["action"], "paused");
+        assert_eq!(
+            pause["affected_tasks"].as_array().expect("affected").len(),
+            3
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/resume"),
+            br#"{"note":"continue"}"#,
+        );
+        let resume: serde_json::Value = serde_json::from_str(&body).expect("resume json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(resume["action"], "resumed");
+        assert_eq!(
+            resume["affected_tasks"].as_array().expect("affected").len(),
+            3
+        );
+
+        let (status, body) =
+            response_for_mutation(&store, "POST", &format!("/tasks/{review_id}/block"), b"");
+        assert_eq!(status, "200 OK", "{body}");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/retry"),
+            b"",
+        );
+        let retry: serde_json::Value = serde_json::from_str(&body).expect("retry json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(retry["action"], "retried");
+        assert_eq!(
+            retry["affected_tasks"].as_array().expect("affected").len(),
+            1
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/workflows/{workflow_id}/link"),
+            br#"{"from":"review","to":"review"}"#,
+        );
+        let invalid: serde_json::Value = serde_json::from_str(&body).expect("invalid json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(invalid["error"], "workflow stage cannot depend on itself");
+        assert!(validate_state(&store.load().expect("load")).valid);
+    }
+
+    #[test]
+    fn registry_api_lists_templates_and_creates_workflow_from_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("api-test");
+        os.workflow_templates.insert(
+            "release".into(),
+            crate::models::WorkflowTemplate {
+                id: "release".into(),
+                name: "Release".into(),
+                description: "Release workflow.".into(),
+                stages: vec!["plan".into(), "build".into(), "ship".into()],
+                tasks: vec![
+                    crate::models::WorkflowTemplateTask {
+                        stage: "build".into(),
+                        title: Some("Build {objective}".into()),
+                        objective: Some("Compile {objective}".into()),
+                        command: Some("printf build-{objective}".into()),
+                        capabilities: vec!["rust".into()],
+                    },
+                    crate::models::WorkflowTemplateTask {
+                        stage: "ship".into(),
+                        title: Some("Ship {objective}".into()),
+                        objective: Some("Publish {objective}".into()),
+                        command: None,
+                        capabilities: vec!["ops".into()],
+                    },
+                ],
+                edges: vec![
+                    crate::models::WorkflowTemplateEdge {
+                        from: "plan".into(),
+                        to: "build".into(),
+                    },
+                    crate::models::WorkflowTemplateEdge {
+                        from: "build".into(),
+                        to: "ship".into(),
+                    },
+                ],
+            },
+        );
+        store.save(&os).expect("save state");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/registry/templates");
+        let templates: serde_json::Value = serde_json::from_str(&body).expect("templates json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(templates["ci-fix"]["stages"][0], "reproduce");
+
+        let (status, body) = response_for_path(&loaded, "/registry/templates/ci-fix");
+        let template: serde_json::Value = serde_json::from_str(&body).expect("template json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(template["id"], "ci-fix");
+        assert_eq!(template["stages"].as_array().expect("stages").len(), 4);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/templates/ci-fix/workflows",
+            br#"{"objective":"Fix failing CI","priority":"high"}"#,
+        );
+        let created: serde_json::Value = serde_json::from_str(&body).expect("created json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(created["template"], "ci-fix");
+        assert_eq!(created["workflow"]["objective"], "Fix failing CI");
+        assert_eq!(created["workflow"]["priority"], "high");
+        assert_eq!(created["tasks"].as_object().expect("tasks").len(), 4);
+        assert_eq!(created["dag"]["nodes"].as_array().expect("nodes").len(), 4);
+        assert_eq!(created["dag"]["edges"].as_array().expect("edges").len(), 3);
+        assert_eq!(created["dag"]["progress"]["total_tasks"], 4);
+
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.workflows.len(), 1);
+        assert_eq!(loaded.tasks.len(), 4);
+        assert!(validate_state(&loaded).valid);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/templates/release/workflows",
+            br#"{"objective":"v1"}"#,
+        );
+        let created: serde_json::Value = serde_json::from_str(&body).expect("created release json");
+        assert_eq!(status, "201 Created");
+        let build_id = created["tasks"]["build"].as_str().expect("build id");
+        let ship_id = created["tasks"]["ship"].as_str().expect("ship id");
+        let loaded = store.load().expect("load release workflow");
+        let build_task_id = TaskId::from_slug(build_id);
+        let ship_task_id = TaskId::from_slug(ship_id);
+        let build_task = loaded.tasks.get(&build_task_id).expect("build task");
+        let ship_task = loaded.tasks.get(&ship_task_id).expect("ship task");
+        assert_eq!(build_task.title, "Build v1");
+        assert_eq!(build_task.objective, "Compile v1");
+        assert_eq!(build_task.command.as_deref(), Some("printf build-v1"));
+        assert_eq!(build_task.required_capabilities, vec!["rust".to_owned()]);
+        assert_eq!(ship_task.dependencies, vec![build_task_id]);
+    }
+
+    #[test]
+    fn registry_api_imports_marketplace_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        store
+            .save(&OperatingSystem::new("api-test"))
+            .expect("save state");
+        let manifest = MarketplaceManifest {
+            metadata: Some(MarketplaceManifestMetadata {
+                id: "api-market".into(),
+                version: "1.0.0".into(),
+                publisher: Some("Agent OS tests".into()),
+                homepage: None,
+            }),
+            agent_profiles: vec![AgentProfile {
+                id: "api-reviewer".into(),
+                name: "API Reviewer".into(),
+                kind: AgentKind::Reviewer,
+                model: Some("review-model".into()),
+                capabilities: vec!["review".into()],
+                system_prompt: Some("Review imported work.".into()),
+            }],
+            workflow_templates: vec![WorkflowTemplate {
+                id: "api-release".into(),
+                name: "API Release".into(),
+                description: "Ship from API manifest.".into(),
+                stages: vec!["plan".into(), "build".into()],
+                tasks: vec![crate::models::WorkflowTemplateTask {
+                    stage: "build".into(),
+                    title: Some("Build {objective}".into()),
+                    objective: Some("Compile {objective}".into()),
+                    command: Some("printf build".into()),
+                    capabilities: vec!["rust".into()],
+                }],
+                edges: vec![WorkflowTemplateEdge {
+                    from: "plan".into(),
+                    to: "build".into(),
+                }],
+            }],
+            mcp_servers: vec![McpServer {
+                id: "api-mcp".into(),
+                command: "printf".into(),
+                args: vec!["{}".into()],
+                env: BTreeMap::from([("API_TOKEN".into(), "secret".into())]),
+                enabled: true,
+            }],
+        };
+        let checksum = fnv1a64_checksum(&serde_json::to_vec(&manifest).expect("manifest json"));
+        let request = serde_json::to_vec(&json!({
+            "manifest": manifest,
+            "source": "api-test",
+            "expect_checksum": checksum
+        }))
+        .expect("request json");
+
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/registry/marketplace-import", &request);
+        let imported: serde_json::Value = serde_json::from_str(&body).expect("imported json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(imported["source"], "api-test");
+        assert_eq!(imported["verified_checksum"], true);
+        assert_eq!(imported["imported_agent_profiles"], 1);
+        assert_eq!(imported["imported_workflow_templates"], 1);
+        assert_eq!(imported["imported_mcp_servers"], 1);
+        assert_eq!(imported["overwritten"], 0);
+        assert_eq!(imported["checksum"], checksum);
+
+        let loaded = store.load().expect("load imported");
+        assert_eq!(
+            loaded
+                .agent_profiles
+                .get("api-reviewer")
+                .expect("profile")
+                .capabilities,
+            vec!["review".to_owned()]
+        );
+        assert!(loaded.workflow_templates.contains_key("api-release"));
+        assert!(loaded.mcp_servers.contains_key("api-mcp"));
+        assert!(
+            loaded
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::MarketplaceImported)
+        );
+        assert!(validate_state(&loaded).valid);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/profiles/api-reviewer/agents",
+            br#"{"name":"API Installed Reviewer","model":"override-model","parallel":2}"#,
+        );
+        let installed: serde_json::Value =
+            serde_json::from_str(&body).expect("installed profile agent json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(installed["profile"], "api-reviewer");
+        assert_eq!(installed["agent"]["name"], "API Installed Reviewer");
+        assert_eq!(installed["agent"]["model"], "override-model");
+        assert_eq!(installed["agent"]["max_parallel_tasks"], 2);
+        assert_eq!(installed["agent"]["capabilities"][0], "review");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/profiles/api-reviewer/agents",
+            br#"{"name":"API Installed Reviewer"}"#,
+        );
+        let duplicate_agent: serde_json::Value =
+            serde_json::from_str(&body).expect("duplicate installed agent json");
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(duplicate_agent["error"], "agent already exists");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/profiles/missing/agents",
+            br#"{"parallel":1}"#,
+        );
+        let missing_profile: serde_json::Value =
+            serde_json::from_str(&body).expect("missing profile json");
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(missing_profile["error"], "agent profile not found");
+
+        let loaded = store.load().expect("load installed profile agent");
+        assert!(
+            loaded
+                .agents
+                .contains_key(&AgentId::new("api-installed-reviewer"))
+        );
+        assert!(validate_state(&loaded).valid);
+
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/registry/marketplace-import", &request);
+        let duplicate: serde_json::Value = serde_json::from_str(&body).expect("duplicate json");
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(duplicate["error"], "agent profile already exists");
+
+        let forced_request: serde_json::Value =
+            serde_json::from_slice(&request).expect("forced request value");
+        let mut forced_request = forced_request.as_object().expect("request object").clone();
+        forced_request.insert("force".into(), json!(true));
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/marketplace-import",
+            &serde_json::to_vec(&forced_request).expect("forced request json"),
+        );
+        let forced: serde_json::Value = serde_json::from_str(&body).expect("forced json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(forced["overwritten"], 3);
+
+        let bad_checksum_request = serde_json::to_vec(&json!({
+            "manifest": forced_request["manifest"],
+            "expect_checksum": "fnv1a64:0000000000000000"
+        }))
+        .expect("bad checksum request json");
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/marketplace-import",
+            &bad_checksum_request,
+        );
+        let mismatch: serde_json::Value = serde_json::from_str(&body).expect("mismatch json");
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(mismatch["error"], "marketplace checksum mismatch");
+    }
+
+    #[test]
+    fn registry_api_manages_mcp_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        store
+            .save(&OperatingSystem::new("api-test"))
+            .expect("save state");
+
+        let request = serde_json::json!({
+            "id": "local-tools",
+            "command": "agent-os-mcp",
+            "args": ["--stdio"],
+            "env": { "AGENT_OS_TOKEN": "test-token" },
+            "enabled": false
+        })
+        .to_string();
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/registry/mcp-servers", request.as_bytes());
+        let created: serde_json::Value = serde_json::from_str(&body).expect("created json");
+
+        assert_eq!(status, "201 Created");
+        assert_eq!(created["id"], "local-tools");
+        assert_eq!(created["mcp_server"]["command"], "agent-os-mcp");
+        assert_eq!(created["mcp_server"]["args"][0], "--stdio");
+        assert_eq!(created["mcp_server"]["env"]["AGENT_OS_TOKEN"], "test-token");
+        assert_eq!(created["mcp_server"]["enabled"], false);
+
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/registry/mcp-servers", request.as_bytes());
+        let duplicate: serde_json::Value = serde_json::from_str(&body).expect("duplicate json");
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(duplicate["error"], "mcp server already exists");
+
+        let request = serde_json::json!({
+            "enabled": true,
+            "args": [],
+            "env": {}
+        })
+        .to_string();
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/mcp-servers/local-tools",
+            request.as_bytes(),
+        );
+        let updated: serde_json::Value = serde_json::from_str(&body).expect("updated json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(updated["mcp_server"]["enabled"], true);
+        assert_eq!(updated["mcp_server"]["args"], serde_json::json!([]));
+        assert_eq!(updated["mcp_server"]["env"], serde_json::json!({}));
+
+        let loaded = store.load().expect("load state");
+        assert_eq!(
+            loaded
+                .mcp_servers
+                .get("local-tools")
+                .expect("mcp server")
+                .enabled,
+            true
+        );
+        assert!(
+            loaded
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::McpServerUpdated)
+        );
+
+        let (status, body) =
+            response_for_mutation(&store, "DELETE", "/registry/mcp-servers/local-tools", b"");
+        let deleted: serde_json::Value = serde_json::from_str(&body).expect("deleted json");
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(deleted["removed"], true);
+        assert_eq!(deleted["mcp_server"]["id"], "local-tools");
+        assert!(
+            !store
+                .load()
+                .expect("reload")
+                .mcp_servers
+                .contains_key("local-tools")
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/registry/mcp-servers",
+            br#"{"id":"bad-env","command":"agent-os-mcp","env":{"1BAD":"x"}}"#,
+        );
+        let invalid: serde_json::Value = serde_json::from_str(&body).expect("invalid json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(
+            invalid["error"],
+            "mcp environment key must be a valid environment variable name"
+        );
+    }
+
+    #[test]
+    fn approval_api_lists_and_resolves_gates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("api-test");
+        let mut task = Task::new(
+            "Approve deploy",
+            "Deploy after review",
+            Priority::Normal,
+            vec![],
+        );
+        task.status = TaskStatus::Blocked;
+        let task_id = task.id.clone();
+        os.create_task(task);
+        let approval = ApprovalRequest::new(
+            task_id.clone(),
+            None,
+            "git push origin main",
+            "risky command matched policy",
+        );
+        let approval_id = approval.id.clone();
+        os.request_approval(approval);
+        store.save(&os).expect("save state");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/approvals");
+        let approvals: serde_json::Value = serde_json::from_str(&body).expect("approvals json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(approvals.as_array().expect("approvals").len(), 1);
+        assert_eq!(approvals[0]["status"], "pending");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/approvals/{approval_id}/approve"),
+            br#"{"by":"operator"}"#,
+        );
+        let approved: serde_json::Value = serde_json::from_str(&body).expect("approved json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(approved["id"], approval_id);
+        assert_eq!(approved["approval"]["status"], "approved");
+        assert_eq!(approved["approval"]["resolved_by"], "operator");
+        assert_eq!(
+            store
+                .load()
+                .expect("load approved")
+                .tasks
+                .get(&task_id)
+                .expect("task")
+                .status,
+            TaskStatus::Pending
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            &format!("/approvals/{approval_id}/deny"),
+            b"",
+        );
+        let denied: serde_json::Value = serde_json::from_str(&body).expect("denied json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(denied["approval"]["status"], "approved");
+
+        let (status, body) = response_for_mutation(&store, "POST", "/approvals/!!!/approve", b"");
+        let invalid: serde_json::Value = serde_json::from_str(&body).expect("invalid json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(
+            invalid["error"],
+            "approval id must contain at least one ASCII letter, digit, or hyphen"
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/approvals/missing/approve",
+            br#"{"by":"operator"}"#,
+        );
+        let missing: serde_json::Value = serde_json::from_str(&body).expect("missing json");
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(missing["error"], "approval not found");
+        assert!(validate_state(&store.load().expect("load")).valid);
+    }
+
+    #[test]
+    fn worker_and_eval_api_manage_distributed_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("api-test");
+        os.policy.allow_shell = true;
+        os.policy.command_timeout_seconds = 1;
+        os.register_agent(Agent::new(
+            "builder",
+            AgentKind::Builder,
+            None,
+            vec!["rust".into()],
+            1,
+        ));
+        let task = Task::new(
+            "Remote worker task",
+            "claim through worker node",
+            Priority::Normal,
+            vec!["rust".into()],
+        );
+        let task_id = task.id.clone();
+        os.create_task(task);
+        store.save(&os).expect("save state");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/workers",
+            br#"{"id":"remote-a","endpoint":"http://127.0.0.1:9000"}"#,
+        );
+        let worker: serde_json::Value = serde_json::from_str(&body).expect("worker json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(worker["id"], "remote-a");
+        assert_eq!(worker["worker"]["status"], "online");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/workers/remote-a/heartbeat",
+            br#"{"status":"busy","endpoint":"http://127.0.0.1:9001"}"#,
+        );
+        let heartbeat: serde_json::Value = serde_json::from_str(&body).expect("heartbeat json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(heartbeat["worker"]["status"], "busy");
+        assert_eq!(heartbeat["worker"]["endpoint"], "http://127.0.0.1:9001");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/workers?status=busy&query=9001&limit=1");
+        let workers: serde_json::Value = serde_json::from_str(&body).expect("workers json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(workers.as_array().expect("workers").len(), 1);
+        assert_eq!(workers[0]["id"], "remote-a");
+
+        let (status, body) = response_for_path(&loaded, "/workers/remote-a");
+        let worker_detail: serde_json::Value = serde_json::from_str(&body).expect("worker detail");
+        assert_eq!(status, "200 OK");
+        assert_eq!(worker_detail["id"], "remote-a");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/workers",
+            br#"{"id":"builder","endpoint":"http://127.0.0.1:9100"}"#,
+        );
+        assert_eq!(status, "201 Created");
+        let _: serde_json::Value = serde_json::from_str(&body).expect("builder worker json");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/workers/builder/claim",
+            br#"{"lease_seconds":30}"#,
+        );
+        let claim: serde_json::Value = serde_json::from_str(&body).expect("worker claim json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(claim["claimed"], true);
+        assert_eq!(claim["assignment"]["agent_id"], "builder");
+        assert_eq!(claim["assignment"]["task_id"], task_id.to_string());
+        assert_eq!(claim["task"]["title"], "Remote worker task");
+        assert_eq!(claim["worker"]["status"], "online");
+
+        let report_request = serde_json::to_vec(&serde_json::json!({
+            "task_id": task_id,
+            "status": "complete",
+            "note": "worker finished remotely",
+            "command": "printf worker-claim",
+            "cwd": "/tmp/remote-worker",
+            "exit_code": 0,
+            "artifacts": [{
+                "kind": "stdout",
+                "path": "artifacts/stdout.log",
+                "bytes": 18,
+                "content_type": "text/plain"
+            }]
+        }))
+        .expect("worker report request");
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/workers/builder/report", &report_request);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("worker report json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(report["reported"], true);
+        assert_eq!(report["task"]["status"], "complete");
+        assert_eq!(report["task"]["output"], "worker finished remotely");
+        assert_eq!(report["run"]["status"], "success");
+        assert_eq!(report["run"]["command"], "printf worker-claim");
+        assert_eq!(report["run"]["cwd"], "/tmp/remote-worker");
+        assert_eq!(report["run"]["exit_code"], 0);
+        assert_eq!(report["run"]["artifacts"][0]["kind"], "stdout");
+        assert_eq!(
+            report["run"]["artifacts"][0]["path"],
+            "artifacts/stdout.log"
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/evals",
+            br#"{"target":"ci-fix-workflow","success":true,"cost_micros":1234,"latency_ms":567}"#,
+        );
+        let eval: serde_json::Value = serde_json::from_str(&body).expect("eval json");
+        let eval_id = eval["id"].as_str().expect("eval id").to_owned();
+        assert_eq!(status, "201 Created");
+        assert_eq!(eval["eval"]["target"], "ci-fix-workflow");
+        assert_eq!(eval["eval"]["success"], true);
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(
+            &loaded,
+            "/evals?target=ci-fix-workflow&success=true&limit=1",
+        );
+        let evals: serde_json::Value = serde_json::from_str(&body).expect("evals json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(evals.as_array().expect("evals").len(), 1);
+        assert_eq!(evals[0]["id"], eval_id);
+
+        let (status, body) = response_for_path(&loaded, &format!("/evals/{eval_id}"));
+        let eval_detail: serde_json::Value = serde_json::from_str(&body).expect("eval detail");
+        assert_eq!(status, "200 OK");
+        assert_eq!(eval_detail["id"], eval_id);
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/evals/run",
+            br#"{"target":"local-smoke","command":"printf api-eval-run","success_pattern":"api-eval-run"}"#,
+        );
+        let eval_run: serde_json::Value = serde_json::from_str(&body).expect("eval run json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(eval_run["eval"]["target"], "local-smoke");
+        assert_eq!(eval_run["eval"]["success"], true);
+        assert_eq!(eval_run["eval"]["run"]["command"], "printf api-eval-run");
+        assert_eq!(eval_run["eval"]["run"]["stdout"], "api-eval-run");
+        assert_eq!(eval_run["eval"]["run"]["success_pattern"], "api-eval-run");
+        assert_eq!(eval_run["stdout"], "api-eval-run");
+        assert_eq!(eval_run["success_pattern_matched"], true);
+        assert_eq!(eval_run["output_schema_valid"], true);
+        assert_eq!(eval_run["output_schema_error"], serde_json::Value::Null);
+        assert_eq!(eval_run["timed_out"], false);
+        let eval_run_id = eval_run["id"].as_str().expect("eval run id").to_owned();
+        let loaded = store.load().expect("load eval run");
+        let (status, body) = response_for_path(&loaded, &format!("/evals/{eval_run_id}"));
+        let eval_run_detail: serde_json::Value =
+            serde_json::from_str(&body).expect("eval run detail json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(eval_run_detail["run"]["command"], "printf api-eval-run");
+
+        let (status, body) = response_for_path(&loaded, "/evals?query=api-eval-run&limit=1");
+        let queried_evals: serde_json::Value =
+            serde_json::from_str(&body).expect("queried evals json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(queried_evals.as_array().expect("queried evals").len(), 1);
+        assert_eq!(queried_evals[0]["id"], eval_run_id);
+
+        let output_schema = serde_json::json!({
+            "type": "object",
+            "required": ["message", "ok", "count"],
+            "properties": {
+                "message": { "type": "string" },
+                "ok": { "type": "boolean" },
+                "count": { "type": "integer" }
+            },
+            "additionalProperties": false
+        });
+        let valid_schema_request = serde_json::to_vec(&serde_json::json!({
+            "target": "schema-smoke",
+            "command": "printf '{\"message\":\"api-schema-run\",\"ok\":true,\"count\":2}'",
+            "output_schema": output_schema
+        }))
+        .expect("schema request json");
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/evals/run", &valid_schema_request);
+        let eval_schema_run: serde_json::Value =
+            serde_json::from_str(&body).expect("eval schema run json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(eval_schema_run["eval"]["success"], true);
+        assert_eq!(eval_schema_run["output_schema_valid"], true);
+        assert_eq!(
+            eval_schema_run["output_schema_error"],
+            serde_json::Value::Null
+        );
+        assert_eq!(eval_schema_run["eval"]["run"]["output_schema_valid"], true);
+
+        let invalid_schema_request = serde_json::to_vec(&serde_json::json!({
+            "target": "schema-smoke-invalid",
+            "command": "printf '{\"message\":\"api-schema-run\",\"ok\":\"yes\",\"count\":2}'",
+            "output_schema": {
+                "type": "object",
+                "required": ["message", "ok", "count"],
+                "properties": {
+                    "message": { "type": "string" },
+                    "ok": { "type": "boolean" },
+                    "count": { "type": "integer" }
+                },
+                "additionalProperties": false
+            }
+        }))
+        .expect("invalid schema request json");
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/evals/run", &invalid_schema_request);
+        let eval_schema_failure: serde_json::Value =
+            serde_json::from_str(&body).expect("eval schema failure json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(eval_schema_failure["eval"]["success"], false);
+        assert_eq!(eval_schema_failure["output_schema_valid"], false);
+        assert!(
+            eval_schema_failure["output_schema_error"]
+                .as_str()
+                .expect("schema error")
+                .contains("output.ok must match output_schema.type boolean")
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/evals/run",
+            br#"{"target":"timeout-smoke","command":"sleep 3; printf late"}"#,
+        );
+        let eval_timeout: serde_json::Value =
+            serde_json::from_str(&body).expect("eval timeout json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(eval_timeout["eval"]["success"], false);
+        assert_eq!(eval_timeout["eval"]["run"]["timed_out"], true);
+        assert_eq!(
+            eval_timeout["eval"]["run"]["status"],
+            serde_json::Value::Null
+        );
+        assert_eq!(eval_timeout["timed_out"], true);
+        assert_eq!(eval_timeout["status"], serde_json::Value::Null);
+
+        let (status, body) = response_for_mutation(&store, "DELETE", "/workers/remote-a", b"");
+        let removed: serde_json::Value = serde_json::from_str(&body).expect("removed json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(removed["removed"], true);
+
+        let (status, body) = response_for_mutation(&store, "DELETE", "/workers/builder", b"");
+        let removed: serde_json::Value = serde_json::from_str(&body).expect("removed builder json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(removed["removed"], true);
+
+        let loaded = store.load().expect("load");
+        assert!(loaded.workers.is_empty());
+        assert_eq!(loaded.evals.len(), 5);
+        assert!(validate_state(&loaded).valid);
+    }
+
+    #[test]
+    fn secrets_backend_api_manages_backend_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("api-test");
+        os.register_tool(ToolDefinition::new(
+            "secret-tool",
+            ToolKind::Shell,
+            "uses a secret",
+            vec![],
+            "printf {token}",
+            None,
+        ));
+        let mut task = Task::new("Needs token", "check secret", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        task.tool = Some(ToolInvocation::with_secret_env_args(
+            ToolId::new("secret-tool"),
+            BTreeMap::new(),
+            BTreeMap::from([("token".into(), "AGENT_OS_TEST_MISSING_SECRET".into())]),
+        ));
+        os.create_task(task);
+        store.save(&os).expect("save state");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/secrets?kind=env&limit=1");
+        let defaults: serde_json::Value = serde_json::from_str(&body).expect("defaults json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(defaults.as_array().expect("defaults").len(), 1);
+        assert_eq!(defaults[0]["id"], "environment");
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/secrets",
+            br#"{"id":"prod-op","kind":"1password","reference":"op://vault/item"}"#,
+        );
+        let created: serde_json::Value = serde_json::from_str(&body).expect("created json");
+        assert_eq!(status, "201 Created");
+        assert_eq!(created["id"], "prod-op");
+        assert_eq!(created["secrets_backend"]["kind"], "one-password");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/secrets?kind=one-password&query=vault");
+        let filtered: serde_json::Value = serde_json::from_str(&body).expect("filtered json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(filtered.as_array().expect("filtered").len(), 1);
+        assert_eq!(filtered[0]["id"], "prod-op");
+
+        let (status, body) = response_for_path(&loaded, "/secrets/prod-op");
+        let detail: serde_json::Value = serde_json::from_str(&body).expect("detail json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(detail["reference"], "op://vault/item");
+
+        let loaded = store.load().expect("load");
+        let (status, body) = response_for_path(&loaded, "/secrets/check");
+        let check: serde_json::Value = serde_json::from_str(&body).expect("check json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(check["total"], 1);
+        assert_eq!(check["present"], 0);
+        assert_eq!(check["missing"], 1);
+        assert_eq!(check["references"][0]["task_id"], task_id.to_string());
+        assert_eq!(
+            check["references"][0]["env"],
+            "AGENT_OS_TEST_MISSING_SECRET"
+        );
+        assert_eq!(check["references"][0]["present"], false);
+
+        let (status, body) =
+            response_for_mutation(&store, "POST", "/secrets", br#"{"id":"!!!","kind":"env"}"#);
+        let invalid: serde_json::Value = serde_json::from_str(&body).expect("invalid json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(
+            invalid["error"],
+            "secrets backend id must contain at least one ASCII letter, digit, or hyphen"
+        );
+
+        let (status, body) = response_for_mutation(
+            &store,
+            "POST",
+            "/secrets",
+            br#"{"id":"bad-kind","kind":"mystery"}"#,
+        );
+        let invalid_kind: serde_json::Value =
+            serde_json::from_str(&body).expect("invalid kind json");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(invalid_kind["error"], "invalid kind");
+
+        let (status, body) = response_for_mutation(&store, "DELETE", "/secrets/prod-op", b"");
+        let removed: serde_json::Value = serde_json::from_str(&body).expect("removed json");
+        assert_eq!(status, "200 OK");
+        assert_eq!(removed["removed"], true);
+
+        let loaded = store.load().expect("load");
+        assert!(!loaded.secrets_backends.contains_key("prod-op"));
+        assert!(validate_state(&loaded).valid);
+    }
+
+    #[test]
     fn claim_unknown_agent_returns_not_found_without_mutating_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::new(dir.path().join("state.json"));
@@ -10423,5 +20261,159 @@ mod tests {
         assert!(run.finished_at.is_none());
         assert!(run.exit_code.is_none());
         assert!(validate_state(&loaded).valid);
+    }
+
+    #[test]
+    fn cors_origin_policy_allows_loopback_and_rejects_remote_origins() {
+        let cors = ApiCors::default();
+        assert_eq!(
+            allowed_cors_origin("GET / HTTP/1.1\r\n", &cors).expect("missing origin"),
+            None
+        );
+        assert_eq!(
+            allowed_cors_origin("GET / HTTP/1.1\r\nOrigin: http://localhost:3000\r\n", &cors)
+                .expect("localhost"),
+            Some("http://localhost:3000".into())
+        );
+        assert_eq!(
+            allowed_cors_origin("GET / HTTP/1.1\r\nOrigin: http://127.0.0.1:3000\r\n", &cors)
+                .expect("ipv4"),
+            Some("http://127.0.0.1:3000".into())
+        );
+        assert_eq!(
+            allowed_cors_origin("GET / HTTP/1.1\r\nOrigin: http://[::1]:3000\r\n", &cors)
+                .expect("ipv6"),
+            Some("http://[::1]:3000".into())
+        );
+
+        let denied =
+            allowed_cors_origin("GET / HTTP/1.1\r\nOrigin: https://evil.example\r\n", &cors)
+                .expect_err("remote origin rejected");
+        assert_eq!(denied.0, "403 Forbidden");
+
+        let repeated = allowed_cors_origin(
+            "GET / HTTP/1.1\r\nOrigin: http://localhost:3000\r\nOrigin: https://evil.example\r\n",
+            &cors,
+        )
+        .expect_err("repeated origin rejected");
+        assert_eq!(repeated.0, "400 Bad Request");
+        let repeated_body: serde_json::Value =
+            serde_json::from_str(&repeated.1).expect("repeated origin body");
+        assert_eq!(repeated_body["error"], "origin must not be repeated");
+    }
+
+    #[test]
+    fn cors_origin_policy_allows_configured_remote_origins() {
+        let cors = ApiCors::allow_origins(vec!["https://dashboard.example".into()]);
+
+        assert_eq!(
+            allowed_cors_origin(
+                "GET / HTTP/1.1\r\nOrigin: https://dashboard.example\r\n",
+                &cors,
+            )
+            .expect("configured origin"),
+            Some("https://dashboard.example".into())
+        );
+        let denied =
+            allowed_cors_origin("GET / HTTP/1.1\r\nOrigin: https://other.example\r\n", &cors)
+                .expect_err("unconfigured remote origin rejected");
+        assert_eq!(denied.0, "403 Forbidden");
+        assert_eq!(
+            normalize_cors_origin("https://dashboard.example/path"),
+            None
+        );
+    }
+
+    #[test]
+    fn bearer_token_authorization_uses_exact_token_match() {
+        let handler = ApiHandler {
+            store: Store::new("unused-state.json"),
+            auth: ApiAuth::bearer(Some("secret-token".into())),
+            cors: ApiCors::default(),
+            config_path: None,
+        };
+
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Bearer secret-token\r\n"
+            ),
+            AuthDecision::Allowed
+        );
+        assert_eq!(
+            handler.authorize("GET", "GET / HTTP/1.1\r\nAuthorization: Bearer secret\r\n"),
+            AuthDecision::MissingOrInvalid
+        );
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Bearer secret-token\r\nAuthorization: Bearer secret-token\r\n"
+            ),
+            AuthDecision::MissingOrInvalid
+        );
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Bearer secret-token-extra\r\n"
+            ),
+            AuthDecision::MissingOrInvalid
+        );
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Basic secret-token\r\n"
+            ),
+            AuthDecision::MissingOrInvalid
+        );
+    }
+
+    #[test]
+    fn scoped_tokens_authorize_only_matching_methods() {
+        let handler = ApiHandler {
+            store: Store::new("unused-state.json"),
+            auth: ApiAuth::scoped(
+                Some("full-token".into()),
+                Some("read-token".into()),
+                Some("write-token".into()),
+            ),
+            cors: ApiCors::default(),
+            config_path: None,
+        };
+
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Bearer read-token\r\n"
+            ),
+            AuthDecision::Allowed
+        );
+        assert_eq!(
+            handler.authorize(
+                "POST",
+                "POST / HTTP/1.1\r\nAuthorization: Bearer read-token\r\n"
+            ),
+            AuthDecision::InsufficientScope
+        );
+        assert_eq!(
+            handler.authorize(
+                "DELETE",
+                "DELETE / HTTP/1.1\r\nAuthorization: Bearer write-token\r\n"
+            ),
+            AuthDecision::Allowed
+        );
+        assert_eq!(
+            handler.authorize(
+                "GET",
+                "GET / HTTP/1.1\r\nAuthorization: Bearer write-token\r\n"
+            ),
+            AuthDecision::InsufficientScope
+        );
+        assert_eq!(
+            handler.authorize(
+                "POST",
+                "POST / HTTP/1.1\r\nAuthorization: Bearer full-token\r\n"
+            ),
+            AuthDecision::Allowed
+        );
     }
 }

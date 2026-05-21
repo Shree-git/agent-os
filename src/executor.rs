@@ -1,20 +1,28 @@
 use crate::models::{
-    AgentId, EventKind, OperatingSystem, Policy, Priority, RunId, RunRecord, RunStatus, Task,
-    TaskId, ToolId, ToolInvocation, ToolKind,
+    AgentId, ApprovalRequest, AutonomyLevel, EventKind, NetworkMode, OperatingSystem, Policy,
+    Priority, ProviderKind, RunArtifact, RunArtifactKind, RunId, RunRecord, RunStatus, Task,
+    TaskId, TaskStatus, ToolDefinition, ToolId, ToolInvocation, ToolKind,
 };
-use crate::policy::{PolicyError, check_file_write_path, check_shell_command, check_workspace};
+use crate::policy::{
+    PolicyError, check_file_write_path, check_shell_command, check_shell_writes, check_workspace,
+};
+use crate::process_tree::terminate_child_process_tree;
 use crate::providers::{
     AgentProvider, AgentResponse, ProviderError, ProviderRequest, ProviderRuntime, ProviderToolCall,
 };
 use crate::runtime::{Runtime, RuntimeError};
+use crate::secrets::OperatingSystemSecretResolver;
 use crate::store::{Store, StoreError};
 use crate::tools::{
-    RenderedToolText, ToolError, render_tool_command_with_redaction_patterns,
-    render_tool_text_with_redaction_patterns, resolve_tool_arg, validate_tool_invocation,
+    RenderedToolText, ToolError, render_tool_command_with_resolver_and_redaction_patterns,
+    render_tool_text_with_resolver_and_redaction_patterns, resolve_tool_arg_with_resolver,
+    validate_tool_invocation,
 };
 use chrono::Utc;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -62,12 +70,15 @@ struct PreparedShellRun {
     run: RunRecord,
     store: Store,
     log_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
     command: String,
     cwd_path: PathBuf,
     max_output_bytes: usize,
     timeout: Duration,
     env: Vec<(String, String)>,
     redacted_values: Vec<String>,
+    process_isolation: bool,
 }
 
 struct PreparedProviderRun {
@@ -210,10 +221,21 @@ fn prepare_work(
         .get(task_id)
         .cloned()
         .ok_or_else(|| ExecutorError::TaskNotFound(task_id.clone()))?;
+    if task.status == TaskStatus::Pending {
+        if let Some(task) = os.tasks.get_mut(task_id) {
+            task.attempts = task.attempts.saturating_add(1);
+            task.updated_at = Utc::now();
+        }
+        os.record(
+            EventKind::TaskUpdated,
+            format!("started task {} direct execution attempt", task_id),
+        );
+    }
     let agent_id = task.assigned_to.clone();
     let command_override = task.command.clone();
     let cwd_override = task.cwd.clone();
     let tool_invocation = task.tool.clone();
+    let secret_resolver = OperatingSystemSecretResolver::new(os.secrets_backends.clone());
     let tool_work = if let Some(invocation) = tool_invocation {
         let tool = os.tools.get(&invocation.tool_id).cloned();
         let Some(tool) = tool else {
@@ -246,9 +268,10 @@ fn prepare_work(
             return Err(error.into());
         }
         match tool.kind {
-            ToolKind::Shell => match render_tool_command_with_redaction_patterns(
+            ToolKind::Shell => match render_tool_command_with_resolver_and_redaction_patterns(
                 &tool,
                 &invocation,
+                &secret_resolver,
                 &os.policy.redacted_env_patterns,
             ) {
                 Ok(rendered) => Some(ToolWork::Shell(rendered)),
@@ -270,14 +293,20 @@ fn prepare_work(
                 }
             },
             ToolKind::FileRead | ToolKind::FileWrite => {
-                match render_tool_text_with_redaction_patterns(
+                match render_tool_text_with_resolver_and_redaction_patterns(
                     &tool,
                     &invocation,
+                    &secret_resolver,
                     &os.policy.redacted_env_patterns,
                 ) {
                     Ok(rendered) => {
                         let body = if tool.kind == ToolKind::FileWrite {
-                            match resolve_tool_arg(&tool, &invocation, "body") {
+                            match resolve_tool_arg_with_resolver(
+                                &tool,
+                                &invocation,
+                                "body",
+                                &secret_resolver,
+                            ) {
                                 Ok(body) => Some(body),
                                 Err(ToolError::MissingArgument { .. }) => None,
                                 Err(error) => {
@@ -363,8 +392,58 @@ fn prepare_work(
             .as_ref()
             .and_then(|agent_id| os.agents.get(agent_id));
         let tools = os.tools.values().cloned().collect::<Vec<_>>();
-        let request = ProviderRequest::with_context(agent, &task, &tools, &os.memory);
+        let memory = os.provider_memory_for_task(&task, chrono::Utc::now());
+        let request = ProviderRequest::with_ordered_context_limited(
+            agent,
+            &task,
+            &tools,
+            &memory,
+            os.memory_policy.max_provider_memories,
+        );
         let provider_command = format!("provider:{}", os.provider.kind);
+        if matches!(
+            os.policy.autonomy,
+            AutonomyLevel::ObserveOnly | AutonomyLevel::Suggest
+        ) {
+            let message = format!(
+                "provider execution is disabled by autonomy level {}",
+                autonomy_label(&os.policy.autonomy)
+            );
+            reject_run_message_with_event(
+                os,
+                store,
+                RunRejection {
+                    task_id: task_id.clone(),
+                    agent_id,
+                    command: provider_command,
+                    cwd: cwd_override.clone().unwrap_or_else(|| ".".into()),
+                    message,
+                    event_kind: EventKind::RunFinished,
+                },
+            )?;
+            return Err(
+                PolicyError::Rejected("provider execution is disabled by autonomy".into()).into(),
+            );
+        }
+        if os.policy.network.mode == NetworkMode::Disabled && os.provider.kind != ProviderKind::Mock
+        {
+            let message = "network access is disabled for providers".to_string();
+            reject_run_message_with_event(
+                os,
+                store,
+                RunRejection {
+                    task_id: task_id.clone(),
+                    agent_id,
+                    command: provider_command,
+                    cwd: cwd_override.clone().unwrap_or_else(|| ".".into()),
+                    message,
+                    event_kind: EventKind::RunFinished,
+                },
+            )?;
+            return Err(
+                PolicyError::Rejected("network access is disabled for providers".into()).into(),
+            );
+        }
         let provider = match ProviderRuntime::from_settings(&os.provider) {
             Ok(provider) => provider,
             Err(error) => {
@@ -384,12 +463,13 @@ fn prepare_work(
                 return Err(error.into());
             }
         };
-        let run = RunRecord::new(
+        let mut run = RunRecord::new(
             task_id.clone(),
             agent_id,
             provider_command,
             cwd_override.clone().unwrap_or_else(|| ".".into()),
         );
+        os.ensure_unique_run_id(&mut run);
         os.record(
             EventKind::RunStarted,
             format!("started provider run {} for task {}", run.id, task_id),
@@ -422,17 +502,41 @@ fn prepare_work(
     let recorded_command = redact_values(command.clone(), &redacted_values);
 
     if let Err(error) = check_shell_command(&os.policy, &command) {
-        reject_run(os, store, task_id, agent_id, recorded_command, cwd, &error)?;
-        return Err(error.into());
+        if let PolicyError::ApprovalRequired(_) = &error
+            && approval_already_granted(os, task_id, &recorded_command)
+        {
+            os.record(
+                EventKind::ApprovalResolved,
+                format!("approved action reused for task {}", task_id),
+            );
+        } else {
+            if let PolicyError::ApprovalRequired(reason) = &error {
+                os.request_approval(ApprovalRequest::new(
+                    task_id.clone(),
+                    None,
+                    recorded_command.clone(),
+                    reason.clone(),
+                ));
+            }
+            reject_run(os, store, task_id, agent_id, recorded_command, cwd, &error)?;
+            return Err(error.into());
+        }
     }
 
     if let Err(error) = check_workspace(&os.policy, &cwd_path) {
         reject_run(os, store, task_id, agent_id, recorded_command, cwd, &error)?;
         return Err(error.into());
     }
+    if let Err(error) = check_shell_writes(&os.policy, &command, &cwd_path) {
+        reject_run(os, store, task_id, agent_id, recorded_command, cwd, &error)?;
+        return Err(error.into());
+    }
 
     let mut run = RunRecord::new(task_id.clone(), agent_id, recorded_command, cwd);
+    os.ensure_unique_run_id(&mut run);
     let log_path = store.run_log_path(&run.id);
+    let stdout_path = store.run_artifact_path(&run.id, "stdout.log");
+    let stderr_path = store.run_artifact_path(&run.id, "stderr.log");
     run.log_path = Some(log_path.display().to_string());
     os.record(
         EventKind::RunStarted,
@@ -444,6 +548,8 @@ fn prepare_work(
         run,
         store: store.clone(),
         log_path,
+        stdout_path,
+        stderr_path,
         command,
         cwd_path,
         max_output_bytes: os.policy.max_output_bytes,
@@ -453,6 +559,7 @@ fn prepare_work(
             .into_iter()
             .chain(redacted_values)
             .collect(),
+        process_isolation: os.policy.sandbox.process_isolation,
     }))
 }
 
@@ -561,12 +668,13 @@ fn prepare_file_work(
         None
     };
 
-    let run = RunRecord::new(
+    let mut run = RunRecord::new(
         task_id.clone(),
         agent_id,
         recorded_command,
         redacted_path.clone(),
     );
+    os.ensure_unique_run_id(&mut run);
     os.record(
         EventKind::RunStarted,
         format!("started file tool run {} for task {}", run.id, task_id),
@@ -610,47 +718,58 @@ fn execute_prepared_work(prepared: PreparedWork) -> Result<FinishedRun, Executor
 
 fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, ExecutorError> {
     let started = Instant::now();
-    if let Some(parent) = prepared.log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| ExecutorError::Io {
-            task_id: prepared.run.task_id.clone(),
-            source,
-        })?;
-    }
-    let initial_log = format!("$ {}\n\n[stdout]\n", prepared.run.command);
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&prepared.log_path)
-        .map_err(|source| ExecutorError::Io {
-            task_id: prepared.run.task_id.clone(),
-            source,
-        })?;
-    let live_log = Arc::new(Mutex::new(LiveLog::new(file, prepared.max_output_bytes)));
+    create_parent_dir(&prepared.run.task_id, &prepared.log_path)?;
+    create_parent_dir(&prepared.run.task_id, &prepared.stdout_path)?;
+    create_parent_dir(&prepared.run.task_id, &prepared.stderr_path)?;
+    let initial_log = format!(
+        "$ {}\n{}\n[stdout]\n",
+        prepared.run.command,
+        run_trace_log_line(&prepared.run)
+    );
+    let live_log = open_live_sink(
+        &prepared.run.task_id,
+        &prepared.log_path,
+        prepared.max_output_bytes,
+    )?;
+    let stdout_artifact = open_live_sink(
+        &prepared.run.task_id,
+        &prepared.stdout_path,
+        prepared.max_output_bytes,
+    )?;
+    let stderr_artifact = open_live_sink(
+        &prepared.run.task_id,
+        &prepared.stderr_path,
+        prepared.max_output_bytes,
+    )?;
     append_live_log(&live_log, &initial_log).map_err(|source| ExecutorError::Io {
         task_id: prepared.run.task_id.clone(),
         source,
     })?;
 
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&prepared.command)
         .current_dir(&prepared.cwd_path)
         .env_clear()
         .envs(prepared.env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| ExecutorError::Io {
-            task_id: prepared.run.task_id.clone(),
-            source,
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if prepared.process_isolation {
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|source| ExecutorError::Io {
+        task_id: prepared.run.task_id.clone(),
+        source,
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_reader = stdout.map(|stdout| {
         spawn_pipe_reader(
             stdout,
             live_log.clone(),
+            Some(stdout_artifact.clone()),
             prepared.redacted_values.clone(),
             None,
         )
@@ -659,6 +778,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
         spawn_pipe_reader(
             stderr,
             live_log.clone(),
+            Some(stderr_artifact.clone()),
             prepared.redacted_values.clone(),
             Some("\n[stderr]\n"),
         )
@@ -678,18 +798,22 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
         }
         if started.elapsed() >= prepared.timeout {
             timed_out = true;
-            child.kill().map_err(|source| ExecutorError::Io {
-                task_id: prepared.run.task_id.clone(),
-                source,
-            })?;
+            terminate_child_process_tree(&mut child, prepared.process_isolation).map_err(
+                |source| ExecutorError::Io {
+                    task_id: prepared.run.task_id.clone(),
+                    source,
+                },
+            )?;
             break;
         }
         if cancel_requested(&prepared.store, &prepared.run.id) {
             cancelled = true;
-            child.kill().map_err(|source| ExecutorError::Io {
-                task_id: prepared.run.task_id.clone(),
-                source,
-            })?;
+            terminate_child_process_tree(&mut child, prepared.process_isolation).map_err(
+                |source| ExecutorError::Io {
+                    task_id: prepared.run.task_id.clone(),
+                    source,
+                },
+            )?;
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -742,6 +866,8 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
         .lock()
         .map(|state| state.body.clone())
         .unwrap_or_default();
+    prepared.run.artifacts =
+        shell_run_artifacts(&prepared.run, &prepared.stdout_path, &prepared.stderr_path);
 
     Ok(FinishedRun {
         run: prepared.run,
@@ -754,6 +880,7 @@ fn execute_shell(mut prepared: PreparedShellRun) -> Result<FinishedRun, Executor
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     mut reader: R,
     live_log: Arc<Mutex<LiveLog>>,
+    artifact: Option<Arc<Mutex<LiveLog>>>,
     redacted_values: Vec<String>,
     header: Option<&'static str>,
 ) -> thread::JoinHandle<()> {
@@ -771,9 +898,39 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             }
             let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
             let chunk = redact_values(chunk, &redacted_values);
+            if let Some(artifact) = &artifact {
+                let _ = append_live_log(artifact, &chunk);
+            }
             let _ = append_live_log(&live_log, &chunk);
         }
     })
+}
+
+fn create_parent_dir(task_id: &TaskId, path: &Path) -> Result<(), ExecutorError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ExecutorError::Io {
+            task_id: task_id.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn open_live_sink(
+    task_id: &TaskId,
+    path: &Path,
+    max_output_bytes: usize,
+) -> Result<Arc<Mutex<LiveLog>>, ExecutorError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| ExecutorError::Io {
+            task_id: task_id.clone(),
+            source,
+        })?;
+    Ok(Arc::new(Mutex::new(LiveLog::new(file, max_output_bytes))))
 }
 
 fn append_live_log(live_log: &Arc<Mutex<LiveLog>>, text: &str) -> std::io::Result<()> {
@@ -798,6 +955,10 @@ fn cancel_requested(store: &Store, run_id: &RunId) -> bool {
         .unwrap_or(false)
 }
 
+fn run_trace_log_line(run: &RunRecord) -> String {
+    format!("trace_id: {}\n", run.trace_id)
+}
+
 fn execute_file_read(mut prepared: PreparedFileRun) -> Result<FinishedRun, ExecutorError> {
     let result = std::fs::read_to_string(&prepared.path);
     let (status, exit_code, log) = match result {
@@ -805,14 +966,21 @@ fn execute_file_read(mut prepared: PreparedFileRun) -> Result<FinishedRun, Execu
             RunStatus::Success,
             Some(0),
             format!(
-                "file-read {}\n\n[content]\n{}",
-                prepared.redacted_path, body
+                "file-read {}\n{}\n[content]\n{}",
+                prepared.redacted_path,
+                run_trace_log_line(&prepared.run),
+                body
             ),
         ),
         Err(error) => (
             RunStatus::Failed,
             None,
-            format!("file-read {}\n\n[error]\n{}", prepared.redacted_path, error),
+            format!(
+                "file-read {}\n{}\n[error]\n{}",
+                prepared.redacted_path,
+                run_trace_log_line(&prepared.run),
+                error
+            ),
         ),
     };
     prepared.run.status = status;
@@ -866,8 +1034,9 @@ fn execute_file_write(mut prepared: PreparedFileWriteRun) -> Result<FinishedRun,
             RunStatus::Success,
             Some(0),
             format!(
-                "file-write {}\n\n[wrote]\n{} bytes\n",
+                "file-write {}\n{}\n[wrote]\n{} bytes\n",
                 prepared.redacted_path,
+                run_trace_log_line(&prepared.run),
                 prepared.body.len()
             ),
         ),
@@ -875,8 +1044,10 @@ fn execute_file_write(mut prepared: PreparedFileWriteRun) -> Result<FinishedRun,
             RunStatus::Failed,
             None,
             format!(
-                "file-write {}\n\n[error]\n{}",
-                prepared.redacted_path, error
+                "file-write {}\n{}\n[error]\n{}",
+                prepared.redacted_path,
+                run_trace_log_line(&prepared.run),
+                error
             ),
         ),
     };
@@ -947,6 +1118,12 @@ fn redact_values(mut value: String, redacted_values: &[String]) -> String {
 fn redact_policy_error(error: PolicyError, redacted_values: &[String]) -> PolicyError {
     match error {
         PolicyError::ShellDisabled => PolicyError::ShellDisabled,
+        PolicyError::ApprovalRequired(message) => {
+            PolicyError::ApprovalRequired(redact_values(message, redacted_values))
+        }
+        PolicyError::AutonomyRestricted(message) => {
+            PolicyError::AutonomyRestricted(redact_values(message, redacted_values))
+        }
         PolicyError::Rejected(message) => {
             PolicyError::Rejected(redact_values(message, redacted_values))
         }
@@ -954,6 +1131,63 @@ fn redact_policy_error(error: PolicyError, redacted_values: &[String]) -> Policy
             PolicyError::WorkspaceRejected(redact_values(message, redacted_values))
         }
     }
+}
+
+fn shell_run_artifacts(
+    run: &RunRecord,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Vec<RunArtifact> {
+    vec![
+        RunArtifact {
+            kind: RunArtifactKind::Stdout,
+            path: stdout_path.display().to_string(),
+            bytes: std::fs::metadata(stdout_path)
+                .ok()
+                .map(|metadata| metadata.len()),
+            content_type: Some("text/plain".into()),
+        },
+        RunArtifact {
+            kind: RunArtifactKind::Stderr,
+            path: stderr_path.display().to_string(),
+            bytes: std::fs::metadata(stderr_path)
+                .ok()
+                .map(|metadata| metadata.len()),
+            content_type: Some("text/plain".into()),
+        },
+        RunArtifact::new(RunArtifactKind::Summary, format!("run:{}:summary", run.id)),
+    ]
+}
+
+fn autonomy_label(level: &AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::ObserveOnly => "observe-only",
+        AutonomyLevel::Suggest => "suggest",
+        AutonomyLevel::ExecuteWithApproval => "execute-with-approval",
+        AutonomyLevel::ExecuteFreely => "execute-freely",
+    }
+}
+
+fn approval_already_granted(os: &OperatingSystem, task_id: &TaskId, action: &str) -> bool {
+    os.approvals.values().any(|approval| {
+        approval.task_id == *task_id
+            && approval.action == action
+            && approval.status == crate::models::ApprovalStatus::Approved
+    })
+}
+
+fn approval_action_granted(os: &OperatingSystem, action: &str) -> bool {
+    os.approvals.values().any(|approval| {
+        approval.action == action && approval.status == crate::models::ApprovalStatus::Approved
+    })
+}
+
+fn approval_already_pending(os: &OperatingSystem, task_id: &TaskId, action: &str) -> bool {
+    os.approvals.values().any(|approval| {
+        approval.task_id == *task_id
+            && approval.action == action
+            && approval.status == crate::models::ApprovalStatus::Pending
+    })
 }
 
 fn execute_provider(mut prepared: PreparedProviderRun) -> Result<FinishedRun, ExecutorError> {
@@ -971,8 +1205,9 @@ fn execute_provider(mut prepared: PreparedProviderRun) -> Result<FinishedRun, Ex
             prepared.run.exit_code = None;
             prepared.run.finished_at = Some(Utc::now());
             let log = format!(
-                "provider: {}\nagent: {} ({})\ntask: {}\n\n[error]\n{}\n",
+                "provider: {}\n{}\nagent: {} ({})\ntask: {}\n\n[error]\n{}\n",
                 provider,
+                run_trace_log_line(&prepared.run),
                 prepared.request.agent_name,
                 prepared.request.agent_kind,
                 prepared.request.task_title,
@@ -991,8 +1226,9 @@ fn execute_provider(mut prepared: PreparedProviderRun) -> Result<FinishedRun, Ex
     prepared.run.finished_at = Some(Utc::now());
 
     let log = format!(
-        "provider: {}\nagent: {} ({})\ntask: {}\nconfidence: {}\n\nsummary:\n{}\n\nplan:\n{}\n",
+        "provider: {}\n{}\nagent: {} ({})\ntask: {}\nconfidence: {}\n\nsummary:\n{}\n\nplan:\n{}\n",
         provider,
+        run_trace_log_line(&prepared.run),
         prepared.request.agent_name,
         prepared.request.agent_kind,
         prepared.request.task_title,
@@ -1078,7 +1314,7 @@ fn finish_run(
                         run_id, run_for_update.exit_code
                     )
                 });
-                Runtime::fail_task(latest, &task_id, Some(failure_message))?;
+                Runtime::fail_task_or_retry(latest, &task_id, Some(failure_message))?;
             }
         }
 
@@ -1168,6 +1404,30 @@ fn materialize_provider_tool_calls(
             );
             continue;
         }
+        let action = provider_tool_call_action(&tool.id, &call.args);
+        if let Err(error) = preflight_provider_tool_call_policy(os, tool, &invocation, &action) {
+            os.record(
+                EventKind::PolicyRejected,
+                format!(
+                    "provider requested tool {} for task {} rejected by policy: {}",
+                    tool.id, parent_task_id, error
+                ),
+            );
+            continue;
+        }
+        if provider_tool_call_requires_approval(&os.policy)
+            && !approval_already_granted(os, parent_task_id, &action)
+        {
+            if !approval_already_pending(os, parent_task_id, &action) {
+                os.request_approval(ApprovalRequest::new(
+                    parent_task_id.clone(),
+                    None,
+                    action,
+                    format!("provider requested tool task {}", tool.id),
+                ));
+            }
+            continue;
+        }
         let mut task = Task::new(
             format!("Tool call: {}", tool.name),
             format!(
@@ -1183,12 +1443,92 @@ fn materialize_provider_tool_calls(
     }
 }
 
+fn preflight_provider_tool_call_policy(
+    os: &OperatingSystem,
+    tool: &ToolDefinition,
+    invocation: &ToolInvocation,
+    action: &str,
+) -> Result<(), String> {
+    let secret_resolver = OperatingSystemSecretResolver::new(os.secrets_backends.clone());
+    match tool.kind {
+        ToolKind::Shell => {
+            let rendered = render_tool_command_with_resolver_and_redaction_patterns(
+                tool,
+                invocation,
+                &secret_resolver,
+                &os.policy.redacted_env_patterns,
+            )
+            .map_err(|error| error.to_string())?;
+            match check_shell_command(&os.policy, &rendered.command) {
+                Ok(_) => {}
+                Err(PolicyError::ApprovalRequired(_)) if approval_action_granted(os, action) => {}
+                Err(PolicyError::ApprovalRequired(_)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            let cwd = rendered
+                .default_cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)
+                .map_err(|error| error.to_string())?;
+            check_workspace(&os.policy, &cwd).map_err(|error| error.to_string())?;
+            check_shell_writes(&os.policy, &rendered.command, &cwd)
+                .map_err(|error| error.to_string())?;
+        }
+        ToolKind::FileRead | ToolKind::FileWrite => {
+            let rendered = render_tool_text_with_resolver_and_redaction_patterns(
+                tool,
+                invocation,
+                &secret_resolver,
+                &os.policy.redacted_env_patterns,
+            )
+            .map_err(|error| error.to_string())?;
+            if tool.kind == ToolKind::FileWrite && !invocation.args.contains_key("body") {
+                return Err("missing required file-write tool argument `body`".into());
+            }
+            let base = rendered
+                .default_cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)
+                .map_err(|error| error.to_string())?;
+            let path = base.join(rendered.text);
+            let decision = if tool.kind == ToolKind::FileWrite {
+                check_file_write_path(&os.policy, &path)
+            } else {
+                check_workspace(&os.policy, &path)
+            };
+            decision.map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn key_matches_redacted_patterns(key: &str, patterns: &[String]) -> bool {
     let key = key.to_ascii_uppercase();
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim();
         !pattern.is_empty() && key.contains(&pattern.to_ascii_uppercase())
     })
+}
+
+fn provider_tool_call_requires_approval(policy: &Policy) -> bool {
+    matches!(policy.autonomy, AutonomyLevel::ExecuteWithApproval)
+        || policy.approval.require_for_risky_actions
+}
+
+fn provider_tool_call_action(
+    tool_id: &ToolId,
+    args: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let args = args
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("provider-tool:{tool_id} args:{args}")
 }
 
 fn reject_run(
@@ -1255,6 +1595,7 @@ fn reject_run_message_with_event(
         rejection.command,
         rejection.cwd,
     );
+    candidate.ensure_unique_run_id(&mut run);
     run.status = RunStatus::Rejected;
     run.finished_at = Some(Utc::now());
     candidate.runs.insert(run.id.clone(), run.clone());
@@ -1291,10 +1632,102 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        MemoryRecord, OperatingSystem, Priority, ProviderKind, ProviderSettings, Task, TaskStatus,
-        ToolDefinition,
+        AutonomyLevel, MemoryRecord, OperatingSystem, Priority, ProviderKind, ProviderSettings,
+        Task, TaskStatus, ToolDefinition,
+    };
+    #[cfg(unix)]
+    use crate::process_tree::{
+        collect_descendant_pids, collect_process_group_pids, process_exists,
     };
     use std::collections::BTreeMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_termination_kills_spawned_children() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn shell");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let descendants = collect_descendant_pids(child.id());
+        assert!(
+            !descendants.is_empty(),
+            "test command should have a child process"
+        );
+
+        terminate_child_process_tree(&mut child, false).expect("terminate tree");
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            descendants.into_iter().all(|pid| !process_exists(pid)),
+            "descendant process should be gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_isolation_terminates_spawned_process_group() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn isolated shell");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let group_members = collect_process_group_pids(child.id());
+        assert!(
+            group_members.contains(&child.id()),
+            "isolated shell should become its own process group leader"
+        );
+        assert!(
+            group_members.len() > 1,
+            "isolated command should have a child in its process group"
+        );
+
+        terminate_child_process_tree(&mut child, true).expect("terminate process group");
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            group_members.into_iter().all(|pid| !process_exists(pid)),
+            "process group members should be gone"
+        );
+    }
+
+    #[test]
+    fn shell_logs_include_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let task = Task::new("Shell trace", "trace shell logs", Priority::Normal, vec![]);
+        let run = RunRecord::new(task.id.clone(), None, "printf shell-trace", ".");
+        let trace_id = run.trace_id.clone();
+
+        let finished = execute_shell(PreparedShellRun {
+            run,
+            store,
+            log_path: dir.path().join("run.log"),
+            stdout_path: dir.path().join("stdout.txt"),
+            stderr_path: dir.path().join("stderr.txt"),
+            command: "printf shell-trace".into(),
+            cwd_path: dir.path().to_path_buf(),
+            max_output_bytes: 1024,
+            timeout: Duration::from_secs(5),
+            env: Vec::new(),
+            redacted_values: Vec::new(),
+            process_isolation: false,
+        })
+        .expect("shell execution");
+
+        assert_eq!(finished.run.status, RunStatus::Success);
+        assert!(finished.log.contains(&format!("trace_id: {trace_id}")));
+        assert!(finished.log.contains("shell-trace"));
+    }
 
     #[test]
     fn provider_run_records_configured_provider_kind() {
@@ -1609,9 +2042,55 @@ mod tests {
     }
 
     #[test]
+    fn file_tool_logs_include_trace_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let source = workspace.join("note.txt");
+        std::fs::write(&source, "hello trace").expect("source");
+        let mut os = OperatingSystem::new("test");
+        let task = Task::new("Trace files", "read and write", Priority::Normal, vec![]);
+        let task_id = task.id.clone();
+        os.create_task(task);
+        store.save_validated(&os).expect("save state");
+
+        let read_run = RunRecord::new(task_id.clone(), None, "file-read note", ".");
+        let read_trace = read_run.trace_id.clone();
+        let read = execute_file_read(PreparedFileRun {
+            run: read_run,
+            path: source,
+            redacted_path: "note.txt".into(),
+            max_output_bytes: 1024,
+        })
+        .expect("file read");
+        assert!(read.log.contains(&format!("trace_id: {read_trace}")));
+
+        let target = workspace.join("written.txt");
+        let write_run = RunRecord::new(task_id, None, "file-write written", ".");
+        let write_trace = write_run.trace_id.clone();
+        let write = execute_file_write(PreparedFileWriteRun {
+            run: write_run,
+            store,
+            policy: Policy {
+                allowed_workspaces: vec![workspace.display().to_string()],
+                ..Policy::default()
+            },
+            path: target.clone(),
+            redacted_path: "written.txt".into(),
+            body: "hello".into(),
+            max_output_bytes: 1024,
+        })
+        .expect("file write");
+        assert!(write.log.contains(&format!("trace_id: {write_trace}")));
+        assert_eq!(std::fs::read_to_string(target).expect("written"), "hello");
+    }
+
+    #[test]
     fn provider_log_uses_run_provider_kind() {
         let task = Task::new("Plan", "plan work", Priority::Normal, vec![]);
         let run = RunRecord::new(task.id.clone(), None, "provider:openai-compatible", ".");
+        let trace_id = run.trace_id.clone();
         let request = ProviderRequest::new(None, &task);
 
         let finished = execute_provider(PreparedProviderRun {
@@ -1622,6 +2101,7 @@ mod tests {
         .expect("provider execution");
 
         assert!(finished.log.contains("provider: openai-compatible"));
+        assert!(finished.log.contains(&format!("trace_id: {trace_id}")));
     }
 
     #[test]
@@ -1653,6 +2133,7 @@ mod tests {
         let log_path = run.log_path.as_ref().expect("log path");
         let log = std::fs::read_to_string(log_path).expect("run log");
         assert!(log.contains("provider: openai-compatible"));
+        assert!(log.contains(&format!("trace_id: {}", run.trace_id)));
         assert!(log.contains("[error]"));
     }
 
@@ -1661,6 +2142,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::new(dir.path().join("state.json"));
         let mut os = OperatingSystem::new("test");
+        os.policy.allow_shell = true;
+        os.policy.autonomy = AutonomyLevel::ExecuteFreely;
+        os.policy.approval.require_for_risky_actions = false;
         os.register_tool(ToolDefinition::new(
             "say",
             ToolKind::Shell,
@@ -1714,6 +2198,220 @@ mod tests {
         let invocation = created_tool_task.tool.as_ref().expect("invocation");
         assert_eq!(invocation.tool_id, ToolId::new("say"));
         assert_eq!(invocation.args.get("message"), Some(&"hello".to_owned()));
+    }
+
+    #[test]
+    fn provider_tool_calls_reject_shell_tools_disabled_by_policy_before_creating_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("test");
+        os.register_tool(ToolDefinition::new(
+            "say",
+            ToolKind::Shell,
+            "say something",
+            vec![],
+            "printf {message}",
+            None,
+        ));
+        let parent = Task::new("Plan", "plan work", Priority::Normal, vec![]);
+        let parent_id = parent.id.clone();
+        os.create_task(parent);
+        store.save(&os).expect("save state");
+
+        let response = AgentResponse {
+            summary: "done".into(),
+            plan: vec!["call a tool".into()],
+            confidence: 91,
+            tool_calls: vec![ProviderToolCall {
+                tool: "say".into(),
+                args: BTreeMap::from([("message".into(), "hello".into())]),
+            }],
+        };
+        let mut run = RunRecord::new(parent_id.clone(), None, "provider:mock", ".");
+        run.status = RunStatus::Success;
+        run.exit_code = Some(0);
+        run.finished_at = Some(Utc::now());
+
+        finish_run(
+            &mut os,
+            &store,
+            FinishedRun {
+                run,
+                log: "provider log".into(),
+                response: Some(response),
+                failure_message: None,
+            },
+        )
+        .expect("finish run");
+
+        assert!(os.tasks.values().all(|task| task.tool.is_none()));
+        assert!(os.events.iter().any(|event| {
+            event.kind == EventKind::PolicyRejected
+                && event
+                    .message
+                    .contains("shell execution is disabled by policy")
+        }));
+    }
+
+    #[test]
+    fn provider_tool_calls_queue_approval_before_materializing_tool_tasks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("test");
+        os.policy.allow_shell = true;
+        os.policy.approval.require_for_risky_actions = true;
+        os.register_tool(ToolDefinition::new(
+            "say",
+            ToolKind::Shell,
+            "say something",
+            vec!["plan".into()],
+            "printf {message}",
+            None,
+        ));
+        let parent = Task::new("Plan", "plan work", Priority::High, vec!["plan".into()]);
+        let parent_id = parent.id.clone();
+        os.create_task(parent);
+        store.save(&os).expect("save state");
+
+        let response = AgentResponse {
+            summary: "done".into(),
+            plan: vec!["call a tool".into()],
+            confidence: 91,
+            tool_calls: vec![ProviderToolCall {
+                tool: "say".into(),
+                args: BTreeMap::from([("message".into(), "hello".into())]),
+            }],
+        };
+        let mut run = RunRecord::new(parent_id.clone(), None, "provider:mock", ".");
+        run.status = RunStatus::Success;
+        run.exit_code = Some(0);
+        run.finished_at = Some(Utc::now());
+
+        finish_run(
+            &mut os,
+            &store,
+            FinishedRun {
+                run,
+                log: "provider log".into(),
+                response: Some(response),
+                failure_message: None,
+            },
+        )
+        .expect("finish run");
+
+        assert!(os.tasks.values().all(|task| task.tool.is_none()));
+        let approval = os
+            .approvals
+            .values()
+            .find(|approval| approval.task_id == parent_id)
+            .expect("approval request");
+        assert_eq!(approval.status, crate::models::ApprovalStatus::Pending);
+        assert_eq!(
+            approval.action,
+            "provider-tool:say args:message=hello".to_owned()
+        );
+        assert!(approval.reason.contains("provider requested tool task say"));
+    }
+
+    #[test]
+    fn provider_tool_calls_materialize_after_matching_approval() {
+        let mut os = OperatingSystem::new("test");
+        os.policy.allow_shell = true;
+        os.policy.approval.require_for_risky_actions = true;
+        os.register_tool(ToolDefinition::new(
+            "say",
+            ToolKind::Shell,
+            "say something",
+            vec!["plan".into()],
+            "printf {message}",
+            None,
+        ));
+        let parent = Task::new("Plan", "plan work", Priority::High, vec!["plan".into()]);
+        let parent_id = parent.id.clone();
+        os.create_task(parent);
+        let action = "provider-tool:say args:message=hello";
+        os.request_approval(ApprovalRequest::new(
+            parent_id.clone(),
+            None,
+            action,
+            "provider requested tool task say",
+        ));
+        let approval_id = os
+            .approvals
+            .values()
+            .find(|approval| approval.action == action)
+            .expect("approval")
+            .id
+            .clone();
+        os.resolve_approval(&approval_id, true, Some("operator".into()))
+            .expect("resolve approval");
+
+        materialize_provider_tool_calls(
+            &mut os,
+            &parent_id,
+            &[ProviderToolCall {
+                tool: "say".into(),
+                args: BTreeMap::from([("message".into(), "hello".into())]),
+            }],
+        );
+
+        assert!(os.tasks.values().any(|task| task.tool.is_some()));
+    }
+
+    #[test]
+    fn provider_tool_calls_reject_file_write_policy_before_creating_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path().join("state.json"));
+        let mut os = OperatingSystem::new("test");
+        os.policy.rules = vec!["deny writes outside src".into()];
+        os.register_tool(ToolDefinition::new(
+            "write-note",
+            ToolKind::FileWrite,
+            "write a note",
+            vec![],
+            "{name}",
+            Some(dir.path().display().to_string()),
+        ));
+        let parent = Task::new("Plan", "plan work", Priority::Normal, vec![]);
+        let parent_id = parent.id.clone();
+        os.create_task(parent);
+        store.save(&os).expect("save state");
+
+        let response = AgentResponse {
+            summary: "done".into(),
+            plan: vec![],
+            confidence: 80,
+            tool_calls: vec![ProviderToolCall {
+                tool: "write-note".into(),
+                args: BTreeMap::from([
+                    ("name".into(), "guide.md".into()),
+                    ("body".into(), "hello".into()),
+                ]),
+            }],
+        };
+        let mut run = RunRecord::new(parent_id.clone(), None, "provider:mock", ".");
+        run.status = RunStatus::Success;
+        run.exit_code = Some(0);
+        run.finished_at = Some(Utc::now());
+
+        finish_run(
+            &mut os,
+            &store,
+            FinishedRun {
+                run,
+                log: "provider log".into(),
+                response: Some(response),
+                failure_message: None,
+            },
+        )
+        .expect("finish run");
+
+        assert!(os.tasks.values().all(|task| task.tool.is_none()));
+        assert!(os.events.iter().any(|event| {
+            event.kind == EventKind::PolicyRejected
+                && event.message.contains("deny writes outside src")
+        }));
+        assert!(!dir.path().join("guide.md").exists());
     }
 
     #[test]
@@ -1920,6 +2618,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::new(dir.path().join("state.json"));
         let mut os = OperatingSystem::new("test");
+        os.policy.allow_shell = true;
+        os.policy.autonomy = AutonomyLevel::ExecuteFreely;
+        os.policy.approval.require_for_risky_actions = false;
         os.policy.redacted_env_patterns = vec![];
         os.register_tool(ToolDefinition::new(
             "send",

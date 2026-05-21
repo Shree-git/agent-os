@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent OS - Local-first agent runtime</title>
+    <meta name="description" content="Agent OS is a local-first control plane for durable AI agent queues, scheduling, memory, tools, logs, policy, and dashboards.">
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #111827;
+        --muted: #52606d;
+        --line: #d7dde5;
+        --paper: #ffffff;
+        --field: #f7f8fa;
+        --green: #245b3c;
+        --green-soft: #eef8f2;
+        --rust: #d06b2f;
+        --blue: #24506f;
+        --violet: #51427e;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.5;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 14px clamp(20px, 5vw, 72px);
+        background: rgba(255, 255, 255, 0.92);
+        border-bottom: 1px solid var(--line);
+        backdrop-filter: blur(12px);
+      }
+
+      .brand {
+        font-size: 18px;
+        font-weight: 800;
+        text-decoration: none;
+      }
+
+      .nav {
+        display: flex;
+        gap: 18px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .nav a {
+        text-decoration: none;
+      }
+
+      .hero {
+        min-height: 82vh;
+        display: grid;
+        align-items: center;
+        padding: 88px clamp(20px, 5vw, 72px) 64px;
+        background:
+          linear-gradient(90deg, rgba(255,255,255,0.96) 0%, rgba(255,255,255,0.9) 38%, rgba(255,255,255,0.22) 100%),
+          url("assets/agent-os-dashboard-preview.svg") right center / min(68vw, 980px) auto no-repeat,
+          #f7f8fa;
+      }
+
+      .hero-copy {
+        max-width: 620px;
+      }
+
+      .eyebrow {
+        color: var(--green);
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 14px 0 18px;
+        font-size: clamp(44px, 7vw, 88px);
+        line-height: 0.95;
+        letter-spacing: 0;
+      }
+
+      .lead {
+        max-width: 560px;
+        color: var(--muted);
+        font-size: clamp(18px, 2vw, 22px);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 30px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 44px;
+        padding: 0 18px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .button.primary {
+        color: #ffffff;
+        background: var(--green);
+        border-color: var(--green);
+      }
+
+      section {
+        padding: 72px clamp(20px, 5vw, 72px);
+      }
+
+      .section-head {
+        max-width: 760px;
+        margin-bottom: 28px;
+      }
+
+      h2 {
+        margin: 0 0 12px;
+        font-size: clamp(30px, 4vw, 52px);
+        line-height: 1.02;
+        letter-spacing: 0;
+      }
+
+      .section-head p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 18px;
+      }
+
+      .band {
+        background: var(--field);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .item {
+        padding: 22px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper);
+      }
+
+      .item h3 {
+        margin: 0 0 10px;
+        font-size: 18px;
+      }
+
+      .item p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .demo {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(360px, 0.85fr);
+        gap: 28px;
+        align-items: start;
+      }
+
+      .shot {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper);
+      }
+
+      pre {
+        overflow: auto;
+        margin: 0;
+        padding: 22px;
+        border-radius: 8px;
+        background: #101820;
+        color: #e6edf3;
+        font: 14px/1.6 SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
+      }
+
+      .steps {
+        display: grid;
+        gap: 12px;
+      }
+
+      .step {
+        padding: 18px;
+        border-left: 4px solid var(--rust);
+        background: var(--paper);
+      }
+
+      .step strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .footer {
+        padding: 36px clamp(20px, 5vw, 72px);
+        color: var(--muted);
+        border-top: 1px solid var(--line);
+      }
+
+      @media (max-width: 840px) {
+        .topbar {
+          position: static;
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .nav {
+          flex-wrap: wrap;
+        }
+
+        .hero {
+          min-height: 78vh;
+          padding-top: 56px;
+          background:
+            linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(255,255,255,0.94) 52%, rgba(255,255,255,0.6) 100%),
+            url("assets/agent-os-dashboard-preview.svg") center bottom / 720px auto no-repeat,
+            #f7f8fa;
+        }
+
+        .grid,
+        .demo {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="../README.md">Agent OS</a>
+      <nav class="nav" aria-label="Landing page">
+        <a href="#why">Why</a>
+        <a href="#demo">Demo</a>
+        <a href="#screenshots">Screenshots</a>
+        <a href="../examples/README.md">Examples</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="eyebrow">Local-first agent runtime</div>
+          <h1>Agent OS</h1>
+          <p class="lead">A durable control plane for AI agent products: queues, capability scheduling, memory, policy checks, tool execution, run logs, metrics, and a local dashboard API.</p>
+          <div class="actions">
+            <a class="button primary" href="../README.md#quick-start">Start locally</a>
+            <a class="button" href="#demo">Run the demo</a>
+          </div>
+        </div>
+      </section>
+
+      <section id="why">
+        <div class="section-head">
+          <h2>Why Agent OS</h2>
+          <p>Agent frameworks describe behavior. Agent OS handles the operating layer that makes local agent work inspectable, recoverable, and safe to automate.</p>
+        </div>
+        <div class="grid">
+          <article class="item">
+            <h3>Durable by default</h3>
+            <p>Agents, tasks, workflows, events, memory, approvals, runs, logs, and replay data live in a portable project state directory.</p>
+          </article>
+          <article class="item">
+            <h3>Operator ready</h3>
+            <p>The CLI and local HTTP API expose the same runtime concepts for terminals, dashboards, workers, and product integrations.</p>
+          </article>
+          <article class="item">
+            <h3>Policy aware</h3>
+            <p>Shell and file tools run through workspace checks, redaction, approval gates, cancellation, and auditable run records.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="demo" class="band">
+        <div class="section-head">
+          <h2>Local demo</h2>
+          <p>The first run needs no hosted service and no provider API key. It shows scheduling, execution, logs, replay, metrics, and the dashboard API.</p>
+        </div>
+        <div class="demo">
+          <pre><code>agent-os --state ./sandbox init --name "Builder Demo" --force
+agent-os --state ./sandbox task create "Run a local builder task" \
+  --need rust \
+  --command "printf 'scheduled, executed, logged, replayable\n'"
+agent-os --state ./sandbox run --execute --limit 1
+agent-os --state ./sandbox runs list
+agent-os --state ./sandbox runs replay RUN_ID
+agent-os --state ./sandbox metrics
+
+export AGENT_OS_API_TOKEN=dev-token
+agent-os --state ./sandbox api serve \
+  --addr 127.0.0.1:7373 \
+  --token-env AGENT_OS_API_TOKEN</code></pre>
+          <img class="shot" src="assets/agent-os-dashboard-preview.svg" alt="Agent OS dashboard preview with queues, metrics, logs, approvals, memory, and events">
+        </div>
+      </section>
+
+      <section id="screenshots">
+        <div class="section-head">
+          <h2>Screenshot storyboard</h2>
+          <p>Use these captures for release notes, the repository README, or a product landing page.</p>
+        </div>
+        <div class="steps">
+          <div class="step">
+            <strong>Queue view</strong>
+            Capture `agent-os status`, `agent-os agent list`, and `agent-os task list` after the demo task is queued.
+          </div>
+          <div class="step">
+            <strong>Execution trace</strong>
+            Capture `agent-os runs logs RUN_ID`, `agent-os runs replay RUN_ID`, and the durable trace ID.
+          </div>
+          <div class="step">
+            <strong>Dashboard API</strong>
+            Capture `/dashboard.html`, `/status`, `/metrics`, and `/metrics/prometheus` from the localhost API.
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Agent OS is a local runtime for building agent CLIs, dashboards, workers, and automation daemons without starting from an empty prompt loop.
+    </footer>
+  </body>
+</html>

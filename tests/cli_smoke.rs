@@ -4,7 +4,6 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +18,94 @@ fn workspace_tempdir() -> std::io::Result<tempfile::TempDir> {
         .tempdir_in(base)
 }
 
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod executable");
+}
+
+#[cfg(unix)]
+fn make_private_file(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("private file metadata")
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions).expect("chmod private file");
+}
+
+#[cfg(not(unix))]
+fn make_private_file(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn make_group_readable_file(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("group-readable file metadata")
+        .permissions();
+    permissions.set_mode(0o640);
+    std::fs::set_permissions(path, permissions).expect("chmod group-readable file");
+}
+
+fn rewrite_memory_timestamp(state_dir: &std::path::Path, topic: &str, timestamp: &str) {
+    let state_file = state_dir.join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).expect("read state"))
+            .expect("state json");
+    let records = state["memory"].as_array_mut().expect("memory array");
+    let record = records
+        .iter_mut()
+        .find(|record| record["topic"] == topic)
+        .expect("memory record");
+    record["created_at"] = serde_json::json!(timestamp);
+    record["updated_at"] = serde_json::json!(timestamp);
+    std::fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&state).expect("state json"),
+    )
+    .expect("write state");
+}
+
+fn inject_pending_approval(state_dir: &std::path::Path, task_id: &str, approval_id: &str) {
+    let state_file = state_dir.join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).expect("read state"))
+            .expect("state json");
+    let task = state["tasks"]
+        .get_mut(task_id)
+        .expect("approval task in state");
+    task["status"] = serde_json::json!("blocked");
+    task["assigned_to"] = Value::Null;
+    task["output"] = Value::Null;
+    let requested_at = task["updated_at"]
+        .as_str()
+        .expect("task updated_at")
+        .to_owned();
+    state["approvals"][approval_id] = serde_json::json!({
+        "id": approval_id,
+        "task_id": task_id,
+        "run_id": null,
+        "action": "git push origin main",
+        "reason": "mcp approval smoke",
+        "status": "pending",
+        "requested_at": requested_at,
+        "resolved_at": null,
+        "resolved_by": null
+    });
+    std::fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&state).expect("state json"),
+    )
+    .expect("write state");
+}
+
 #[test]
 fn init_status_and_schedule_task() {
     let dir = workspace_tempdir().expect("tempdir");
@@ -30,7 +117,20 @@ fn init_status_and_schedule_task() {
         .args(["--state", state, "init", "--force"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Initialized"));
+        .stdout(predicate::str::contains("Initialized"))
+        .stdout(predicate::str::contains("Next: agent-os --state"))
+        .stdout(predicate::str::contains("Create a task:"))
+        .stdout(predicate::str::contains("Preview scheduling:"));
+    let initialized: Value = serde_json::from_str(
+        &std::fs::read_to_string(std::path::Path::new(state).join("state.json"))
+            .expect("read initialized state"),
+    )
+    .expect("initialized state json");
+    assert_eq!(initialized["policy"]["allow_shell"], false);
+    assert_eq!(
+        initialized["policy"]["network"]["mode"],
+        serde_json::json!("providers-only")
+    );
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -1095,6 +1195,83 @@ fn init_status_and_schedule_task() {
 }
 
 #[test]
+fn status_output_uses_color_environment_conventions() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state, "init", "--force"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state,
+            "task",
+            "create",
+            "Color pending task",
+            "--need",
+            "rust",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--state", state, "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[33m1\u{1b}[0m pending"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--state", state, "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[").not())
+        .stdout(predicate::str::contains("1 pending"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--state", state, "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[33m1\u{1b}[0m pending"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .args(["--state", state, "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[").not())
+        .stdout(predicate::str::contains("1 pending"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--state", state, "--json", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}[").not())
+        .stdout(predicate::str::contains("\"tasks_pending\": 1"));
+}
+
+#[test]
 fn state_directory_may_contain_dots() {
     let dir = workspace_tempdir().expect("tempdir");
     let state_dir = dir.path().join("agent.os.state");
@@ -1299,6 +1476,23 @@ fn json_create_commands_return_created_records() {
         .success()
         .stdout(predicate::str::contains("\"topic\": \"json-latest-topic\""));
 
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "add",
+            "db-note",
+            "Pool idle postgres connections before runtime requests",
+            "--tag",
+            "rust",
+        ])
+        .assert()
+        .success();
+    rewrite_memory_timestamp(&state, "db-note", "2020-01-01T00:00:00Z");
+
     let limited_memory = Command::cargo_bin("agent-os")
         .expect("binary")
         .args([
@@ -1329,6 +1523,49 @@ fn json_create_commands_return_created_records() {
     let memory_by_recency_body: Value =
         serde_json::from_slice(&memory_by_recency.stdout).expect("memory list json");
     assert_eq!(memory_by_recency_body[0]["topic"], "json-latest-topic");
+
+    let private_memory = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "add",
+            "private-client-note",
+            "Keep this out of provider recall",
+            "--visibility",
+            "private",
+            "--scope",
+            "client-a",
+            "--tag",
+            "private",
+        ])
+        .output()
+        .expect("private memory add");
+    assert!(private_memory.status.success(), "private memory add failed");
+    let private_memory_body: Value =
+        serde_json::from_slice(&private_memory.stdout).expect("private memory json");
+    assert_eq!(private_memory_body["memory"]["visibility"], "private");
+    assert_eq!(private_memory_body["memory"]["scope"], "client-a");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "memory",
+            "list",
+            "--visibility",
+            "private",
+            "--scope",
+            "client-a",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("private-client-note"))
+        .stdout(predicate::str::contains("private"))
+        .stdout(predicate::str::contains("client-a"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -1404,6 +1641,62 @@ fn json_create_commands_return_created_records() {
     let search_by_recency_body: Value =
         serde_json::from_slice(&search_by_recency.stdout).expect("memory search json");
     assert_eq!(search_by_recency_body[0]["topic"], "json-latest-topic");
+
+    let search_by_relevance = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "search",
+            "connection pooling postgres",
+            "--tag",
+            "rust",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("memory search relevance");
+    assert!(
+        search_by_relevance.status.success(),
+        "memory relevance search failed"
+    );
+    let search_by_relevance_body: Value =
+        serde_json::from_slice(&search_by_relevance.stdout).expect("memory relevance json");
+    assert_eq!(search_by_relevance_body[0]["topic"], "db-note");
+
+    let recall = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "recall",
+            "connection pooling postgres",
+            "--tag",
+            "rust",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("memory recall");
+    assert!(recall.status.success(), "memory recall failed");
+    let recall_body: Value = serde_json::from_slice(&recall.stdout).expect("memory recall json");
+    assert_eq!(recall_body.as_array().expect("recall hits").len(), 1);
+    assert_eq!(recall_body[0]["record"]["topic"], "db-note");
+    assert!(
+        recall_body[0]["score"].as_u64().expect("recall score") > 0,
+        "{recall_body}"
+    );
+    assert!(
+        recall_body[0]["snippet"]
+            .as_str()
+            .expect("recall snippet")
+            .contains("postgres"),
+        "{recall_body}"
+    );
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -1544,6 +1837,22 @@ fn json_create_commands_return_created_records() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid memory until timestamp"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "memory",
+            "list",
+            "--visibility",
+            "secret",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "memory visibility must be one of: shared, private",
+        ));
 }
 
 #[test]
@@ -1554,7 +1863,7 @@ fn invalid_enum_like_inputs_are_rejected() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -1835,7 +2144,7 @@ fn operator_command_ids_must_be_valid() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -1884,7 +2193,7 @@ fn agent_heartbeat_cli_controls_scheduler_availability() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -1986,7 +2295,7 @@ fn agent_claim_cli_assigns_ready_work() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -2068,7 +2377,7 @@ fn state_repair_expires_online_agents_with_expired_leases() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -2150,7 +2459,7 @@ fn agent_remove_refuses_referenced_agents_and_removes_idle_agents() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -2236,7 +2545,7 @@ fn execute_task_command_records_run_and_log() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -2251,7 +2560,7 @@ fn execute_task_command_records_run_and_log() {
             "--need",
             "rust",
             "--command",
-            "printf agent-os",
+            "printf agent-os; printf err-os >&2",
         ])
         .assert()
         .success();
@@ -2286,6 +2595,25 @@ fn execute_task_command_records_run_and_log() {
     let runs: Value = serde_json::from_slice(&output.stdout).expect("runs json");
     let run_id = runs[0]["id"].as_str().expect("run id");
     let run_task_id = runs[0]["task_id"].as_str().expect("run task id");
+    let artifacts = runs[0]["artifacts"].as_array().expect("run artifacts");
+    let stdout_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact["kind"] == "stdout")
+        .expect("stdout artifact");
+    let stderr_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact["kind"] == "stderr")
+        .expect("stderr artifact");
+    let stdout_path = stdout_artifact["path"].as_str().expect("stdout path");
+    let stderr_path = stderr_artifact["path"].as_str().expect("stderr path");
+    assert_eq!(
+        std::fs::read_to_string(stdout_path).expect("stdout artifact"),
+        "agent-os"
+    );
+    assert_eq!(
+        std::fs::read_to_string(stderr_path).expect("stderr artifact"),
+        "err-os"
+    );
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -2525,6 +2853,74 @@ fn execute_task_command_records_run_and_log() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
+        .args(["--state", state_arg, "runs", "debug", run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("debug"))
+        .stdout(predicate::str::contains("artifacts: 3"))
+        .stdout(predicate::str::contains("exists=true"))
+        .stdout(predicate::str::contains("Run smoke command"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "runs",
+            "debug",
+            run_id,
+            "--tail-bytes",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"log_tail_bytes\": 2"))
+        .stdout(predicate::str::contains("\"log\": \"os\""))
+        .stdout(predicate::str::contains("\"agent\""))
+        .stdout(predicate::str::contains("\"artifact_status\""))
+        .stdout(predicate::str::contains("\"diagnostics\""));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "artifacts", run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stdout"))
+        .stdout(predicate::str::contains("stderr"))
+        .stdout(predicate::str::contains("fnv1a64:"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "runs",
+            "artifacts",
+            run_id,
+            "stdout",
+            "--tail-bytes",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"artifact_id\": \"stdout\""))
+        .stdout(predicate::str::contains("\"tail_bytes\": 2"))
+        .stdout(predicate::str::contains("\"truncated\": true"))
+        .stdout(predicate::str::contains("\"body\": \"os\""))
+        .stdout(predicate::str::contains("fnv1a64:"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "artifacts", run_id, "stderr"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("artifact stderr"))
+        .stdout(predicate::str::contains("err-os"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
         .args([
             "--state",
             state_arg,
@@ -2539,6 +2935,295 @@ fn execute_task_command_records_run_and_log() {
         .stderr(predicate::str::contains(
             "tail_bytes must be greater than 0",
         ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "runs",
+            "debug",
+            run_id,
+            "--tail-bytes",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "tail_bytes must be greater than 0",
+        ));
+}
+
+#[test]
+fn state_sqlite_initializes_and_imports_json_state() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+    let sqlite_init = dir.path().join("init-only.sqlite");
+    let sqlite_init_arg = sqlite_init.to_str().expect("sqlite init");
+    let sqlite_import = dir.path().join("import.sqlite");
+    let sqlite_import_arg = sqlite_import.to_str().expect("sqlite import");
+    let restored_state = dir.path().join("restored-agent-os");
+    let restored_state_arg = restored_state.to_str().expect("restored state");
+    let active_sqlite = dir.path().join("active.sqlite");
+    let active_sqlite_arg = active_sqlite.to_str().expect("active sqlite");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "state",
+            "sqlite",
+            "--output",
+            sqlite_init_arg,
+            "--init-only",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initialized SQLite backend"));
+
+    let init_connection = rusqlite::Connection::open(&sqlite_init).expect("open init sqlite");
+    let table_count: i64 = init_connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('state_snapshots', 'run_logs', 'run_records', 'task_records')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite tables");
+    assert_eq!(table_count, 4);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Persist sqlite run",
+            "--need",
+            "rust",
+            "--command",
+            "printf sqlite-log",
+            "--max-attempts",
+            "3",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "run", "--execute"])
+        .assert()
+        .success();
+
+    let import_output = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "state",
+            "sqlite",
+            "--output",
+            sqlite_import_arg,
+        ])
+        .output()
+        .expect("state sqlite import");
+    assert!(import_output.status.success(), "sqlite import failed");
+    let import_report: Value =
+        serde_json::from_slice(&import_output.stdout).expect("sqlite import json");
+    assert_eq!(import_report["initialized"], true);
+    assert_eq!(import_report["imported"], true);
+    assert_eq!(import_report["import"]["imported_snapshot"], true);
+    assert_eq!(import_report["import"]["imported_runs"], 1);
+    assert_eq!(import_report["import"]["imported_run_logs"], 1);
+    assert_eq!(import_report["import"]["skipped_run_logs"], 0);
+
+    let import_connection = rusqlite::Connection::open(&sqlite_import).expect("open import sqlite");
+    let snapshot_body: String = import_connection
+        .query_row(
+            "SELECT body FROM state_snapshots WHERE id = 'current'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite snapshot");
+    let snapshot: Value = serde_json::from_str(&snapshot_body).expect("snapshot json");
+    assert_eq!(snapshot["tasks"].as_object().expect("tasks").len(), 1);
+    assert_eq!(snapshot["runs"].as_object().expect("runs").len(), 1);
+
+    let run_record_body: String = import_connection
+        .query_row("SELECT body FROM run_records LIMIT 1", [], |row| row.get(0))
+        .expect("query sqlite run record");
+    let run_record: Value = serde_json::from_str(&run_record_body).expect("run record json");
+    assert_eq!(run_record["command"], "printf sqlite-log");
+
+    let task_record: (String, String, String, i64, i64) = import_connection
+        .query_row(
+            "SELECT title, status, priority, attempts, max_attempts FROM task_records LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("query sqlite task record");
+    assert_eq!(task_record.0, "Persist sqlite run");
+    assert_eq!(task_record.1, "complete");
+    assert_eq!(task_record.2, "normal");
+    assert_eq!(task_record.3, 1);
+    assert_eq!(task_record.4, 3);
+
+    let log_body: String = import_connection
+        .query_row("SELECT body FROM run_logs LIMIT 1", [], |row| row.get(0))
+        .expect("query sqlite log");
+    assert!(log_body.contains("sqlite-log"));
+
+    let restore_preview = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            restored_state_arg,
+            "--json",
+            "state",
+            "sqlite",
+            "--output",
+            sqlite_import_arg,
+            "--restore",
+            "--dry-run",
+        ])
+        .output()
+        .expect("state sqlite restore preview");
+    assert!(
+        restore_preview.status.success(),
+        "sqlite restore preview failed"
+    );
+    let restore_preview: Value =
+        serde_json::from_slice(&restore_preview.stdout).expect("sqlite restore preview json");
+    assert_eq!(restore_preview["dry_run"], true);
+    assert_eq!(restore_preview["restored"], false);
+    assert_eq!(restore_preview["restore"]["restored_snapshot"], false);
+    assert!(!restored_state.join("state.json").exists());
+
+    let restore_output = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            restored_state_arg,
+            "--json",
+            "state",
+            "sqlite",
+            "--output",
+            sqlite_import_arg,
+            "--restore",
+        ])
+        .output()
+        .expect("state sqlite restore");
+    assert!(restore_output.status.success(), "sqlite restore failed");
+    let restore_report: Value =
+        serde_json::from_slice(&restore_output.stdout).expect("sqlite restore json");
+    assert_eq!(restore_report["restored"], true);
+    assert_eq!(restore_report["restore"]["restored_snapshot"], true);
+    assert_eq!(restore_report["restore"]["restored_runs"], 1);
+
+    let restored_body =
+        std::fs::read_to_string(restored_state.join("state.json")).expect("restored state");
+    let restored_snapshot: Value = serde_json::from_str(&restored_body).expect("restored json");
+    assert_eq!(
+        restored_snapshot["tasks"]
+            .as_object()
+            .expect("restored tasks")
+            .len(),
+        1
+    );
+    assert_eq!(
+        restored_snapshot["runs"]
+            .as_object()
+            .expect("restored runs")
+            .len(),
+        1
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            active_sqlite_arg,
+            "init",
+            "--force",
+            "--profile",
+            "dev",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            active_sqlite_arg,
+            "task",
+            "create",
+            "Active sqlite task",
+            "--need",
+            "rust",
+        ])
+        .assert()
+        .success();
+
+    let active_status = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", active_sqlite_arg, "--json", "status"])
+        .output()
+        .expect("active sqlite status");
+    assert!(
+        active_status.status.success(),
+        "active sqlite status failed"
+    );
+    let active_status: Value =
+        serde_json::from_slice(&active_status.stdout).expect("active sqlite status json");
+    assert_eq!(active_status["tasks_pending"], 1);
+
+    let active_connection = rusqlite::Connection::open(&active_sqlite).expect("active sqlite db");
+    let active_snapshot_body: String = active_connection
+        .query_row(
+            "SELECT body FROM state_snapshots WHERE id = 'current'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active sqlite snapshot");
+    let active_snapshot: Value =
+        serde_json::from_str(&active_snapshot_body).expect("active snapshot json");
+    assert_eq!(
+        active_snapshot["tasks"]
+            .as_object()
+            .expect("active sqlite tasks")
+            .len(),
+        1
+    );
+    let active_task_count: i64 = active_connection
+        .query_row("SELECT COUNT(*) FROM task_records", [], |row| row.get(0))
+        .expect("active sqlite task record count");
+    assert_eq!(active_task_count, 1);
+    let active_task_attempts: (i64, i64) = active_connection
+        .query_row(
+            "SELECT attempts, max_attempts FROM task_records LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("active sqlite task attempts");
+    assert_eq!(active_task_attempts, (0, 1));
 }
 
 #[test]
@@ -2598,7 +3283,10 @@ parallel = 1
         .args(["--state", state_arg, "run", "--execute"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("shell execution is disabled"));
+        .stderr(predicate::str::contains("shell execution is disabled"))
+        .stderr(predicate::str::contains(
+            "set policy.allow_shell = true in config",
+        ));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -2776,6 +3464,35 @@ api_key_env = " BAD_KEY "
         .failure()
         .stderr(predicate::str::contains(
             "provider api_key_env must be a valid environment variable name",
+        ));
+
+    std::fs::write(
+        &config,
+        r#"
+[provider]
+kind = "openai-compatible"
+endpoint = "https://api.openai.com/v1/chat/completions"
+max_retries = 9
+"#,
+    )
+    .expect("write unbounded provider retry config");
+    let unbounded_provider_retries_state = dir.path().join("unbounded-provider-retries");
+    let unbounded_provider_retries_state_arg =
+        unbounded_provider_retries_state.to_str().expect("state");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            unbounded_provider_retries_state_arg,
+            "--config",
+            config_arg,
+            "init",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "provider max_retries must be less than or equal to 8",
         ));
 
     std::fs::write(
@@ -3368,6 +4085,33 @@ parallel = 1
         .assert()
         .success()
         .stdout(predicate::str::contains("\"tasks_failed\": 1"));
+
+    let eval_start = Instant::now();
+    let eval_timeout = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "eval",
+            "run",
+            "timeout-smoke",
+            "--command",
+            "sleep 3; printf late",
+        ])
+        .output()
+        .expect("eval timeout");
+    assert!(eval_timeout.status.success(), "agent-os eval run failed");
+    assert!(
+        eval_start.elapsed() < Duration::from_secs(3),
+        "eval timeout did not stop command promptly: {:?}",
+        eval_start.elapsed()
+    );
+    let eval_timeout: Value =
+        serde_json::from_slice(&eval_timeout.stdout).expect("eval timeout json");
+    assert_eq!(eval_timeout["eval"]["success"], false);
+    assert_eq!(eval_timeout["timed_out"], true);
+    assert_eq!(eval_timeout["status"], Value::Null);
 }
 
 #[test]
@@ -3378,7 +4122,7 @@ fn policy_environment_is_minimal_by_default() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -3495,10 +4239,28 @@ fn config_init_and_doctor_report_config() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("missing config defaults to safe"))
+        .stdout(predicate::str::contains("missing config defaults to dev").not());
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
         .args(["--state", "   ", "doctor"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("state must not be empty"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("state unavailable at"))
+        .stderr(predicate::str::contains("agent-os --state"))
+        .stderr(predicate::str::contains(state_arg))
+        .stderr(predicate::str::contains("init --profile safe"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3533,8 +4295,71 @@ fn config_init_and_doctor_report_config() {
         serde_json::from_slice(&config_init.stdout).expect("config init json body");
     assert_eq!(config_init["path"], config_arg);
     assert_eq!(config_init["written"], true);
+    assert_eq!(config_init["profile"], "safe");
     assert_eq!(config_init["config"]["name"], "Agent OS");
+    assert_eq!(config_init["config"]["policy"]["allow_shell"], false);
     assert!(!config.with_extension("toml.tmp").exists());
+
+    let dev_config = dir.path().join("dev-agent-os.toml");
+    let dev_config_arg = dev_config.to_str().expect("dev config");
+    let dev_config_init = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--config",
+            dev_config_arg,
+            "--json",
+            "config",
+            "init",
+            "--profile",
+            "dev",
+        ])
+        .output()
+        .expect("dev config init json");
+    assert!(dev_config_init.status.success(), "dev config init failed");
+    let dev_report: Value =
+        serde_json::from_slice(&dev_config_init.stdout).expect("dev config init json body");
+    assert_eq!(dev_report["profile"], "dev");
+    assert_eq!(dev_report["config"]["policy"]["allow_shell"], true);
+
+    let safe_config = dir.path().join("safe-agent-os.toml");
+    let safe_config_arg = safe_config.to_str().expect("safe config");
+    let safe_config_init = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--config",
+            safe_config_arg,
+            "--json",
+            "config",
+            "init",
+            "--profile",
+            "safe",
+        ])
+        .output()
+        .expect("safe config init json");
+    assert!(safe_config_init.status.success(), "safe config init failed");
+    let safe_report: Value =
+        serde_json::from_slice(&safe_config_init.stdout).expect("safe config init json body");
+    assert_eq!(safe_report["profile"], "safe");
+    assert_eq!(safe_report["config"]["policy"]["allow_shell"], false);
+    assert_eq!(
+        safe_report["config"]["policy"]["network"]["mode"],
+        "providers-only"
+    );
+    assert_eq!(
+        safe_report["config"]["policy"]["approval"]["require_for_risky_actions"],
+        true
+    );
+
+    let human_config = dir.path().join("human-agent-os.toml");
+    let human_config_arg = human_config.to_str().expect("human config");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--config", human_config_arg, "config", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote safe config"))
+        .stdout(predicate::str::contains("Next: agent-os --config"))
+        .stdout(predicate::str::contains("config validate"));
 
     let config_show = Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3564,6 +4389,7 @@ fn config_init_and_doctor_report_config() {
     assert_eq!(default_report["path"], missing_config_arg);
     assert_eq!(default_report["exists"], false);
     assert_eq!(default_report["config"]["name"], "Agent OS");
+    assert_eq!(default_report["config"]["policy"]["allow_shell"], false);
 
     let default_validation = Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3590,13 +4416,31 @@ fn config_init_and_doctor_report_config() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--config",
+            missing_config_arg,
+            "doctor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config exists: no"))
+        .stdout(predicate::str::contains("config init --profile safe"))
+        .stdout(predicate::str::contains("config init --profile dev").not());
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
         .args(["--state", state_arg, "--config", config_arg, "doctor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("state valid: n/a"))
         .stdout(predicate::str::contains("config exists: yes"))
         .stdout(predicate::str::contains("config loads: yes"))
-        .stdout(predicate::str::contains("config valid: yes"));
+        .stdout(predicate::str::contains("config valid: yes"))
+        .stdout(predicate::str::contains("next steps:"))
+        .stdout(predicate::str::contains("agent-os --state"))
+        .stdout(predicate::str::contains(" init"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3637,9 +4481,18 @@ fn config_init_and_doctor_report_config() {
         .args(["--state", state_arg, "--config", config_arg, "doctor"])
         .assert()
         .success()
+        .stdout(predicate::str::contains(format!(
+            "platform: {}",
+            std::env::consts::OS
+        )))
+        .stdout(predicate::str::contains("service manager:"))
+        .stdout(predicate::str::contains("service recommendation:"))
+        .stdout(predicate::str::contains("shell execution supported:"))
         .stdout(predicate::str::contains("config loads: yes"))
         .stdout(predicate::str::contains("config valid: no"))
-        .stdout(predicate::str::contains("OS name must not be empty"));
+        .stdout(predicate::str::contains("OS name must not be empty"))
+        .stdout(predicate::str::contains("next steps:"))
+        .stdout(predicate::str::contains("config validate"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3652,9 +4505,19 @@ fn config_init_and_doctor_report_config() {
             "\"agent_os_version\": \"{}\"",
             env!("CARGO_PKG_VERSION")
         )))
+        .stdout(predicate::str::contains(format!(
+            "\"platform\": \"{}\"",
+            std::env::consts::OS
+        )))
+        .stdout(predicate::str::contains("\"service_manager\":"))
+        .stdout(predicate::str::contains("\"service_recommendation\":"))
+        .stdout(predicate::str::contains("\"shell_execution_supported\":"))
+        .stdout(predicate::str::contains("\"shell_execution_note\":"))
         .stdout(predicate::str::contains("\"config_loads\": true"))
         .stdout(predicate::str::contains("\"config_valid\": false"))
         .stdout(predicate::str::contains("\"config_error\": null"))
+        .stdout(predicate::str::contains("\"next_steps\": ["))
+        .stdout(predicate::str::contains("config validate"))
         .stdout(predicate::str::contains("OS name must not be empty"));
 }
 
@@ -3667,7 +4530,7 @@ fn doctor_reports_state_validation_issues() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -3709,7 +4572,8 @@ fn doctor_reports_state_validation_issues() {
         .success()
         .stdout(predicate::str::contains("state valid: no"))
         .stdout(predicate::str::contains("state issues:"))
-        .stdout(predicate::str::contains("missing from agent current tasks"));
+        .stdout(predicate::str::contains("missing from agent current tasks"))
+        .stdout(predicate::str::contains("state repair --dry-run"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3717,6 +4581,8 @@ fn doctor_reports_state_validation_issues() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"state_valid\": false"))
+        .stdout(predicate::str::contains("\"next_steps\": ["))
+        .stdout(predicate::str::contains("state repair --dry-run"))
         .stdout(predicate::str::contains("missing from agent current tasks"));
 
     std::fs::write(&state_file, "{not-json").expect("write malformed state");
@@ -3726,7 +4592,8 @@ fn doctor_reports_state_validation_issues() {
         .assert()
         .success()
         .stdout(predicate::str::contains("state loads: no"))
-        .stdout(predicate::str::contains("state error:"));
+        .stdout(predicate::str::contains("state error:"))
+        .stdout(predicate::str::contains("Restore or repair"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -3734,6 +4601,7 @@ fn doctor_reports_state_validation_issues() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"state_loads\": false"))
+        .stdout(predicate::str::contains("Restore or repair"))
         .stdout(predicate::str::contains("\"state_error\":"));
 }
 
@@ -3746,7 +4614,7 @@ fn invalid_state_update_does_not_persist_partial_mutation() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -3795,7 +4663,7 @@ fn invalid_state_run_does_not_persist_partial_assignment() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -3856,7 +4724,7 @@ fn invalid_state_workflow_does_not_persist_partial_tasks() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4099,7 +4967,7 @@ fn api_can_backup_state_to_requested_path() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4372,7 +5240,7 @@ fn api_can_migrate_state_paths() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4467,6 +5335,7 @@ fn api_can_migrate_state_paths() {
         active_noop_body["output"].as_str(),
         Some(state.join("state.json").to_str().expect("state path"))
     );
+    assert_eq!(active_noop_body["output_preexisting"], true);
     assert_eq!(active_noop_body["migration"]["changed"], false);
     assert_eq!(active_noop_body["validation"]["valid"], true);
 
@@ -4481,7 +5350,8 @@ fn api_can_migrate_state_paths() {
     let dry_run_body: Value = serde_json::from_str(http_body(&dry_run)).expect("migrate dry-run");
     assert_eq!(dry_run_body["dry_run"], true);
     assert_eq!(dry_run_body["migration"]["from_version"], 0);
-    assert_eq!(dry_run_body["migration"]["to_version"], 3);
+    assert_eq!(dry_run_body["migration"]["to_version"], 4);
+    assert_eq!(dry_run_body["output_preexisting"], false);
     assert_eq!(dry_run_body["validation"]["valid"], true);
     assert!(
         !migrated_path.exists(),
@@ -4498,7 +5368,8 @@ fn api_can_migrate_state_paths() {
     let migrated_body: Value = serde_json::from_str(http_body(&migrated)).expect("migrate body");
     assert_eq!(migrated_body["dry_run"], false);
     assert_eq!(migrated_body["migration"]["from_version"], 0);
-    assert_eq!(migrated_body["migration"]["to_version"], 3);
+    assert_eq!(migrated_body["migration"]["to_version"], 4);
+    assert_eq!(migrated_body["output_preexisting"], false);
     assert_eq!(migrated_body["validation"]["valid"], true);
 
     wait_for_api_success(&mut child);
@@ -4506,7 +5377,7 @@ fn api_can_migrate_state_paths() {
     let migrated_state: Value =
         serde_json::from_str(&std::fs::read_to_string(&migrated_path).expect("migrated state"))
             .expect("migrated json");
-    assert_eq!(migrated_state["version"], 3);
+    assert_eq!(migrated_state["version"], 4);
 }
 
 #[test]
@@ -4518,7 +5389,7 @@ fn api_can_export_state_snapshot() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4616,7 +5487,7 @@ fn api_can_export_state_snapshot() {
     let exported = http_get(addr, "/state/export", &auth);
     assert!(exported.contains("HTTP/1.1 200 OK"), "{exported}");
     let exported_body: Value = serde_json::from_str(http_body(&exported)).expect("export body");
-    assert_eq!(exported_body["version"], 3);
+    assert_eq!(exported_body["version"], 4);
     assert!(exported_body["tasks"].to_string().contains("Export me"));
     assert!(exported_body["events"].as_array().expect("events").len() >= 2);
 
@@ -4632,7 +5503,7 @@ fn state_repair_resets_empty_os_name() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4693,7 +5564,7 @@ fn state_repair_fixes_assignment_index_drift() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4768,7 +5639,7 @@ fn state_validate_and_repair_handle_duplicate_current_tasks() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4835,7 +5706,7 @@ fn state_repair_raises_zero_agent_parallelism() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4882,7 +5753,7 @@ fn failed_state_repair_does_not_persist_partial_repairs() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4937,7 +5808,7 @@ fn state_repair_dedupes_duplicate_task_dependencies() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -4998,7 +5869,7 @@ fn state_repair_removes_missing_task_dependencies() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5056,7 +5927,7 @@ fn state_repair_removes_empty_task_plan_steps() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5124,7 +5995,7 @@ fn state_repair_removes_invalid_workflow_stages() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5210,7 +6081,7 @@ fn state_repair_fixes_policy_drift() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5306,7 +6177,7 @@ fn state_repair_fixes_provider_drift() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5316,6 +6187,7 @@ fn state_repair_fixes_provider_drift() {
     value["provider"]["model"] = Value::from(" ");
     value["provider"]["api_key_env"] = Value::from(" OPENAI_API_KEY ");
     value["provider"]["endpoint"] = Value::from(" ");
+    value["provider"]["max_retries"] = Value::from(u64::from(agent_os::MAX_PROVIDER_RETRIES + 1));
     std::fs::write(
         &state_file,
         serde_json::to_string_pretty(&value).expect("json body"),
@@ -5331,7 +6203,10 @@ fn state_repair_fixes_provider_drift() {
         .stdout(predicate::str::contains(
             "provider api_key_env must be a valid environment variable name",
         ))
-        .stdout(predicate::str::contains("provider endpoint is empty"));
+        .stdout(predicate::str::contains("provider endpoint is empty"))
+        .stdout(predicate::str::contains(
+            "provider max_retries must be less than or equal to 8",
+        ));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -5340,7 +6215,8 @@ fn state_repair_fixes_provider_drift() {
         .success()
         .stdout(predicate::str::contains("reset provider model"))
         .stdout(predicate::str::contains("trimmed provider api_key_env"))
-        .stdout(predicate::str::contains("cleared empty provider endpoint"));
+        .stdout(predicate::str::contains("cleared empty provider endpoint"))
+        .stdout(predicate::str::contains("reset provider max_retries"));
 
     let after: Value =
         serde_json::from_str(&std::fs::read_to_string(&state_file).expect("state body"))
@@ -5348,6 +6224,7 @@ fn state_repair_fixes_provider_drift() {
     assert_eq!(after["provider"]["model"], "mock-agent");
     assert_eq!(after["provider"]["api_key_env"], "OPENAI_API_KEY");
     assert!(after["provider"]["endpoint"].is_null());
+    assert_eq!(after["provider"]["max_retries"], 2);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -5366,7 +6243,7 @@ fn state_repair_clears_missing_assigned_agent_on_finished_task() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5437,7 +6314,7 @@ fn state_validate_reports_inconsistent_run_lifecycle() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5512,7 +6389,7 @@ fn state_repair_fixes_inconsistent_run_lifecycle() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5604,7 +6481,7 @@ fn state_validate_and_repair_run_exit_code_drift() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5686,7 +6563,7 @@ fn state_validate_and_repair_timestamp_order_drift() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5804,7 +6681,7 @@ fn state_repair_fixes_invalid_event_log() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -5910,7 +6787,7 @@ fn state_validate_reports_invalid_persisted_ids() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6073,7 +6950,7 @@ fn runs_cancel_clears_active_run_terminal_fields() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6164,7 +7041,7 @@ fn state_validate_reports_dependency_cycles() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6203,6 +7080,144 @@ fn state_validate_reports_dependency_cycles() {
 }
 
 #[test]
+fn run_dry_run_reports_dependency_deadlocks() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_file = state.join("state.json");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    for title in ["Cycle A", "Cycle B"] {
+        Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args(["--state", state_arg, "task", "create", title])
+            .assert()
+            .success();
+    }
+
+    let mut value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).expect("state body"))
+            .expect("state json");
+    let task_ids = value["tasks"]
+        .as_object()
+        .expect("tasks object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(task_ids.len(), 2);
+    value["tasks"][&task_ids[0]]["dependencies"] = serde_json::json!([task_ids[1].clone()]);
+    value["tasks"][&task_ids[1]]["dependencies"] = serde_json::json!([task_ids[0].clone()]);
+    std::fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&value).expect("json body"),
+    )
+    .expect("write corrupted state");
+
+    let dry_run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "run", "--dry-run"])
+        .output()
+        .expect("run dry-run");
+    assert!(dry_run.status.success(), "run dry-run failed");
+    let dry_run: Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run json");
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(
+        dry_run["scheduler"]["deadlocked_tasks"]
+            .as_array()
+            .expect("deadlocked tasks")
+            .len(),
+        2
+    );
+    assert!(
+        dry_run["scheduler"]["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .expect("note")
+                .contains("dependency deadlock detected")),
+        "dry-run should include dependency deadlock note: {dry_run}"
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "run", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dependency deadlock detected"));
+}
+
+#[test]
+fn run_dry_run_reports_unscheduled_task_reasons() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Needs uncommon capability",
+            "--need",
+            "capability-that-no-agent-has",
+        ])
+        .assert()
+        .success();
+
+    let dry_run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "run", "--dry-run"])
+        .output()
+        .expect("run dry-run");
+    assert!(dry_run.status.success(), "run dry-run failed");
+    let dry_run: Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run json");
+    let unscheduled = dry_run["scheduler"]["unscheduled_tasks"]
+        .as_array()
+        .expect("unscheduled tasks");
+    assert_eq!(unscheduled.len(), 1, "{dry_run}");
+    assert!(
+        unscheduled[0]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("no agent has required capabilities"),
+        "{dry_run}"
+    );
+    assert!(
+        dry_run["scheduler"]["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .expect("note")
+                .contains("task(s) could not be scheduled")),
+        "dry-run should include unscheduled note: {dry_run}"
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "run", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task(s) could not be scheduled"));
+}
+
+#[test]
 fn state_migrate_upgrades_legacy_state_without_version() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -6212,7 +7227,7 @@ fn state_migrate_upgrades_legacy_state_without_version() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6235,13 +7250,20 @@ fn state_migrate_upgrades_legacy_state_without_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Migrated state from version 0 to 3",
-        ));
+            "Migrated state from version 0 to 4",
+        ))
+        .stdout(predicate::str::contains("Migration steps:"))
+        .stdout(predicate::str::contains("set missing state version to 1"))
+        .stdout(predicate::str::contains(
+            "Migrated state validation passed.",
+        ))
+        .stdout(predicate::str::contains("Downgrade note:"))
+        .stdout(predicate::str::contains("Automatic downgrade"));
 
     let migrated_current: Value =
         serde_json::from_str(&std::fs::read_to_string(&state_file).expect("migrated state"))
             .expect("json");
-    assert_eq!(migrated_current["version"], 3);
+    assert_eq!(migrated_current["version"], 4);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -6290,8 +7312,18 @@ fn state_migrate_upgrades_legacy_state_without_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Would migrate state from version 0 to 3",
-        ));
+            "Would migrate state from version 0 to 4",
+        ))
+        .stdout(predicate::str::contains(
+            "Output exists and would be overwritten",
+        ))
+        .stdout(predicate::str::contains("Migration steps:"))
+        .stdout(predicate::str::contains("set missing state version to 1"))
+        .stdout(predicate::str::contains(
+            "Migrated state validation passed.",
+        ))
+        .stdout(predicate::str::contains("Downgrade note:"))
+        .stdout(predicate::str::contains("pre-migration backup/export"));
     let after_dry_run = std::fs::read_to_string(&legacy).expect("legacy after dry-run");
     assert_eq!(after_dry_run, before_dry_run);
 
@@ -6304,12 +7336,14 @@ fn state_migrate_upgrades_legacy_state_without_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"dry_run\": false"))
+        .stdout(predicate::str::contains("\"output_preexisting\": true"))
         .stdout(predicate::str::contains("\"from_version\": 0"))
-        .stdout(predicate::str::contains("\"to_version\": 3"));
+        .stdout(predicate::str::contains("\"to_version\": 4"))
+        .stdout(predicate::str::contains("\"downgrade_notes\""));
 
     let migrated: Value =
         serde_json::from_str(&std::fs::read_to_string(&legacy).expect("migrated")).expect("json");
-    assert_eq!(migrated["version"], 3);
+    assert_eq!(migrated["version"], 4);
 
     let mut future = migrated;
     future["version"] = Value::from(u64::MAX);
@@ -6339,7 +7373,7 @@ fn state_prune_removes_old_finished_runs_and_logs() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6448,7 +7482,7 @@ fn api_can_prune_old_finished_runs_and_events() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6657,6 +7691,114 @@ parallel = 1
 }
 
 #[test]
+fn sandbox_writable_paths_block_shell_writes_outside_allowed_paths() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let config = dir.path().join("agent-os.toml");
+    let workspace = dir.path().join("workspace");
+    let src = workspace.join("src");
+    let docs = workspace.join("docs");
+    std::fs::create_dir_all(&src).expect("src");
+    std::fs::create_dir_all(&docs).expect("docs");
+    let state_arg = state.to_str().expect("state");
+    let config_arg = config.to_str().expect("config");
+    let workspace_arg = workspace.to_str().expect("workspace");
+    let src_arg = src.to_str().expect("src");
+
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+name = "Sandbox OS"
+
+[policy]
+allow_shell = true
+allowed_workspaces = ["{workspace_arg}"]
+
+[policy.sandbox]
+writable_paths = ["{src_arg}"]
+
+[[agents]]
+name = "builder"
+kind = "builder"
+capabilities = ["rust"]
+parallel = 1
+"#
+        ),
+    )
+    .expect("write config");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state", state_arg, "--config", config_arg, "init", "--force",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Denied shell write",
+            "--need",
+            "rust",
+            "--command",
+            "touch docs/out.txt",
+            "--cwd",
+            workspace_arg,
+        ])
+        .assert()
+        .success();
+
+    let run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "run", "--execute"])
+        .output()
+        .expect("json run");
+    assert!(run.status.success(), "json run failed");
+    let run_body: Value = serde_json::from_slice(&run.stdout).expect("json run body");
+    assert_eq!(run_body["runs"].as_array().expect("runs").len(), 0);
+    assert!(
+        run_body["errors"][0]
+            .as_str()
+            .expect("run error")
+            .contains("outside sandbox writable_paths"),
+        "{run_body}"
+    );
+    assert!(!docs.join("out.txt").exists());
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Allowed shell write",
+            "--need",
+            "rust",
+            "--command",
+            "touch src/out.txt",
+            "--cwd",
+            workspace_arg,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "run", "--execute"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("success"));
+    assert!(src.join("out.txt").exists());
+}
+
+#[test]
 fn registered_tool_invocation_executes_with_quoted_args() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -6664,7 +7806,7 @@ fn registered_tool_invocation_executes_with_quoted_args() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6834,7 +7976,7 @@ fn tool_secret_arg_resolves_from_env_and_is_redacted() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -6889,6 +8031,55 @@ fn tool_secret_arg_resolves_from_env_and_is_redacted() {
             .stdout(predicate::str::contains("[redacted]"))
             .stdout(predicate::str::contains("qz").not());
     }
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "secrets",
+            "register",
+            "vault",
+            "--kind",
+            "env-vault",
+            "--reference",
+            "AGENT_TEST_VAULT",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Use vault secret tool",
+            "--tool",
+            "call-api",
+            "--secret-arg",
+            "api_key=vault:api_key",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_TEST_VAULT", r#"{"api_key":"vault-secret"}"#)
+        .args(["--state", state_arg, "run", "--execute"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("success"));
+
+    let vault_run_id = first_run_id(state_arg);
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "runs", "logs", &vault_run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[redacted]"))
+        .stdout(predicate::str::contains("vault-secret").not());
 }
 
 #[test]
@@ -7475,7 +8666,7 @@ fn plain_secret_like_tool_arg_is_rejected_before_persistence() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -7521,7 +8712,7 @@ fn tool_task_missing_arg_is_blocked_and_releases_capacity() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -7622,7 +8813,14 @@ fn metrics_command_reports_counter_snapshot() {
     assert!(metrics["agents_online"].as_u64().expect("agents_online") >= 1);
     assert_eq!(metrics["tasks_total"], 1);
     assert_eq!(metrics["tasks_pending"], 1);
+    assert_eq!(metrics["task_queue_age_ms_count"], 1);
+    assert!(metrics["oldest_queued_task_age_ms"].as_u64().is_some());
+    assert_eq!(metrics["task_queue_age_ms_buckets"]["le_inf"], 1);
     assert_eq!(metrics["runs_total"], 0);
+    assert_eq!(metrics["oldest_active_run_age_ms"], 0);
+    assert_eq!(metrics["run_duration_ms_count"], 0);
+    assert_eq!(metrics["run_duration_ms_sum"], 0);
+    assert_eq!(metrics["run_duration_ms_buckets"]["le_inf"], 0);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -7631,7 +8829,30 @@ fn metrics_command_reports_counter_snapshot() {
         .success()
         .stdout(predicate::str::contains("agent-os metrics"))
         .stdout(predicate::str::contains("agents:"))
-        .stdout(predicate::str::contains("tasks: 1 total"));
+        .stdout(predicate::str::contains("tasks: 1 total"))
+        .stdout(predicate::str::contains("oldest queued"))
+        .stdout(predicate::str::contains("oldest active"))
+        .stdout(predicate::str::contains("task queue ages:"))
+        .stdout(predicate::str::contains("run durations:"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state, "metrics", "--prometheus"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "# TYPE agent_os_tasks_total gauge",
+        ))
+        .stdout(predicate::str::contains("agent_os_tasks_total 1"))
+        .stdout(predicate::str::contains(
+            "agent_os_oldest_active_run_age_ms 0",
+        ))
+        .stdout(predicate::str::contains(
+            "agent_os_task_queue_age_ms_bucket{le=\"+Inf\"} 1",
+        ))
+        .stdout(predicate::str::contains(
+            "agent_os_run_duration_ms_bucket{le=\"+Inf\"} 0",
+        ));
 
     let missing_state = dir.path().join("missing-agent-os");
     let missing_state = missing_state.to_str().expect("missing state");
@@ -7650,6 +8871,12 @@ fn metrics_command_reports_counter_snapshot() {
     assert_eq!(unavailable["agent_os_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(unavailable["state_loads"], false);
     assert_eq!(unavailable["state_valid"], Value::Null);
+    assert_eq!(unavailable["oldest_active_run_age_ms"], 0);
+    assert_eq!(unavailable["oldest_queued_task_age_ms"], 0);
+    assert_eq!(unavailable["task_queue_age_ms_count"], 0);
+    assert_eq!(unavailable["task_queue_age_ms_buckets"]["le_inf"], 0);
+    assert_eq!(unavailable["run_duration_ms_count"], 0);
+    assert_eq!(unavailable["run_duration_ms_buckets"]["le_inf"], 0);
     assert!(
         unavailable["state_error"]
             .as_str()
@@ -7669,7 +8896,7 @@ fn execute_limit_runs_commands_in_parallel() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -7728,7 +8955,7 @@ fn execute_non_command_task_uses_mock_provider() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -7784,6 +9011,83 @@ fn execute_non_command_task_uses_mock_provider() {
 }
 
 #[test]
+fn execute_non_command_task_uses_provider_plugin() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let config = dir.path().join("agent-os.toml");
+    let state_arg = state.to_str().expect("state");
+    let config_arg = config.to_str().expect("config");
+
+    std::fs::write(
+        &config,
+        r#"
+name = "Plugin Provider OS"
+
+[provider]
+kind = "plugin"
+model = "plugin-model"
+plugin_command = "sh"
+plugin_args = [
+  "-c",
+  "read request; case \"$request\" in *Plugin*) printf '{\"summary\":\"plugin provider completed\",\"plan\":[\"plugin step\"],\"confidence\":92}' ;; *) printf 'bad request' >&2; exit 3 ;; esac"
+]
+
+[policy]
+allow_shell = true
+allowed_workspaces = ["."]
+"#,
+    )
+    .expect("write plugin config");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state", state_arg, "--config", config_arg, "init", "--force",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Plugin provider task",
+            "--objective",
+            "Exercise provider plugin contract",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "run", "--execute"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Executed run"))
+        .stdout(predicate::str::contains("success"));
+
+    let output = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "task", "list", "--all"])
+        .output()
+        .expect("task list");
+    assert!(output.status.success());
+    let tasks: Value = serde_json::from_slice(&output.stdout).expect("tasks json");
+    let task_id = tasks[0]["id"].as_str().expect("task id");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "task", "show", task_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plugin provider completed"))
+        .stdout(predicate::str::contains("plugin step"));
+}
+
+#[test]
 fn daemon_run_ticks_and_persists_status() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -7792,7 +9096,7 @@ fn daemon_run_ticks_and_persists_status() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -8021,7 +9325,7 @@ fn daemon_soak_processes_multiple_ticks_and_tasks() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -8087,7 +9391,7 @@ fn daemon_stop_requests_running_daemon_to_exit() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -8157,7 +9461,7 @@ fn api_can_read_and_stop_daemon() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -8321,6 +9625,1643 @@ fn service_launchd_renders_plist_manifest() {
 }
 
 #[test]
+fn git_cli_reports_status_and_creates_review_task() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    assert!(init.status.success(), "git init failed");
+    std::fs::write(repo.join("lib.rs"), "fn main() {}\n").expect("write file");
+
+    let status = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--json",
+            "git",
+            "status",
+            "--cwd",
+            repo.to_str().expect("repo path"),
+        ])
+        .output()
+        .expect("git status");
+    assert!(status.status.success(), "agent-os git status failed");
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(status["command"][0], "git");
+    assert!(
+        status["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("lib.rs")
+    );
+
+    let mut mcp = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args(["mcp", "serve", "--max-requests", "3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp git status");
+    let mut stdin = mcp.stdin.take().expect("mcp stdin");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .expect("write mcp initialize");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .expect("write mcp tools list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"agent_os_git_status","arguments":{{"cwd":{}}}}}}}"#,
+        serde_json::to_string(repo.to_str().expect("repo path")).expect("repo json")
+    )
+    .expect("write mcp git status");
+    drop(stdin);
+    let output = mcp.wait_with_output().expect("mcp git status output");
+    assert!(output.status.success(), "mcp git status failed");
+    let stdout = String::from_utf8(output.stdout).expect("mcp stdout");
+    let responses = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("mcp response json"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3);
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "agent_os_git_status")
+    );
+    assert_eq!(responses[2]["result"]["isError"], false);
+    let git_status_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("git status text");
+    let git_status: Value = serde_json::from_str(git_status_text).expect("git status json");
+    assert_eq!(
+        git_status["command"],
+        serde_json::json!(["git", "status", "--short", "--branch"])
+    );
+    assert!(
+        git_status["stdout"]
+            .as_str()
+            .expect("mcp git stdout")
+            .contains("lib.rs")
+    );
+
+    let pr = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--json",
+            "git",
+            "pr",
+            "--title",
+            "Review",
+            "--body",
+            "Body",
+            "--base",
+            "main",
+            "--head",
+            "codex/test",
+            "--dry-run",
+            "--cwd",
+            repo.to_str().expect("repo path"),
+        ])
+        .output()
+        .expect("git pr dry run");
+    assert!(pr.status.success(), "agent-os git pr dry-run failed");
+    let pr: Value = serde_json::from_slice(&pr.stdout).expect("pr json");
+    assert_eq!(pr["dry_run"], true);
+    assert_eq!(pr["command"][0], "gh");
+    assert_eq!(pr["command"][1], "pr");
+
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let review = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "git",
+            "review-task",
+            "--cwd",
+            repo.to_str().expect("repo path"),
+            "--base",
+            "main",
+        ])
+        .output()
+        .expect("git review task");
+    assert!(review.status.success(), "agent-os git review-task failed");
+    let review: Value = serde_json::from_slice(&review.stdout).expect("review json");
+    assert_eq!(review["task"]["required_capabilities"][0], "review");
+    assert!(
+        review["task"]["command"]
+            .as_str()
+            .expect("review command")
+            .contains("git diff --stat main...HEAD")
+    );
+}
+
+#[test]
+fn registry_cli_installs_profiles_templates_and_mcp_servers() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let registry = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "registry", "list"])
+        .output()
+        .expect("registry list");
+    assert!(registry.status.success(), "agent-os registry list failed");
+    let registry: Value = serde_json::from_slice(&registry.stdout).expect("registry json");
+    assert_eq!(
+        registry["agent_profiles"]["rust-project-maintainer"]["kind"],
+        "builder"
+    );
+    assert_eq!(
+        registry["workflow_templates"]["ci-fix"]["stages"][0],
+        "reproduce"
+    );
+
+    let marketplace = dir.path().join("marketplace.json");
+    std::fs::write(
+        &marketplace,
+        r#"
+{
+  "metadata": {
+    "id": "market-core",
+    "version": "1.2.3",
+    "publisher": "Agent OS test marketplace",
+    "homepage": "https://example.invalid/agent-os-market"
+  },
+  "agent_profiles": [
+    {
+      "id": "market-reviewer",
+      "name": "Marketplace reviewer",
+      "kind": "reviewer",
+      "model": "market-model",
+      "capabilities": ["review", "market"],
+      "system_prompt": "Review imported marketplace work."
+    }
+  ],
+  "workflow_templates": [
+    {
+      "id": "market-release",
+      "name": "Marketplace release",
+      "description": "Imported release workflow.",
+      "stages": ["plan", "build", "ship"],
+      "tasks": [
+        {
+          "stage": "build",
+          "title": "Build {objective}",
+          "objective": "Compile release for {objective}",
+          "command": "printf build-{objective}",
+          "capabilities": ["rust"]
+        },
+        {
+          "stage": "ship",
+          "title": "Ship {objective}",
+          "objective": "Publish release for {objective}",
+          "capabilities": ["ops"]
+        }
+      ],
+      "edges": [
+        {"from": "plan", "to": "build"},
+        {"from": "build", "to": "ship"}
+      ]
+    }
+  ],
+  "mcp_servers": [
+    {
+      "id": "market-mcp",
+      "command": "market-mcp",
+      "args": ["--stdio"],
+      "env": {"MARKET_TOKEN": "token"},
+      "enabled": true
+    }
+  ]
+}
+"#,
+    )
+    .expect("write marketplace manifest");
+    let marketplace_arg = marketplace.to_str().expect("marketplace path");
+
+    let import = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "marketplace-import",
+            marketplace_arg,
+        ])
+        .output()
+        .expect("marketplace import");
+    assert!(
+        import.status.success(),
+        "agent-os registry marketplace-import failed"
+    );
+    let import: Value = serde_json::from_slice(&import.stdout).expect("marketplace import json");
+    assert_eq!(import["imported_agent_profiles"], 1);
+    assert_eq!(import["imported_workflow_templates"], 1);
+    assert_eq!(import["imported_mcp_servers"], 1);
+    assert_eq!(import["overwritten"], 0);
+    assert_eq!(import["manifest_id"], "market-core");
+    assert_eq!(import["manifest_version"], "1.2.3");
+    let marketplace_checksum = import["checksum"]
+        .as_str()
+        .expect("marketplace checksum")
+        .to_owned();
+    assert!(marketplace_checksum.starts_with("fnv1a64:"));
+    assert_eq!(import["verified_checksum"], false);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "marketplace-import",
+            marketplace_arg,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "agent profile already exists: market-reviewer",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "marketplace-import",
+            marketplace_arg,
+            "--expect-checksum",
+            "fnv1a64:deadbeef",
+            "--force",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("marketplace checksum mismatch"));
+
+    let forced_import = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "marketplace-import",
+            marketplace_arg,
+            "--expect-checksum",
+            marketplace_checksum.as_str(),
+            "--force",
+        ])
+        .output()
+        .expect("forced marketplace import");
+    assert!(
+        forced_import.status.success(),
+        "agent-os registry marketplace-import --force failed"
+    );
+    let forced_import: Value =
+        serde_json::from_slice(&forced_import.stdout).expect("forced marketplace import json");
+    assert_eq!(forced_import["overwritten"], 3);
+    assert_eq!(forced_import["verified_checksum"], true);
+
+    let imported_registry = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "registry", "list"])
+        .output()
+        .expect("registry list after marketplace import");
+    assert!(
+        imported_registry.status.success(),
+        "agent-os registry list after import failed"
+    );
+    let imported_registry: Value =
+        serde_json::from_slice(&imported_registry.stdout).expect("imported registry json");
+    assert_eq!(
+        imported_registry["agent_profiles"]["market-reviewer"]["model"],
+        "market-model"
+    );
+    assert_eq!(
+        imported_registry["workflow_templates"]["market-release"]["stages"][2],
+        "ship"
+    );
+    assert_eq!(
+        imported_registry["workflow_templates"]["market-release"]["tasks"][0]["command"],
+        "printf build-{objective}"
+    );
+    assert_eq!(
+        imported_registry["workflow_templates"]["market-release"]["edges"][1]["to"],
+        "ship"
+    );
+    assert_eq!(
+        imported_registry["mcp_servers"]["market-mcp"]["enabled"],
+        true
+    );
+
+    let install = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "install-agent",
+            "rust-project-maintainer",
+            "--name",
+            "Maintainer",
+            "--model",
+            "local-model",
+            "--parallel",
+            "2",
+        ])
+        .output()
+        .expect("install registry agent");
+    assert!(
+        install.status.success(),
+        "agent-os registry install-agent failed"
+    );
+    let install: Value = serde_json::from_slice(&install.stdout).expect("install json");
+    assert_eq!(install["agent"]["name"], "Maintainer");
+    assert_eq!(install["agent"]["model"], "local-model");
+    assert_eq!(install["agent"]["max_parallel_tasks"], 2);
+    assert_eq!(install["agent"]["capabilities"][0], "code");
+
+    let workflow = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "create-workflow",
+            "ci-fix",
+            "Fix failing CI",
+            "--priority",
+            "high",
+        ])
+        .output()
+        .expect("create registry workflow");
+    assert!(
+        workflow.status.success(),
+        "agent-os registry create-workflow failed"
+    );
+    let workflow: Value = serde_json::from_slice(&workflow.stdout).expect("workflow json");
+    assert_eq!(workflow["template"], "ci-fix");
+    assert_eq!(workflow["workflow"]["priority"], "high");
+    assert!(workflow["tasks"]["reproduce"].is_string());
+    assert!(workflow["tasks"]["patch"].is_string());
+    assert!(workflow["tasks"]["verify"].is_string());
+    assert!(workflow["tasks"]["summarize"].is_string());
+
+    let templated_workflow = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "create-workflow",
+            "market-release",
+            "v1",
+        ])
+        .output()
+        .expect("create marketplace workflow");
+    assert!(
+        templated_workflow.status.success(),
+        "agent-os registry create-workflow for imported template failed"
+    );
+    let templated_workflow: Value =
+        serde_json::from_slice(&templated_workflow.stdout).expect("templated workflow json");
+    let build_task_id = templated_workflow["tasks"]["build"]
+        .as_str()
+        .expect("build task id");
+    let ship_task_id = templated_workflow["tasks"]["ship"]
+        .as_str()
+        .expect("ship task id");
+    let state_body = std::fs::read_to_string(state.join("state.json")).expect("state json");
+    let state_json: Value = serde_json::from_str(&state_body).expect("state json");
+    assert_eq!(state_json["tasks"][build_task_id]["title"], "Build v1");
+    assert_eq!(
+        state_json["tasks"][build_task_id]["objective"],
+        "Compile release for v1"
+    );
+    assert_eq!(
+        state_json["tasks"][build_task_id]["command"],
+        "printf build-v1"
+    );
+    assert_eq!(
+        state_json["tasks"][build_task_id]["required_capabilities"][0],
+        "rust"
+    );
+    assert_eq!(
+        state_json["tasks"][ship_task_id]["dependencies"][0],
+        build_task_id
+    );
+
+    let mcp = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "mcp-add",
+            "local-tools",
+            "--command",
+            "agent-os-mcp",
+            "--arg=--stdio",
+            "--env",
+            "AGENT_OS_TOKEN=test-token",
+            "--disabled",
+        ])
+        .output()
+        .expect("mcp add");
+    assert!(mcp.status.success(), "agent-os registry mcp-add failed");
+    let mcp: Value = serde_json::from_slice(&mcp.stdout).expect("mcp json");
+    assert_eq!(mcp["id"], "local-tools");
+    assert_eq!(mcp["args"][0], "--stdio");
+    assert_eq!(mcp["env"]["AGENT_OS_TOKEN"], "test-token");
+    assert_eq!(mcp["enabled"], false);
+
+    let enable = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "registry",
+            "mcp-enable",
+            "local-tools",
+        ])
+        .output()
+        .expect("mcp enable");
+    assert!(
+        enable.status.success(),
+        "agent-os registry mcp-enable failed"
+    );
+    let enable: Value = serde_json::from_slice(&enable.stdout).expect("enable json");
+    assert_eq!(enable["enabled"], true);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "mcp-disable",
+            "local-tools",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Disabled MCP server local-tools"));
+
+    let mcp_list = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "registry", "mcp-list"])
+        .output()
+        .expect("mcp list");
+    assert!(
+        mcp_list.status.success(),
+        "agent-os registry mcp-list failed"
+    );
+    let mcp_list: Value = serde_json::from_slice(&mcp_list.stdout).expect("mcp-list json");
+    assert_eq!(mcp_list["local-tools"]["enabled"], false);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "mcp-remove",
+            "local-tools",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed MCP server local-tools"));
+
+    let events = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "events",
+            "--kind",
+            "mcp-server-removed",
+        ])
+        .output()
+        .expect("mcp removed event");
+    assert!(events.status.success(), "agent-os events failed");
+    let events = String::from_utf8(events.stdout).expect("events utf8");
+    assert!(events.contains("mcp-server-removed"), "{events}");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "events",
+            "--kind",
+            "marketplace-imported",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("marketplace-imported"));
+}
+
+#[test]
+fn mcp_stdio_server_exposes_agent_os_tools() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let approval_task_output = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "task",
+            "create",
+            "MCP approval task",
+        ])
+        .output()
+        .expect("create approval task");
+    assert!(
+        approval_task_output.status.success(),
+        "approval task create failed"
+    );
+    let approval_task: Value =
+        serde_json::from_slice(&approval_task_output.stdout).expect("approval task json");
+    let approval_task_id = approval_task["id"].as_str().expect("approval task id");
+    inject_pending_approval(&state, approval_task_id, "mcp-approval");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "tool",
+            "add",
+            "mcp-secret-tool",
+            "--command-template",
+            "printf {token}",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "MCP secret task",
+            "--tool",
+            "mcp-secret-tool",
+            "--secret-arg",
+            "token=AGENT_OS_MCP_SECRET_CHECK_MISSING",
+        ])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env_remove("AGENT_OS_MCP_SECRET_CHECK_MISSING")
+        .args(["--state", state_arg, "mcp", "serve", "--max-requests", "6"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .expect("write initialize");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .expect("write tools/list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"agent_os_approval_list","arguments":{{"status":"pending"}}}}}}"#
+    )
+    .expect("write approval list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"agent_os_resolve_approval","arguments":{{"id":"mcp-approval","approved":true,"by":"mcp-client"}}}}}}"#
+    )
+    .expect("write approval resolve");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"agent_os_secrets_check","arguments":{{}}}}}}"#
+    )
+    .expect("write secrets check");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"agent_os_create_task","arguments":{{"title":"MCP task","command":"printf mcp","need":["rust"]}}}}}}"#
+    )
+    .expect("write tools/call");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("mcp output");
+    assert!(output.status.success(), "mcp server failed");
+    let stdout = String::from_utf8(output.stdout).expect("mcp stdout");
+    let responses = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("mcp response json"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 6);
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "agent-os");
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "agent_os_create_task")
+    );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "agent_os_resolve_approval")
+    );
+    assert!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "agent_os_secrets_check")
+    );
+    assert_eq!(responses[2]["result"]["isError"], false);
+    let approvals_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("approvals text");
+    let approvals: Value = serde_json::from_str(approvals_text).expect("approvals json");
+    assert_eq!(approvals["count"], 1);
+    assert_eq!(approvals["approvals"][0]["id"], "mcp-approval");
+    assert_eq!(approvals["approvals"][0]["status"], "pending");
+    assert_eq!(responses[3]["result"]["isError"], false);
+    let resolved_text = responses[3]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("resolved text");
+    let resolved: Value = serde_json::from_str(resolved_text).expect("resolved approval json");
+    assert_eq!(resolved["approval"]["status"], "approved");
+    assert_eq!(resolved["approval"]["resolved_by"], "mcp-client");
+    assert_eq!(responses[4]["result"]["isError"], false);
+    let secrets_text = responses[4]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("secrets check text");
+    let secrets: Value = serde_json::from_str(secrets_text).expect("secrets check json");
+    assert_eq!(secrets["total"], 1);
+    assert_eq!(secrets["present"], 0);
+    assert_eq!(secrets["missing"], 1);
+    assert_eq!(
+        secrets["references"][0]["env"],
+        "AGENT_OS_MCP_SECRET_CHECK_MISSING"
+    );
+    assert_eq!(responses[5]["result"]["isError"], false);
+    let created_text = responses[5]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let created: Value = serde_json::from_str(created_text).expect("created task json");
+    assert_eq!(created["task"]["title"], "MCP task");
+    assert_eq!(created["task"]["command"], "printf mcp");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "task", "list", "--query", "MCP task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MCP task"));
+
+    let approvals = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "approval", "list"])
+        .output()
+        .expect("approval list");
+    assert!(approvals.status.success(), "approval list failed");
+    let approvals: Value = serde_json::from_slice(&approvals.stdout).expect("approvals json");
+    assert_eq!(approvals[0]["id"], "mcp-approval");
+    assert_eq!(approvals[0]["status"], "approved");
+
+    let state_body = std::fs::read_to_string(state.join("state.json")).expect("read state");
+    let state_json: Value = serde_json::from_str(&state_body).expect("state json");
+    assert_eq!(state_json["tasks"][approval_task_id]["status"], "pending");
+}
+
+#[test]
+fn mcp_stdio_server_exposes_resources_and_prompts() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "worker",
+            "register",
+            "mcp-worker",
+            "--endpoint",
+            "http://127.0.0.1:9200",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "eval",
+            "record",
+            "mcp-eval",
+            "--success",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "secrets",
+            "register",
+            "mcp-env",
+            "--kind",
+            "environment",
+            "--reference",
+            "MCP_SECRET",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "mcp-add",
+            "mcp-resource",
+            "--command",
+            assert_cmd::cargo::cargo_bin("agent-os")
+                .to_str()
+                .expect("binary path"),
+        ])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args(["--state", state_arg, "mcp", "serve", "--max-requests", "11"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .expect("write initialize");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{{}}}}"#
+    )
+    .expect("write resources/list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{{"uri":"agent-os://status"}}}}"#
+    )
+    .expect("write resources/read");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{{"uri":"agent-os://workers"}}}}"#
+    )
+    .expect("write workers resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{{"uri":"agent-os://evals"}}}}"#
+    )
+    .expect("write evals resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{{"uri":"agent-os://registry"}}}}"#
+    )
+    .expect("write registry resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{{"uri":"agent-os://secrets"}}}}"#
+    )
+    .expect("write secrets resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{{"uri":"agent-os://approvals"}}}}"#
+    )
+    .expect("write approvals resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{{"uri":"agent-os://policy"}}}}"#
+    )
+    .expect("write policy resource");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":10,"method":"prompts/list","params":{{}}}}"#
+    )
+    .expect("write prompts/list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":11,"method":"prompts/get","params":{{"name":"agent_os_plan_task","arguments":{{"objective":"Ship MCP resources"}}}}}}"#
+    )
+    .expect("write prompts/get");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("mcp output");
+    assert!(output.status.success(), "mcp server failed");
+    let stdout = String::from_utf8(output.stdout).expect("mcp stdout");
+    let responses = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("mcp response json"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 11);
+    assert_eq!(
+        responses[0]["result"]["capabilities"]["resources"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        responses[0]["result"]["capabilities"]["prompts"],
+        serde_json::json!({})
+    );
+    assert!(
+        responses[1]["result"]["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .any(|resource| resource["uri"] == "agent-os://status")
+    );
+    assert!(
+        responses[1]["result"]["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .any(|resource| resource["uri"] == "agent-os://workers")
+    );
+    assert!(
+        responses[1]["result"]["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .any(|resource| resource["uri"] == "agent-os://secrets")
+    );
+    assert!(
+        responses[1]["result"]["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .any(|resource| resource["uri"] == "agent-os://policy")
+    );
+    let status_text = responses[2]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("resource text");
+    let status: Value = serde_json::from_str(status_text).expect("status resource json");
+    assert_eq!(
+        status["state_path"],
+        state.join("state.json").display().to_string()
+    );
+    let workers_text = responses[3]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("workers resource text");
+    let workers: Value = serde_json::from_str(workers_text).expect("workers resource json");
+    assert_eq!(
+        workers["workers"]["mcp-worker"]["endpoint"],
+        "http://127.0.0.1:9200"
+    );
+    assert_eq!(workers["count"], 1);
+
+    let evals_text = responses[4]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("evals resource text");
+    let evals: Value = serde_json::from_str(evals_text).expect("evals resource json");
+    assert_eq!(evals["evals"][0]["target"], "mcp-eval");
+    assert_eq!(evals["count"], 1);
+
+    let registry_text = responses[5]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("registry resource text");
+    let registry: Value = serde_json::from_str(registry_text).expect("registry resource json");
+    assert_eq!(
+        registry["mcp_servers"]["mcp-resource"]["command"],
+        assert_cmd::cargo::cargo_bin("agent-os")
+            .display()
+            .to_string()
+    );
+    assert_eq!(registry["counts"]["mcp_servers"], 1);
+
+    let secrets_text = responses[6]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("secrets resource text");
+    let secrets: Value = serde_json::from_str(secrets_text).expect("secrets resource json");
+    assert_eq!(
+        secrets["secrets_backends"]["mcp-env"]["reference"],
+        "MCP_SECRET"
+    );
+    assert_eq!(secrets["count"], 2);
+
+    let approvals_text = responses[7]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("approvals resource text");
+    let approvals: Value = serde_json::from_str(approvals_text).expect("approvals resource json");
+    assert_eq!(approvals["count"], 0);
+    let policy_text = responses[8]["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("policy resource text");
+    let policy: Value = serde_json::from_str(policy_text).expect("policy resource json");
+    assert_eq!(policy["policy"]["autonomy"], "execute-freely");
+    assert_eq!(policy["policy"]["sandbox"]["process_isolation"], true);
+    assert_eq!(policy["policy"]["network"]["mode"], "allowed");
+    assert_eq!(policy["memory_policy"]["semantic_recall"], false);
+    assert!(
+        responses[9]["result"]["prompts"]
+            .as_array()
+            .expect("prompts")
+            .iter()
+            .any(|prompt| prompt["name"] == "agent_os_plan_task")
+    );
+    let prompt_text = responses[10]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("prompt text");
+    assert!(prompt_text.contains("Ship MCP resources"), "{prompt_text}");
+}
+
+#[test]
+fn mcp_stdio_server_proxies_enabled_registered_servers() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let remote_state = dir.path().join("remote-agent-os");
+    let state_arg = state.to_str().expect("state path");
+    let remote_state_arg = remote_state.to_str().expect("remote state path");
+    let binary = assert_cmd::cargo::cargo_bin("agent-os");
+    let binary_arg = binary.to_str().expect("binary path");
+
+    for state_arg in [state_arg, remote_state_arg] {
+        Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+            .assert()
+            .success();
+    }
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "mcp-add",
+            "remote",
+            "--command",
+            binary_arg,
+            "--arg=--state",
+            "--arg",
+            remote_state_arg,
+            "--arg",
+            "mcp",
+            "--arg",
+            "serve",
+            "--arg=--max-requests",
+            "--arg",
+            "2",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "registry",
+            "mcp-add",
+            "disabled",
+            "--command",
+            binary_arg,
+            "--arg=--state",
+            "--arg",
+            remote_state_arg,
+            "--arg",
+            "mcp",
+            "--arg",
+            "serve",
+            "--arg=--max-requests",
+            "--arg",
+            "2",
+            "--disabled",
+        ])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new(binary)
+        .args(["--state", state_arg, "mcp", "serve", "--max-requests", "3"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .expect("write initialize");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .expect("write tools/list");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"mcp_remote__agent_os_status","arguments":{{}}}}}}"#
+    )
+    .expect("write tools/call");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("mcp output");
+    assert!(output.status.success(), "mcp server failed");
+    let stdout = String::from_utf8(output.stdout).expect("mcp stdout");
+    let responses = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("mcp response json"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3);
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools list");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "mcp_remote__agent_os_status"),
+        "{tools:?}"
+    );
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool["name"] == "mcp_disabled__agent_os_status"),
+        "{tools:?}"
+    );
+    assert_eq!(responses[2]["result"]["isError"], false);
+    let proxied_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("proxied text");
+    let proxied: Value = serde_json::from_str(proxied_text).expect("proxied status json");
+    assert_eq!(
+        proxied["state_path"],
+        remote_state.join("state.json").display().to_string()
+    );
+}
+
+#[test]
+fn worker_and_eval_cli_manage_distributed_runtime_records() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let worker = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "worker",
+            "register",
+            "remote-a",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--status",
+            "online",
+        ])
+        .output()
+        .expect("worker register");
+    assert!(worker.status.success(), "agent-os worker register failed");
+    let worker: Value = serde_json::from_slice(&worker.stdout).expect("worker json");
+    assert_eq!(worker["id"], "remote-a");
+    assert_eq!(worker["endpoint"], "http://127.0.0.1:9000");
+    assert_eq!(worker["status"], "online");
+
+    let heartbeat = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "worker",
+            "heartbeat",
+            "remote-a",
+            "--endpoint",
+            "http://127.0.0.1:9001",
+            "--status",
+            "busy",
+            "--lease-seconds",
+            "60",
+        ])
+        .output()
+        .expect("worker heartbeat");
+    assert!(
+        heartbeat.status.success(),
+        "agent-os worker heartbeat failed"
+    );
+    let heartbeat: Value = serde_json::from_slice(&heartbeat.stdout).expect("heartbeat json");
+    assert_eq!(heartbeat["endpoint"], "http://127.0.0.1:9001");
+    assert_eq!(heartbeat["status"], "busy");
+
+    let workers = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state", state_arg, "--json", "worker", "list", "--status", "busy", "--query",
+            "remote", "--limit", "1",
+        ])
+        .output()
+        .expect("worker list");
+    assert!(workers.status.success(), "agent-os worker list failed");
+    let workers: Value = serde_json::from_slice(&workers.stdout).expect("workers json");
+    assert_eq!(workers.as_array().expect("workers").len(), 1);
+    assert_eq!(workers[0]["id"], "remote-a");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "worker",
+            "register",
+            "builder",
+            "--endpoint",
+            "http://127.0.0.1:9100",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Remote worker task",
+            "--need",
+            "rust",
+            "--command",
+            "printf worker-claim",
+        ])
+        .assert()
+        .success();
+    let worker_claim = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "worker",
+            "claim",
+            "builder",
+            "--lease-seconds",
+            "30",
+        ])
+        .output()
+        .expect("worker claim");
+    assert!(
+        worker_claim.status.success(),
+        "agent-os worker claim failed"
+    );
+    let worker_claim: Value =
+        serde_json::from_slice(&worker_claim.stdout).expect("worker claim json");
+    assert_eq!(worker_claim["claimed"], true);
+    assert_eq!(worker_claim["worker"]["id"], "builder");
+    assert_eq!(worker_claim["assignment"]["agent_id"], "builder");
+    assert_eq!(worker_claim["task"]["title"], "Remote worker task");
+    let worker_task_id = worker_claim["assignment"]["task_id"]
+        .as_str()
+        .expect("worker task id");
+
+    let worker_report = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "worker",
+            "report",
+            "builder",
+            worker_task_id,
+            "--status",
+            "complete",
+            "--note",
+            "worker finished remotely",
+            "--command",
+            "printf worker-claim",
+            "--cwd",
+            "/tmp/remote-worker",
+            "--exit-code",
+            "0",
+            "--artifact",
+            "stdout=artifacts/stdout.log",
+        ])
+        .output()
+        .expect("worker report");
+    assert!(
+        worker_report.status.success(),
+        "agent-os worker report failed"
+    );
+    let worker_report: Value =
+        serde_json::from_slice(&worker_report.stdout).expect("worker report json");
+    assert_eq!(worker_report["reported"], true);
+    assert_eq!(worker_report["task"]["status"], "complete");
+    assert_eq!(worker_report["task"]["output"], "worker finished remotely");
+    assert_eq!(worker_report["run"]["status"], "success");
+    assert_eq!(worker_report["run"]["command"], "printf worker-claim");
+    assert_eq!(worker_report["run"]["cwd"], "/tmp/remote-worker");
+    assert_eq!(worker_report["run"]["artifacts"][0]["kind"], "stdout");
+
+    let eval = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "eval",
+            "record",
+            "ci-fix-workflow",
+            "--success",
+            "--cost-micros",
+            "1234",
+            "--latency-ms",
+            "567",
+        ])
+        .output()
+        .expect("eval record");
+    assert!(eval.status.success(), "agent-os eval record failed");
+    let eval: Value = serde_json::from_slice(&eval.stdout).expect("eval json");
+    let eval_id = eval["id"].as_str().expect("eval id");
+    assert_eq!(eval["target"], "ci-fix-workflow");
+    assert_eq!(eval["success"], true);
+    assert_eq!(eval["cost_micros"], 1234);
+    assert_eq!(eval["latency_ms"], 567);
+
+    let eval_output_schema = dir.path().join("eval-output-schema.json");
+    std::fs::write(
+        &eval_output_schema,
+        r#"{"type":"object","required":["message","ok","count"],"properties":{"message":{"type":"string"},"ok":{"type":"boolean"},"count":{"type":"integer"}},"additionalProperties":false}"#,
+    )
+    .expect("write eval output schema");
+    let eval_output_schema_arg = eval_output_schema
+        .to_str()
+        .expect("eval output schema path");
+    let eval_run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "eval",
+            "run",
+            "local-smoke",
+            "--command",
+            "printf '{\"message\":\"cli-eval-run\",\"ok\":true,\"count\":2}'",
+            "--success-pattern",
+            "cli-eval-run",
+            "--output-schema",
+            eval_output_schema_arg,
+        ])
+        .output()
+        .expect("eval run");
+    assert!(eval_run.status.success(), "agent-os eval run failed");
+    let eval_run: Value = serde_json::from_slice(&eval_run.stdout).expect("eval run json");
+    assert_eq!(eval_run["eval"]["target"], "local-smoke");
+    assert_eq!(eval_run["eval"]["success"], true);
+    assert_eq!(
+        eval_run["eval"]["run"]["command"],
+        "printf '{\"message\":\"cli-eval-run\",\"ok\":true,\"count\":2}'"
+    );
+    assert_eq!(
+        eval_run["eval"]["run"]["stdout"],
+        r#"{"message":"cli-eval-run","ok":true,"count":2}"#
+    );
+    assert_eq!(eval_run["eval"]["run"]["success_pattern"], "cli-eval-run");
+    assert_eq!(
+        eval_run["stdout"],
+        r#"{"message":"cli-eval-run","ok":true,"count":2}"#
+    );
+    assert_eq!(eval_run["success_pattern_matched"], true);
+    assert_eq!(eval_run["output_schema_valid"], true);
+    assert_eq!(eval_run["output_schema_error"], Value::Null);
+    let eval_run_id = eval_run["id"].as_str().expect("eval run id");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "eval", "record", "bad-eval"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "eval record requires exactly one of --success or --failure",
+        ));
+
+    let eval_show = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "eval", "show", eval_id])
+        .output()
+        .expect("eval show");
+    assert!(eval_show.status.success(), "agent-os eval show failed");
+    let eval_show: Value = serde_json::from_slice(&eval_show.stdout).expect("eval show json");
+    assert_eq!(eval_show["id"], eval_id);
+
+    let evals = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "eval",
+            "list",
+            "--target",
+            "ci-fix-workflow",
+            "--success",
+            "true",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("eval list");
+    assert!(evals.status.success(), "agent-os eval list failed");
+    let evals: Value = serde_json::from_slice(&evals.stdout).expect("evals json");
+    assert_eq!(evals.as_array().expect("evals").len(), 1);
+    assert_eq!(evals[0]["id"], eval_id);
+
+    let eval_run_list = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "eval",
+            "list",
+            "--query",
+            "cli-eval-run",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("eval run list");
+    assert!(
+        eval_run_list.status.success(),
+        "agent-os eval run list failed"
+    );
+    let eval_run_list: Value =
+        serde_json::from_slice(&eval_run_list.stdout).expect("eval run list json");
+    assert_eq!(eval_run_list.as_array().expect("eval run list").len(), 1);
+    assert_eq!(eval_run_list[0]["id"], eval_run_id);
+    assert_eq!(
+        eval_run_list[0]["run"]["stdout"],
+        r#"{"message":"cli-eval-run","ok":true,"count":2}"#
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "worker", "remove", "remote-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed worker remote-a"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "events", "--kind", "worker-removed"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("worker-removed"));
+}
+
+#[test]
+fn secrets_cli_manages_secret_manager_backends_without_values() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state path");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let defaults = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "secrets", "list"])
+        .output()
+        .expect("secrets list");
+    assert!(defaults.status.success(), "agent-os secrets list failed");
+    let defaults: Value = serde_json::from_slice(&defaults.stdout).expect("secrets list json");
+    assert_eq!(defaults[0]["id"], "environment");
+    assert_eq!(defaults[0]["kind"], "environment");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "tool",
+            "add",
+            "secret-tool",
+            "--command-template",
+            "printf {token}",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "task",
+            "create",
+            "Use secret token",
+            "--tool",
+            "secret-tool",
+            "--secret-arg",
+            "token=AGENT_OS_CLI_SECRET_CHECK",
+        ])
+        .assert()
+        .success();
+
+    let missing_check = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env_remove("AGENT_OS_CLI_SECRET_CHECK")
+        .args(["--state", state_arg, "--json", "secrets", "check"])
+        .output()
+        .expect("secrets missing check");
+    assert!(
+        missing_check.status.success(),
+        "agent-os secrets missing check failed"
+    );
+    let missing_check: Value =
+        serde_json::from_slice(&missing_check.stdout).expect("missing check json");
+    assert_eq!(missing_check["total"], 1);
+    assert_eq!(missing_check["present"], 0);
+    assert_eq!(missing_check["missing"], 1);
+    assert_eq!(
+        missing_check["references"][0]["env"],
+        "AGENT_OS_CLI_SECRET_CHECK"
+    );
+    assert_eq!(missing_check["references"][0]["present"], false);
+
+    let present_check = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_CLI_SECRET_CHECK", "not printed")
+        .args(["--state", state_arg, "--json", "secrets", "check"])
+        .output()
+        .expect("secrets present check");
+    assert!(
+        present_check.status.success(),
+        "agent-os secrets present check failed"
+    );
+    let present_check: Value =
+        serde_json::from_slice(&present_check.stdout).expect("present check json");
+    assert_eq!(present_check["total"], 1);
+    assert_eq!(present_check["present"], 1);
+    assert_eq!(present_check["missing"], 0);
+    assert_eq!(present_check["references"][0]["present"], true);
+
+    let backend = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "secrets",
+            "register",
+            "prod-op",
+            "--kind",
+            "1password",
+            "--reference",
+            "vault/Agent OS",
+        ])
+        .output()
+        .expect("secrets register");
+    assert!(backend.status.success(), "agent-os secrets register failed");
+    let backend: Value = serde_json::from_slice(&backend.stdout).expect("backend json");
+    assert_eq!(backend["id"], "prod-op");
+    assert_eq!(backend["kind"], "one-password");
+    assert_eq!(backend["reference"], "vault/Agent OS");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state", state_arg, "secrets", "register", "bad", "--kind", "mystery",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "invalid secrets backend kind `mystery`",
+        ));
+
+    let filtered = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "secrets",
+            "list",
+            "--kind",
+            "one-password",
+            "--query",
+            "vault",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("filtered secrets list");
+    assert!(
+        filtered.status.success(),
+        "agent-os secrets list filtered failed"
+    );
+    let filtered: Value = serde_json::from_slice(&filtered.stdout).expect("filtered json");
+    assert_eq!(filtered.as_array().expect("filtered").len(), 1);
+    assert_eq!(filtered[0]["id"], "prod-op");
+
+    let shown = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "--json", "secrets", "show", "prod-op"])
+        .output()
+        .expect("secrets show");
+    assert!(shown.status.success(), "agent-os secrets show failed");
+    let shown: Value = serde_json::from_slice(&shown.stdout).expect("show json");
+    assert_eq!(shown["kind"], "one-password");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "secrets", "remove", "prod-op"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed secrets backend prod-op"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "events",
+            "--kind",
+            "secrets-backend-removed",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secrets-backend-removed"));
+}
+
+#[test]
 fn service_install_and_uninstall_manage_launchd_plist() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -8408,6 +11349,84 @@ fn service_install_and_uninstall_manage_launchd_plist() {
 }
 
 #[test]
+fn service_windows_task_renders_powershell_without_installing() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "windows-task",
+            "--bin-path",
+            r"C:\Program Files\Agent OS\agent-os.exe",
+            "--task-name",
+            "Agent OS Test",
+            "--interval-ms",
+            "2500",
+            "--limit",
+            "2",
+            "--execute",
+            "--recover-stale-seconds",
+            "60",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("New-ScheduledTaskAction"))
+        .stdout(predicate::str::contains("Register-ScheduledTask"))
+        .stdout(predicate::str::contains("-TaskName 'Agent OS Test'"))
+        .stdout(predicate::str::contains("-Milliseconds 2500"))
+        .stdout(predicate::str::contains("--execute"))
+        .stdout(predicate::str::contains("--recover-stale-seconds 60"));
+
+    let rendered = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "service",
+            "windows-task",
+            "--bin-path",
+            r"C:\Agent OS\agent-os.exe",
+            "--task-name",
+            "Agent OS JSON",
+        ])
+        .output()
+        .expect("windows task json");
+    assert!(rendered.status.success(), "windows task json failed");
+    let rendered: Value = serde_json::from_slice(&rendered.stdout).expect("windows task json body");
+    assert_eq!(rendered["platform"], "windows-scheduled-task");
+    assert_eq!(rendered["task"]["task_name"], "Agent OS JSON");
+    assert!(
+        rendered["powershell"]
+            .as_str()
+            .expect("powershell")
+            .contains("Register-ScheduledTask")
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "windows-task",
+            "--task-name",
+            " ",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "windows task name must not be empty",
+        ));
+}
+
+#[test]
+#[cfg(unix)]
 fn service_start_stop_and_status_call_launchctl() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -8420,11 +11439,7 @@ fn service_start_stop_and_status_call_launchctl() {
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_LAUNCHCTL_LOG\"\nif [ \"$1\" = \"print\" ]; then echo 'state = running'; fi\nexit 0\n",
     )
     .expect("fake launchctl");
-    let mut permissions = std::fs::metadata(&fake_launchctl)
-        .expect("metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_launchctl, permissions).expect("chmod");
+    make_executable(&fake_launchctl);
 
     let state_arg = state.to_str().expect("state");
     let plist_arg = plist.to_str().expect("plist");
@@ -8536,12 +11551,173 @@ fn service_start_stop_and_status_call_launchctl() {
 }
 
 #[test]
+#[cfg(unix)]
+fn service_systemd_controls_call_systemctl() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let unit = dir.path().join("agent-os.service");
+    let fake_systemctl = dir.path().join("systemctl");
+    let log = dir.path().join("systemctl.log");
+    std::fs::write(
+        &fake_systemctl,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_SYSTEMCTL_LOG\"\nif [ \"$2\" = \"is-active\" ]; then echo active; fi\nexit 0\n",
+    )
+    .expect("fake systemctl");
+    make_executable(&fake_systemctl);
+
+    let state_arg = state.to_str().expect("state");
+    let unit_arg = unit.to_str().expect("unit");
+    let systemctl_arg = fake_systemctl.to_str().expect("systemctl");
+    let log_arg = log.to_str().expect("log");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "install-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--unit-path",
+            unit_arg,
+            "--bin-path",
+            "/usr/local/bin/agent-os",
+            "--execute",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Installed systemd user service unit",
+        ));
+    let unit_body = std::fs::read_to_string(&unit).expect("systemd unit");
+    assert!(unit_body.contains("[Service]"));
+    assert!(unit_body.contains("ExecStart=/usr/local/bin/agent-os"));
+    assert!(unit_body.contains("--execute"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "start-systemd",
+            "--unit-name",
+            "",
+            "--systemctl-path",
+            systemctl_arg,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("service label must not be empty"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "status-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--systemctl-path",
+            "   ",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("systemctl_path must not be empty"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_SYSTEMCTL_LOG", log_arg)
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "start-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--systemctl-path",
+            systemctl_arg,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Started systemd user service"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_SYSTEMCTL_LOG", log_arg)
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "status-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--systemctl-path",
+            systemctl_arg,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is active"))
+        .stdout(predicate::str::contains("active"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_SYSTEMCTL_LOG", log_arg)
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "stop-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--systemctl-path",
+            systemctl_arg,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stopped systemd user service"));
+
+    let calls = std::fs::read_to_string(log).expect("systemctl log");
+    assert!(calls.contains("--user start agent-os-test.service"));
+    assert!(calls.contains("--user is-active agent-os-test.service"));
+    assert!(calls.contains("--user stop agent-os-test.service"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "service",
+            "uninstall-systemd",
+            "--unit-name",
+            "agent-os-test.service",
+            "--unit-path",
+            unit_arg,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed systemd user service unit",
+        ));
+    assert!(!unit.exists());
+}
+
+#[test]
 fn completions_command_generates_shell_completion() {
     Command::cargo_bin("agent-os")
         .expect("binary")
         .args(["--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains(
+            "agent-os config init --profile safe",
+        ))
+        .stdout(predicate::str::contains(
+            "agent-os --state ./sandbox run --dry-run",
+        ))
         .stdout(predicate::str::contains(
             "Run state and config preflight diagnostics",
         ))
@@ -8685,7 +11861,8 @@ fn completions_command_generates_shell_completion() {
         .success()
         .stdout(predicate::str::contains(
             "Bind address for the local API listener",
-        ));
+        ))
+        .stdout(predicate::str::contains("--allow-origin"));
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -8741,12 +11918,61 @@ fn readme_agent_status_synopses_document_aliases() {
 }
 
 #[test]
+fn readme_documents_systemd_argument_escaping() {
+    let readme = include_str!("../README.md");
+    let service_notes = readme
+        .lines()
+        .find(|line| line.starts_with("- `service launchd` renders"))
+        .expect("README service notes");
+
+    assert!(
+        service_notes.contains("service systemd` renders a Linux systemd user unit"),
+        "{service_notes}"
+    );
+    assert!(
+        service_notes.contains("service windows-task` renders a PowerShell script"),
+        "{service_notes}"
+    );
+    assert!(
+        service_notes.contains("escapes `%` specifiers"),
+        "{service_notes}"
+    );
+}
+
+#[test]
+fn readme_documents_policy_rule_approval_gates() {
+    let readme = include_str!("../README.md");
+    let policy_notes = readme
+        .lines()
+        .find(|line| line.starts_with("Policy `rules` accept"))
+        .expect("README policy rule notes");
+
+    assert!(
+        policy_notes.contains("require approval for git push"),
+        "{policy_notes}"
+    );
+    assert!(
+        policy_notes.contains("require approval for PATTERN"),
+        "{policy_notes}"
+    );
+    assert!(policy_notes.contains("approval gate"), "{policy_notes}");
+}
+
+#[test]
 fn readme_filter_synopses_document_accepted_aliases() {
     let readme = include_str!("../README.md");
     let task_list = readme
         .lines()
         .find(|line| line.starts_with("agent-os task list "))
         .expect("README task list synopsis");
+    let task_create = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os task create "))
+        .expect("README task create synopsis");
+    let task_update = readme
+        .lines()
+        .find(|line| line.starts_with("agent-os task update "))
+        .expect("README task update synopsis");
     let tool_add = readme
         .lines()
         .find(|line| line.starts_with("agent-os tool add "))
@@ -8766,6 +11992,8 @@ fn readme_filter_synopses_document_accepted_aliases() {
 
     assert!(task_list.contains("complete|completed"), "{task_list}");
     assert!(task_list.contains("cancelled|canceled"), "{task_list}");
+    assert!(task_create.contains("[--max-attempts N]"), "{task_create}");
+    assert!(task_update.contains("[--max-attempts N]"), "{task_update}");
     for synopsis in [tool_add, tool_list, tool_update] {
         assert!(synopsis.contains("file-read|read-file"), "{synopsis}");
         assert!(synopsis.contains("file-write|write-file"), "{synopsis}");
@@ -8775,6 +12003,24 @@ fn readme_filter_synopses_document_accepted_aliases() {
         "{runs_list}"
     );
     assert!(runs_list.contains("success|succeeded"), "{runs_list}");
+}
+
+#[test]
+fn readme_documents_generated_id_collision_retries() {
+    let readme = include_str!("../README.md");
+    let id_notes = readme
+        .lines()
+        .find(|line| line.starts_with("- Agent names must normalize"))
+        .expect("README ID notes");
+
+    assert!(
+        id_notes.contains("Generated task, run, workflow, memory, and approval IDs"),
+        "{id_notes}"
+    );
+    assert!(
+        id_notes.contains("retried against current state"),
+        "{id_notes}"
+    );
 }
 
 #[test]
@@ -8829,11 +12075,32 @@ fn readme_state_repair_documents_workflow_drift() {
     );
     assert!(
         state_notes
+            .contains("migration dry-runs print planned schema steps plus validation success"),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains("migration responses include `output_preexisting`"),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains("migration reports include downgrade notes"),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains("pre-migration backup/export"),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes
             .contains(r#"POST /state/backup` accepts `{"output":"backup.json","dry_run":true}`"#),
         "{state_notes}"
     );
     assert!(
         state_notes.contains(r#"POST /state/repair` accepts `{"dry_run":true}`"#),
+        "{state_notes}"
+    );
+    assert!(
+        state_notes.contains(r#"POST /state/sqlite` accepts `{"output":"state.sqlite"}`"#),
         "{state_notes}"
     );
     assert!(repair_notes.contains("OS name drift"), "{repair_notes}");
@@ -8966,6 +12233,177 @@ fn github_ci_matches_manifest_rust_version_and_runs_canonical_ci() {
         ci.contains("run: ./scripts/ci.sh"),
         "GitHub CI should run the canonical local CI script"
     );
+    for expected in [
+        "runs-on: windows-latest",
+        "runs-on: macos-latest",
+        "cargo check --locked --all-targets",
+        "cargo test --locked --lib",
+    ] {
+        assert!(
+            ci.contains(expected),
+            "GitHub CI should include cross-platform check `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn release_packaging_artifacts_cover_archives_completions_and_attestation() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let package_script = manifest_dir.join("scripts").join("package-release.sh");
+    assert!(package_script.is_file(), "release packaging script missing");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(&package_script)
+            .expect("package script metadata")
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "release packaging script must be executable"
+        );
+    }
+
+    let script = include_str!("../scripts/package-release.sh");
+    for expected in [
+        "cargo build --locked --release",
+        "completions \"$shell\"",
+        "tar -czf \"$archive\"",
+        "shasum -a 256",
+        "sha256sum",
+        "target_exe_suffix",
+        "*windows*|*mingw*|*msvc*) printf '.exe'",
+        "exe=\"$(target_exe_suffix \"$target\")\"",
+        "exe=\"$(host_exe_suffix)\"",
+        "AGENT_OS_SIGN_RELEASES",
+        "cosign sign-blob --yes",
+        "--output-signature",
+        "--output-certificate",
+    ] {
+        assert!(
+            script.contains(expected),
+            "package-release.sh should include `{expected}`"
+        );
+    }
+
+    let release = include_str!("../.github/workflows/release.yml");
+    for expected in [
+        "tags: [\"v*\"]",
+        "contents: write",
+        "id-token: write",
+        "attestations: write",
+        "actions/attest-build-provenance@v2",
+        "sigstore/cosign-installer@v3",
+        "AGENT_OS_SIGN_RELEASES: \"1\"",
+        "./scripts/package-release.sh",
+        "softprops/action-gh-release@v2",
+        "target/dist/*.tar.gz.sha256",
+        "target/dist/*.tar.gz.sig",
+        "target/dist/*.tar.gz.pem",
+    ] {
+        assert!(
+            release.contains(expected),
+            "release workflow should include `{expected}`"
+        );
+    }
+
+    let formula = include_str!("../packaging/homebrew/agent-os.rb");
+    for expected in [
+        "class AgentOs < Formula",
+        "on_macos do",
+        "on_linux do",
+        "agent-os-0.1.0-aarch64-apple-darwin.tar.gz",
+        "agent-os-0.1.0-x86_64-apple-darwin.tar.gz",
+        "agent-os-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+        "bin.install \"bin/agent-os\"",
+        "bash_completion.install",
+        "zsh_completion.install",
+        "fish_completion.install",
+        "pkgshare/\"completions\"",
+        "agent-os.elvish",
+        "agent-os.powershell",
+        "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
+        "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
+        "REPLACE_WITH_X86_64_UNKNOWN_LINUX_GNU_SHA256",
+    ] {
+        assert!(
+            formula.contains(expected),
+            "Homebrew formula should include `{expected}`"
+        );
+    }
+
+    let checklist = include_str!("../docs/PUBLIC_RELEASE_CHECKLIST.md");
+    assert!(checklist.contains("./scripts/package-release.sh"));
+    assert!(checklist.contains("Sigstore `.sig`/`.pem` signature files"));
+    assert!(checklist.contains("build provenance attestations"));
+    assert!(checklist.contains("packaging/homebrew/agent-os.rb"));
+    assert!(checklist.contains("macOS Apple Silicon"));
+    assert!(checklist.contains("Linux x86_64"));
+}
+
+#[test]
+fn product_polish_artifacts_cover_landing_demo_and_screenshots() {
+    let readme = include_str!("../README.md");
+    let examples = include_str!("../examples/README.md");
+    let landing = include_str!("../docs/landing.html");
+    let preview = include_str!("../docs/assets/agent-os-dashboard-preview.svg");
+
+    assert!(
+        readme.contains("[landing page](docs/landing.html)"),
+        "README should link the product landing page"
+    );
+    assert!(
+        examples.contains("docs/landing.html"),
+        "examples should point demo users to the landing page"
+    );
+    for expected in [
+        "Why Agent OS",
+        "Local demo",
+        "Screenshot storyboard",
+        "agent-os --state ./sandbox run --execute --limit 1",
+        "agent-os-dashboard-preview.svg",
+        "Agent OS dashboard preview",
+    ] {
+        assert!(
+            landing.contains(expected),
+            "landing page should include `{expected}`"
+        );
+    }
+    for expected in [
+        "<svg",
+        "Agent OS dashboard preview",
+        "Workflow Queue",
+        "Run Log",
+        "Approvals",
+        "Memory",
+        "Event Timeline",
+    ] {
+        assert!(
+            preview.contains(expected),
+            "dashboard preview asset should include `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn architecture_doc_contains_runtime_diagrams() {
+    let architecture = include_str!("../docs/ARCHITECTURE.md");
+    for expected in [
+        "## Architecture Diagrams",
+        "```mermaid",
+        "flowchart LR",
+        "sequenceDiagram",
+        "CLI[\"CLI operator commands\"] --> Runtime",
+        "API[\"Local HTTP API\"] --> Runtime",
+        "Executor->>Store: finish run and task lifecycle",
+    ] {
+        assert!(
+            architecture.contains(expected),
+            "docs/ARCHITECTURE.md should include `{expected}`"
+        );
+    }
 }
 
 #[test]
@@ -9029,7 +12467,13 @@ fn readme_documents_global_cli_options_and_env_vars() {
             "README should document global option `{option}`"
         );
     }
-    for env_var in ["AGENT_OS_HOME", "AGENT_OS_CONFIG"] {
+    for env_var in [
+        "AGENT_OS_HOME",
+        "AGENT_OS_CONFIG",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+    ] {
         assert!(
             readme.contains(&format!("`{env_var}`")),
             "README should document {env_var}"
@@ -9041,8 +12485,8 @@ fn readme_documents_global_cli_options_and_env_vars() {
 fn readme_subcommand_lists_match_cli_help() {
     let readme = include_str!("../README.md");
     for command in [
-        "config", "state", "agent", "task", "tool", "memory", "runs", "daemon", "service", "api",
-        "workflow",
+        "config", "state", "agent", "task", "tool", "memory", "registry", "worker", "eval",
+        "secrets", "approval", "git", "runs", "daemon", "service", "api", "workflow",
     ] {
         let documented = documented_readme_subcommands(readme, command);
         let help = Command::cargo_bin("agent-os")
@@ -9131,7 +12575,7 @@ fn workflow_create_respects_task_dependencies() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -9324,6 +12768,158 @@ fn workflow_create_respects_task_dependencies() {
 }
 
 #[test]
+fn workflow_dag_editor_adds_edges_and_controls_stages() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let workflow = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "create",
+            "Edit workflow graph",
+        ])
+        .output()
+        .expect("workflow create");
+    assert!(workflow.status.success(), "workflow create failed");
+    let workflow: Value = serde_json::from_slice(&workflow.stdout).expect("workflow json");
+    let workflow_id = workflow["id"].as_str().expect("workflow id");
+
+    let add = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "add-task",
+            workflow_id,
+            "deploy",
+            "Deploy release",
+            "--after",
+            "review",
+            "--command",
+            "printf deploy",
+            "--need",
+            "ops",
+        ])
+        .output()
+        .expect("workflow add-task");
+    assert!(add.status.success(), "workflow add-task failed");
+    let add: Value = serde_json::from_slice(&add.stdout).expect("add json");
+    assert_eq!(add["stage"], "deploy");
+    assert_eq!(add["progress"]["total_tasks"], 4);
+
+    let link = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "link",
+            workflow_id,
+            "--from",
+            "plan",
+            "--to",
+            "deploy",
+        ])
+        .output()
+        .expect("workflow link");
+    assert!(link.status.success(), "workflow link failed");
+    let link: Value = serde_json::from_slice(&link.stdout).expect("link json");
+    assert_eq!(link["linked"], true);
+
+    let unlink = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "unlink",
+            workflow_id,
+            "--from",
+            "plan",
+            "--to",
+            "deploy",
+        ])
+        .output()
+        .expect("workflow unlink");
+    assert!(unlink.status.success(), "workflow unlink failed");
+    let unlink: Value = serde_json::from_slice(&unlink.stdout).expect("unlink json");
+    assert_eq!(unlink["linked"], false);
+
+    let pause = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "pause",
+            workflow_id,
+        ])
+        .output()
+        .expect("workflow pause");
+    assert!(pause.status.success(), "workflow pause failed");
+    let pause: Value = serde_json::from_slice(&pause.stdout).expect("pause json");
+    assert_eq!(
+        pause["affected_tasks"].as_array().expect("affected").len(),
+        4
+    );
+    assert_eq!(pause["progress"]["tasks_blocked"], 4);
+
+    let retry = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "retry",
+            workflow_id,
+        ])
+        .output()
+        .expect("workflow retry");
+    assert!(retry.status.success(), "workflow retry failed");
+    let retry: Value = serde_json::from_slice(&retry.stdout).expect("retry json");
+    assert_eq!(retry["progress"]["tasks_pending"], 4);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "workflow", "pause", workflow_id])
+        .assert()
+        .success();
+
+    let resume = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "workflow",
+            "resume",
+            workflow_id,
+        ])
+        .output()
+        .expect("workflow resume");
+    assert!(resume.status.success(), "workflow resume failed");
+    let resume: Value = serde_json::from_slice(&resume.stdout).expect("resume json");
+    assert_eq!(resume["progress"]["tasks_pending"], 4);
+}
+
+#[test]
 fn workflow_run_advances_next_ready_stage() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -9331,7 +12927,7 @@ fn workflow_run_advances_next_ready_stage() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -9473,7 +13069,7 @@ fn end_to_end_operator_workflow_covers_cli_api_daemon_tools_memory_and_run_logs(
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -9693,7 +13289,7 @@ fn task_recover_requeues_stale_running_tasks() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -9748,6 +13344,14 @@ fn task_recover_requeues_stale_running_tasks() {
             .len(),
         1
     );
+    assert_eq!(
+        recovered["recovered_runs"]
+            .as_array()
+            .expect("recovered run ids")
+            .len(),
+        0
+    );
+    assert_eq!(recovered["recovered_daemon"], false);
 
     Command::cargo_bin("agent-os")
         .expect("binary")
@@ -9766,7 +13370,7 @@ fn api_can_recover_stale_running_tasks() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -9851,6 +13455,14 @@ fn api_can_recover_stale_running_tasks() {
             .len(),
         0
     );
+    assert_eq!(
+        default_recovery_body["recovered_runs"]
+            .as_array()
+            .expect("default recovered run ids")
+            .len(),
+        0
+    );
+    assert_eq!(default_recovery_body["recovered_daemon"], false);
     let status_after_default = http_get(addr, "/status", &auth);
     assert!(
         status_after_default.contains("HTTP/1.1 200 OK"),
@@ -9878,6 +13490,14 @@ fn api_can_recover_stale_running_tasks() {
             .len(),
         1
     );
+    assert_eq!(
+        recovered_body["recovered_runs"]
+            .as_array()
+            .expect("recovered run ids")
+            .len(),
+        0
+    );
+    assert_eq!(recovered_body["recovered_daemon"], false);
 
     let status = http_get(addr, "/status", &auth);
     assert!(status.contains("HTTP/1.1 200 OK"), "{status}");
@@ -9895,7 +13515,7 @@ fn task_lifecycle_controls_validate_dependencies_and_release_capacity() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10068,7 +13688,7 @@ fn memory_records_can_be_shown_and_removed() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10156,6 +13776,114 @@ fn memory_records_can_be_shown_and_removed() {
 }
 
 #[test]
+fn memory_prune_dry_run_reports_without_removing_then_prunes() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let old_output = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "add",
+            "old-prune-topic",
+            "old body",
+        ])
+        .output()
+        .expect("old memory add");
+    assert!(old_output.status.success(), "old memory add failed");
+    let old_body: Value = serde_json::from_slice(&old_output.stdout).expect("old memory json");
+    let old_id = old_body["id"].as_str().expect("old memory id");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "memory",
+            "add",
+            "fresh-prune-topic",
+            "fresh body",
+        ])
+        .assert()
+        .success();
+
+    rewrite_memory_timestamp(&state, "old-prune-topic", "2020-01-01T00:00:00Z");
+
+    let dry_run = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "prune",
+            "--max-age-days",
+            "1",
+            "--dry-run",
+        ])
+        .output()
+        .expect("memory prune dry run");
+    assert!(dry_run.status.success(), "memory prune dry run failed");
+    let dry_run_body: Value = serde_json::from_slice(&dry_run.stdout).expect("dry run json");
+    assert_eq!(dry_run_body["dry_run"], true);
+    assert_eq!(dry_run_body["expired"][0]["topic"], "old-prune-topic");
+    assert_eq!(
+        dry_run_body["removed"].as_array().expect("removed").len(),
+        0
+    );
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "memory", "show", old_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old-prune-topic"));
+
+    let prune = Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "--json",
+            "memory",
+            "prune",
+            "--max-age-days",
+            "1",
+        ])
+        .output()
+        .expect("memory prune");
+    assert!(prune.status.success(), "memory prune failed");
+    let prune_body: Value = serde_json::from_slice(&prune.stdout).expect("prune json");
+    assert_eq!(prune_body["dry_run"], false);
+    assert_eq!(prune_body["removed"][0]["id"], old_id);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "memory", "show", old_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("memory not found"));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "memory", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fresh-prune-topic"))
+        .stdout(predicate::str::contains("old-prune-topic").not());
+}
+
+#[test]
 fn task_assign_manually_schedules_ready_task() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -10163,7 +13891,7 @@ fn task_assign_manually_schedules_ready_task() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10266,7 +13994,7 @@ fn task_priority_updates_backlog_ordering_signal() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10423,7 +14151,7 @@ fn task_update_can_replace_and_clear_tool_invocations() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10530,7 +14258,7 @@ fn task_dependencies_can_be_replaced_and_cleared() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10670,7 +14398,7 @@ fn api_can_manually_assign_task() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10793,7 +14521,7 @@ fn api_serve_exposes_status_json() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -10806,7 +14534,7 @@ fn api_serve_exposes_status_json() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "6",
+            "7",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -10857,6 +14585,21 @@ fn api_serve_exposes_status_json() {
     assert!(metrics.contains("\"tasks_pending\""), "{metrics}");
     assert!(metrics.contains("\"runs_success\""), "{metrics}");
 
+    let prometheus = http_get(addr, "/metrics/prometheus", &[]);
+    assert!(prometheus.contains("HTTP/1.1 200 OK"), "{prometheus}");
+    assert!(
+        prometheus.contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+        "{prometheus}"
+    );
+    assert!(
+        prometheus.contains("# TYPE agent_os_tasks_total gauge"),
+        "{prometheus}"
+    );
+    assert!(
+        prometheus.contains("agent_os_run_duration_ms_bucket{le=\"+Inf\"}"),
+        "{prometheus}"
+    );
+
     let mut stream = connect_with_retry(addr);
     stream
         .write_all(b"GET /status HTTP/1.1\r\nhost: localhost\r\n\r\n")
@@ -10865,6 +14608,7 @@ fn api_serve_exposes_status_json() {
     stream.read_to_string(&mut response).expect("read response");
 
     assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("\r\nx-trace-id: "), "{response}");
     assert!(response.contains("\"tasks_pending\""), "{response}");
     assert!(
         response.contains(&format!(
@@ -10993,7 +14737,7 @@ fn api_health_reports_config_validation() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -11163,6 +14907,8 @@ fn api_can_write_default_config() {
     let written = http_request(addr, "POST", "/config", "", &[]);
     assert!(written.contains("HTTP/1.1 201 Created"), "{written}");
     assert!(written.contains("\"written\":true"), "{written}");
+    assert!(written.contains("\"profile\":\"safe\""), "{written}");
+    assert!(written.contains("\"allow_shell\":false"), "{written}");
     assert!(written.contains("\"name\":\"Agent OS\""), "{written}");
     assert!(config.exists());
 
@@ -11171,9 +14917,20 @@ fn api_can_write_default_config() {
     assert!(conflict.contains("config conflict"), "{conflict}");
 
     std::fs::write(&config, "name = 'Custom'\n").expect("custom config");
-    let forced = http_request(addr, "POST", "/config", r#"{"force":true}"#, &[]);
+    let forced = http_request(
+        addr,
+        "POST",
+        "/config",
+        r#"{"force":true,"profile":"ci"}"#,
+        &[],
+    );
     assert!(forced.contains("HTTP/1.1 201 Created"), "{forced}");
     assert!(forced.contains("\"written\":true"), "{forced}");
+    assert!(forced.contains("\"profile\":\"ci\""), "{forced}");
+    assert!(
+        forced.contains("\"allowed_commands\":[\"cargo\",\"rustc\",\"git\"]"),
+        "{forced}"
+    );
 
     let loaded = http_get(addr, "/config", &[]);
     assert!(loaded.contains("HTTP/1.1 200 OK"), "{loaded}");
@@ -11411,6 +15168,7 @@ fn api_can_install_and_uninstall_launchd_service() {
 }
 
 #[test]
+#[cfg(unix)]
 fn api_can_control_launchd_service_with_launchctl() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("missing-state");
@@ -11434,21 +15192,13 @@ fn api_can_control_launchd_service_with_launchctl() {
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_LAUNCHCTL_LOG\"\nif [ \"$1\" = \"print\" ]; then echo 'state = running'; fi\nexit 0\n",
     )
     .expect("fake launchctl");
-    let mut permissions = std::fs::metadata(&fake_launchctl)
-        .expect("metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&fake_launchctl, permissions).expect("chmod");
+    make_executable(&fake_launchctl);
     std::fs::write(
         &failing_launchctl,
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_LAUNCHCTL_LOG\"\necho 'bootout failed' >&2\nexit 42\n",
     )
     .expect("failing launchctl");
-    let mut permissions = std::fs::metadata(&failing_launchctl)
-        .expect("metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&failing_launchctl, permissions).expect("chmod");
+    make_executable(&failing_launchctl);
 
     let state_arg = state.to_str().expect("state");
     let log_arg = log.to_str().expect("log");
@@ -11592,12 +15342,280 @@ fn api_can_control_launchd_service_with_launchctl() {
 }
 
 #[test]
+fn api_can_render_install_and_uninstall_systemd_service() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("missing-state");
+    let home = dir.path().join("home");
+    let default_unit_path = home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("agent-os.service");
+    let bin_path = dir.path().join("bin").join("agent-os");
+    let unit_path = dir.path().join("systemd").join("agent-os-test.service");
+    let state_arg = state.to_str().expect("state");
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("HOME", &home)
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--max-requests",
+            "7",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+
+    let stdout = child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let default_rendered = http_request(addr, "POST", "/service/systemd", "", &[]);
+    assert!(
+        default_rendered.contains("HTTP/1.1 200 OK"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"unit_name\":\"agent-os.service\""),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"interval_ms\":1000"),
+        "{default_rendered}"
+    );
+    assert!(
+        default_rendered.contains("\"limit\":1"),
+        "{default_rendered}"
+    );
+    assert!(default_rendered.contains("[Service]"), "{default_rendered}");
+    assert!(
+        default_rendered.contains(".config/systemd/user/agent-os.service"),
+        "{default_rendered}"
+    );
+
+    let body = serde_json::json!({
+        "unit_name": "agent-os-test.service",
+        "bin_path": bin_path,
+        "interval_ms": 250,
+        "limit": 2,
+        "execute": true,
+        "recover_stale_seconds": 30,
+        "unit_path": unit_path,
+    })
+    .to_string();
+    let rendered = http_request(addr, "POST", "/service/systemd", &body, &[]);
+    assert!(rendered.contains("HTTP/1.1 200 OK"), "{rendered}");
+    assert!(rendered.contains("\"platform\":\"systemd\""), "{rendered}");
+    assert!(
+        rendered.contains("\"unit_name\":\"agent-os-test.service\""),
+        "{rendered}"
+    );
+    assert!(rendered.contains("\"interval_ms\":250"), "{rendered}");
+    assert!(rendered.contains("\"limit\":2"), "{rendered}");
+    assert!(rendered.contains("--execute"), "{rendered}");
+    assert!(rendered.contains("--recover-stale-seconds"), "{rendered}");
+
+    let invalid = http_request(
+        addr,
+        "POST",
+        "/service/systemd",
+        r#"{"unit_name":" ","interval_ms":250}"#,
+        &[],
+    );
+    assert!(invalid.contains("HTTP/1.1 400 Bad Request"), "{invalid}");
+    assert!(
+        invalid.contains("service label must not be empty"),
+        "{invalid}"
+    );
+
+    let default_installed = http_request(addr, "POST", "/service/systemd/install", "", &[]);
+    assert!(
+        default_installed.contains("HTTP/1.1 200 OK"),
+        "{default_installed}"
+    );
+    assert!(
+        default_installed.contains("\"installed\":true"),
+        "{default_installed}"
+    );
+    assert!(default_unit_path.exists());
+
+    let default_removed = http_request(addr, "POST", "/service/systemd/uninstall", "", &[]);
+    assert!(
+        default_removed.contains("HTTP/1.1 200 OK"),
+        "{default_removed}"
+    );
+    assert!(
+        default_removed.contains("\"removed\":true"),
+        "{default_removed}"
+    );
+    assert!(!default_unit_path.exists());
+
+    let installed = http_request(addr, "POST", "/service/systemd/install", &body, &[]);
+    assert!(installed.contains("HTTP/1.1 200 OK"), "{installed}");
+    assert!(installed.contains("\"installed\":true"), "{installed}");
+    assert!(unit_path.exists());
+    let unit_body = std::fs::read_to_string(&unit_path).expect("systemd unit");
+    assert!(unit_body.contains("agent-os-test.service"));
+    assert!(unit_body.contains("--execute"));
+    assert!(!unit_path.with_extension("service.tmp").exists());
+
+    let uninstall_body = serde_json::json!({
+        "unit_name": "agent-os-test.service",
+        "unit_path": unit_path,
+    })
+    .to_string();
+    let removed = http_request(
+        addr,
+        "POST",
+        "/service/systemd/uninstall",
+        &uninstall_body,
+        &[],
+    );
+    assert!(removed.contains("HTTP/1.1 200 OK"), "{removed}");
+    assert!(removed.contains("\"removed\":true"), "{removed}");
+    assert!(!unit_path.exists());
+
+    wait_for_api_success(&mut child);
+}
+
+#[test]
+#[cfg(unix)]
+fn api_can_control_systemd_service_with_systemctl() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("missing-state");
+    let fake_systemctl = dir.path().join("systemctl");
+    let failing_systemctl = dir.path().join("systemctl-fail");
+    let log = dir.path().join("systemctl.log");
+    std::fs::write(
+        &fake_systemctl,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_SYSTEMCTL_LOG\"\nif [ \"$2\" = \"is-active\" ]; then echo active; fi\nexit 0\n",
+    )
+    .expect("fake systemctl");
+    make_executable(&fake_systemctl);
+    std::fs::write(
+        &failing_systemctl,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENT_OS_SYSTEMCTL_LOG\"\necho 'stop failed' >&2\nexit 42\n",
+    )
+    .expect("failing systemctl");
+    make_executable(&failing_systemctl);
+
+    let state_arg = state.to_str().expect("state");
+    let log_arg = log.to_str().expect("log");
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("AGENT_OS_SYSTEMCTL_LOG", log_arg)
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--max-requests",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+
+    let stdout = child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let body = serde_json::json!({
+        "unit_name": "agent-os-test.service",
+        "systemctl_path": fake_systemctl,
+    })
+    .to_string();
+    let started = http_request(addr, "POST", "/service/systemd/start", &body, &[]);
+    assert!(started.contains("HTTP/1.1 200 OK"), "{started}");
+    assert!(started.contains("\"started\":true"), "{started}");
+    assert!(
+        started.contains("\"unit_name\":\"agent-os-test.service\""),
+        "{started}"
+    );
+
+    let status = http_request(addr, "POST", "/service/systemd/status", &body, &[]);
+    assert!(status.contains("HTTP/1.1 200 OK"), "{status}");
+    assert!(status.contains("\"active\":true"), "{status}");
+    assert!(status.contains("active"), "{status}");
+
+    let stopped = http_request(addr, "POST", "/service/systemd/stop", &body, &[]);
+    assert!(stopped.contains("HTTP/1.1 200 OK"), "{stopped}");
+    assert!(stopped.contains("\"stopped\":true"), "{stopped}");
+
+    let failing_body = serde_json::json!({
+        "unit_name": "agent-os-test.service",
+        "systemctl_path": failing_systemctl,
+    })
+    .to_string();
+    let failed_stop = http_request(addr, "POST", "/service/systemd/stop", &failing_body, &[]);
+    assert!(
+        failed_stop.contains("HTTP/1.1 409 Conflict"),
+        "{failed_stop}"
+    );
+    assert!(
+        failed_stop.contains("\"error\":\"service command failed\""),
+        "{failed_stop}"
+    );
+    assert!(failed_stop.contains("\"systemctl\":"), "{failed_stop}");
+    assert!(failed_stop.contains("\"success\":false"), "{failed_stop}");
+    assert!(failed_stop.contains("\"status\":42"), "{failed_stop}");
+    assert!(failed_stop.contains("stop failed"), "{failed_stop}");
+
+    let invalid = http_request(
+        addr,
+        "POST",
+        "/service/systemd/status",
+        r#"{"unit_name":"agent-os-test.service","systemctl_path":" "}"#,
+        &[],
+    );
+    assert!(invalid.contains("HTTP/1.1 400 Bad Request"), "{invalid}");
+    assert!(
+        invalid.contains("systemctl_path must not be empty"),
+        "{invalid}"
+    );
+
+    wait_for_api_success(&mut child);
+
+    let calls = std::fs::read_to_string(log).expect("systemctl log");
+    assert!(calls.contains("--user start agent-os-test.service"));
+    assert!(calls.contains("--user is-active agent-os-test.service"));
+    assert!(calls.contains("--user stop agent-os-test.service"));
+}
+
+#[test]
 fn api_doctor_reports_state_and_config_preflight() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("missing-state");
     let config = dir.path().join("agent-os.toml");
+    let missing_config = dir.path().join("missing-agent-os.toml");
     let state_arg = state.to_str().expect("state");
     let config_arg = config.to_str().expect("config");
+    let missing_config_arg = missing_config.to_str().expect("missing config");
 
     std::fs::write(&config, "name = '   '\n").expect("write invalid config");
 
@@ -11641,13 +15659,65 @@ fn api_doctor_reports_state_and_config_preflight() {
         "{doctor}"
     );
     assert!(doctor.contains("\"state_path\":"), "{doctor}");
+    assert!(
+        doctor.contains(&format!("\"platform\":\"{}\"", std::env::consts::OS)),
+        "{doctor}"
+    );
+    assert!(doctor.contains("\"service_manager\":"), "{doctor}");
+    assert!(doctor.contains("\"service_recommendation\":"), "{doctor}");
+    assert!(
+        doctor.contains("\"shell_execution_supported\":"),
+        "{doctor}"
+    );
+    assert!(doctor.contains("\"shell_execution_note\":"), "{doctor}");
     assert!(doctor.contains("\"state_exists\":false"), "{doctor}");
     assert!(doctor.contains("\"state_loads\":false"), "{doctor}");
     assert!(doctor.contains("\"state_valid\":null"), "{doctor}");
     assert!(doctor.contains("\"config_exists\":true"), "{doctor}");
     assert!(doctor.contains("\"config_loads\":true"), "{doctor}");
     assert!(doctor.contains("\"config_valid\":false"), "{doctor}");
+    assert!(doctor.contains("\"next_steps\":["), "{doctor}");
+    assert!(doctor.contains("agent-os --state"), "{doctor}");
+    assert!(doctor.contains("config validate"), "{doctor}");
     assert!(doctor.contains("OS name must not be empty"), "{doctor}");
+
+    wait_for_api_success(&mut child);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args([
+            "--state",
+            state_arg,
+            "--config",
+            missing_config_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--max-requests",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+
+    let stdout = child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let doctor = http_get(addr, "/doctor", &[]);
+    assert!(doctor.contains("HTTP/1.1 200 OK"), "{doctor}");
+    assert!(doctor.contains("\"config_exists\":false"), "{doctor}");
+    assert!(doctor.contains("config init --profile safe"), "{doctor}");
+    assert!(!doctor.contains("config init --profile dev"), "{doctor}");
 
     wait_for_api_success(&mut child);
 }
@@ -11873,6 +15943,10 @@ fn api_schema_command_prints_contract() {
         "nosniff"
     );
     assert_eq!(
+        schema["paths"]["/status"]["get"]["responses"]["200"]["headers"]["X-Trace-Id"]["schema"]["pattern"],
+        r"^[0-9a-fA-F-]{36}$"
+    );
+    assert_eq!(
         schema["paths"]["/status"]["options"]["responses"]["204"]["headers"]["Access-Control-Allow-Headers"]
             ["schema"]["example"],
         "authorization, content-type"
@@ -11993,12 +16067,45 @@ fn api_schema_command_prints_contract() {
         "string"
     );
     assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["platform"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["service_manager"]["enum"],
+        serde_json::json!(["launchd", "systemd", "manual"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["service_recommendation"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["shell_execution_supported"]
+            ["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["shell_execution_note"]["type"],
+        "string"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["DoctorResponse"]["properties"]["config_valid"]["type"],
         serde_json::json!(["boolean", "null"])
     );
     assert_eq!(
+        schema["components"]["schemas"]["DoctorResponse"]["properties"]["next_steps"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["InitRequest"]["properties"]["force"]["default"],
         false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["InitRequest"]["properties"]["profile"]["default"],
+        "safe"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["InitRequest"]["properties"]["profile"]["enum"],
+        serde_json::json!(["safe", "dev", "autonomous", "ci"])
     );
     assert_eq!(
         schema["components"]["schemas"]["InitResponse"]["properties"]["os"]["$ref"],
@@ -12038,6 +16145,18 @@ fn api_schema_command_prints_contract() {
         false
     );
     assert_eq!(
+        schema["components"]["schemas"]["WriteConfigRequest"]["properties"]["profile"]["enum"],
+        serde_json::json!(["safe", "dev", "autonomous", "ci"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WriteConfigRequest"]["properties"]["profile"]["default"],
+        "safe"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WriteConfigResponse"]["properties"]["profile"]["enum"],
+        serde_json::json!(["safe", "dev", "autonomous", "ci"])
+    );
+    assert_eq!(
         schema["components"]["schemas"]["WriteConfigResponse"]["properties"]["config"]["$ref"],
         "#/components/schemas/AppConfig"
     );
@@ -12054,6 +16173,10 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/ProviderSettings"
     );
     assert_eq!(
+        schema["components"]["schemas"]["ProviderSettings"]["properties"]["max_retries"]["maximum"],
+        agent_os::MAX_PROVIDER_RETRIES
+    );
+    assert_eq!(
         schema["components"]["schemas"]["AppConfig"]["properties"]["name"]["pattern"],
         r".*\S.*"
     );
@@ -12062,11 +16185,31 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/Policy"
     );
     assert_eq!(
+        schema["components"]["schemas"]["AppConfig"]["properties"]["memory_policy"]["$ref"],
+        "#/components/schemas/MemoryPolicy"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["OperatingSystem"]["properties"]["policy"]["$ref"],
         "#/components/schemas/Policy"
     );
     assert_eq!(
+        schema["components"]["schemas"]["OperatingSystem"]["properties"]["memory_policy"]["$ref"],
+        "#/components/schemas/MemoryPolicy"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryPolicy"]["properties"]["max_provider_memories"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryPolicy"]["properties"]["max_age_days"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert_eq!(
         schema["components"]["schemas"]["Policy"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["Policy"]["properties"]["allow_shell"]["default"],
         false
     );
     assert_eq!(
@@ -12106,6 +16249,19 @@ fn api_schema_command_prints_contract() {
         r".*\S.*"
     );
     assert_eq!(
+        schema["components"]["schemas"]["Policy"]["properties"]["network"]["properties"]["mode"]["default"],
+        "providers-only"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["Policy"]["properties"]["approval"]["properties"]["require_for_risky_actions"]
+            ["default"],
+        true
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["Policy"]["properties"]["autonomy"]["default"],
+        "execute-with-approval"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["ProviderSettings"]["properties"]["kind"]["enum"],
         serde_json::json!(agent_os::ProviderKind::INPUT_VALUES)
     );
@@ -12119,6 +16275,19 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["components"]["schemas"]["ProviderSettings"]["properties"]["api_key_env"]["pattern"],
+        r"^[A-Za-z_][A-Za-z0-9_]*$"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ProviderSettings"]["properties"]["plugin_command"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ProviderSettings"]["properties"]["plugin_args"]["items"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ProviderSettings"]["properties"]["plugin_env"]["propertyNames"]
+            ["pattern"],
         r"^[A-Za-z_][A-Za-z0-9_]*$"
     );
     assert_eq!(
@@ -12169,6 +16338,11 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/MetricsResponse"
     );
     assert_eq!(
+        schema["paths"]["/metrics/prometheus"]["get"]["responses"]["200"]["content"]["text/plain; version=0.0.4"]
+            ["schema"]["type"],
+        "string"
+    );
+    assert_eq!(
         schema["paths"]["/metrics"]["get"]["tags"],
         serde_json::json!(["system"])
     );
@@ -12199,6 +16373,11 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["components"]["schemas"]["MetricsResponse"]["properties"]["workflows_total"]["minimum"],
+        0
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MetricsResponse"]["properties"]["oldest_active_run_age_ms"]
+            ["minimum"],
         0
     );
     assert_eq!(
@@ -12395,6 +16574,161 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/LaunchctlCommandErrorResponse"
     );
     assert_eq!(
+        schema["paths"]["/service/systemd"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/SystemdServiceRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd"]["post"]["tags"],
+        serde_json::json!(["service"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceRequest"]["properties"]["interval_ms"]["default"],
+        1000
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceRequest"]["properties"]["unit_name"]["default"],
+        "agent-os.service"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceRequest"]["properties"]["unit_name"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceRequest"]["properties"]["bin_path"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceRequest"]["properties"]["unit_path"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceResponse"]["properties"]["service"]["$ref"],
+        "#/components/schemas/SystemdService"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/install"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/install"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/install"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/InstallSystemdServiceResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/uninstall"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/UninstallSystemdServiceRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/uninstall"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/uninstall"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/UninstallSystemdServiceResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["InstallSystemdServiceResponse"]["properties"]["service"]["$ref"],
+        "#/components/schemas/SystemdService"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UninstallSystemdServiceResponse"]["properties"]["removed"]
+            ["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UninstallSystemdServiceRequest"]["properties"]["unit_name"]
+            ["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UninstallSystemdServiceRequest"]["properties"]["unit_path"]
+            ["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/start"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceControlRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/start"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/start"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceStartResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/stop"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceStopResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/stop"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/status"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemdServiceStatusResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/status"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceControlRequest"]["properties"]["systemctl_path"]
+            ["default"],
+        "systemctl"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceControlRequest"]["properties"]["unit_name"]
+            ["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceControlRequest"]["properties"]["systemctl_path"]
+            ["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemdServiceStartResponse"]["properties"]["systemctl"]["$ref"],
+        "#/components/schemas/SystemctlCommandOutput"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SystemctlCommandErrorResponse"]["properties"]["systemctl"]
+            ["$ref"],
+        "#/components/schemas/SystemctlCommandOutput"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/start"]["post"]["responses"]["409"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemctlCommandErrorResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/service/systemd/stop"]["post"]["responses"]["409"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SystemctlCommandErrorResponse"
+    );
+    assert_eq!(
         schema["paths"]["/state/validate"]["get"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/ValidationReport"
@@ -12433,6 +16767,20 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/state/migrate"]["post"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/MigrateStateResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/state/sqlite"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/state/sqlite"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/StateSqliteRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/state/sqlite"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/StateSqliteResponse"
     );
     assert_eq!(
         schema["components"]["schemas"]["OperatingSystem"]["properties"]["tasks"]["additionalProperties"]
@@ -12501,10 +16849,22 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["components"]["schemas"]["MigrateStateResponse"]["required"],
-        serde_json::json!(["dry_run", "input", "output", "migration", "validation"])
+        serde_json::json!([
+            "dry_run",
+            "input",
+            "output",
+            "output_preexisting",
+            "migration",
+            "validation"
+        ])
     );
     assert_eq!(
         schema["components"]["schemas"]["MigrateStateResponse"]["properties"]["dry_run"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MigrateStateResponse"]["properties"]["output_preexisting"]
+            ["type"],
         "boolean"
     );
     assert_eq!(
@@ -12513,7 +16873,56 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["components"]["schemas"]["MigrationReport"]["required"],
-        serde_json::json!(["from_version", "to_version", "changed", "steps"])
+        serde_json::json!([
+            "from_version",
+            "to_version",
+            "changed",
+            "steps",
+            "downgrade_notes"
+        ])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MigrationReport"]["properties"]["downgrade_notes"]["type"],
+        "array"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteRequest"]["properties"]["output"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteRequest"]["properties"]["init_only"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteRequest"]["properties"]["restore"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteResponse"]["required"],
+        serde_json::json!([
+            "path",
+            "state_path",
+            "initialized",
+            "imported",
+            "dry_run",
+            "force",
+            "import",
+            "restore"
+        ])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteResponse"]["properties"]["import"]["anyOf"][0]
+            ["$ref"],
+        "#/components/schemas/SqliteImportReport"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["StateSqliteResponse"]["properties"]["restore"]["anyOf"][0]
+            ["$ref"],
+        "#/components/schemas/SqliteRestoreReport"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SqliteRestoreReport"]["properties"]["validation"]["$ref"],
+        "#/components/schemas/ValidationReport"
     );
     assert_eq!(
         schema["components"]["schemas"]["OperatingSystem"]["properties"]["daemon"]["anyOf"][0]["$ref"],
@@ -12540,10 +16949,50 @@ fn api_schema_command_prints_contract() {
         0
     );
     assert!(schema["paths"]["/runs/{id}/replay"]["get"].is_object());
+    assert!(schema["paths"]["/runs/{id}/debug"]["get"].is_object());
     assert!(schema["paths"]["/agents/{id}"]["get"].is_object());
     assert!(schema["paths"]["/tasks/{id}"]["get"].is_object());
     assert!(schema["paths"]["/workflows/{id}"]["get"].is_object());
     assert!(schema["paths"]["/workflows/{id}/status"]["get"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/dag"]["get"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/tasks"]["post"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/link"]["post"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/unlink"]["post"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/pause"]["post"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/resume"]["post"].is_object());
+    assert!(schema["paths"]["/workflows/{id}/retry"]["post"].is_object());
+    assert!(schema["paths"]["/approvals"]["get"].is_object());
+    assert!(schema["paths"]["/approvals/{id}/approve"]["post"].is_object());
+    assert!(schema["paths"]["/approvals/{id}/deny"]["post"].is_object());
+    assert!(schema["paths"]["/workers"]["get"].is_object());
+    assert!(schema["paths"]["/workers"]["post"].is_object());
+    assert!(schema["paths"]["/workers/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/workers/{id}"]["delete"].is_object());
+    assert!(schema["paths"]["/workers/{id}/heartbeat"]["post"].is_object());
+    assert!(schema["paths"]["/workers/{id}/claim"]["post"].is_object());
+    assert!(schema["paths"]["/evals"]["get"].is_object());
+    assert!(schema["paths"]["/evals"]["post"].is_object());
+    assert!(schema["paths"]["/evals/run"]["post"].is_object());
+    assert!(schema["paths"]["/evals/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/git/status"]["get"].is_object());
+    assert!(schema["paths"]["/git/review-task"]["post"].is_object());
+    assert!(schema["paths"]["/registry"]["get"].is_object());
+    assert!(schema["paths"]["/registry/profiles"]["get"].is_object());
+    assert!(schema["paths"]["/registry/profiles/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/registry/templates"]["get"].is_object());
+    assert!(schema["paths"]["/registry/templates/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/registry/templates/{id}/workflows"]["post"].is_object());
+    assert!(schema["paths"]["/registry/marketplace-import"]["post"].is_object());
+    assert!(schema["paths"]["/registry/mcp-servers"]["get"].is_object());
+    assert!(schema["paths"]["/registry/mcp-servers"]["post"].is_object());
+    assert!(schema["paths"]["/registry/mcp-servers/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/registry/mcp-servers/{id}"]["post"].is_object());
+    assert!(schema["paths"]["/registry/mcp-servers/{id}"]["delete"].is_object());
+    assert!(schema["paths"]["/secrets"]["get"].is_object());
+    assert!(schema["paths"]["/secrets"]["post"].is_object());
+    assert!(schema["paths"]["/secrets/check"]["get"].is_object());
+    assert!(schema["paths"]["/secrets/{id}"]["get"].is_object());
+    assert!(schema["paths"]["/secrets/{id}"]["delete"].is_object());
     assert!(schema["paths"]["/tools/{id}"]["get"].is_object());
     assert_eq!(
         schema["paths"]["/agents/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
@@ -12618,6 +17067,402 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/workflows/{id}/status"]["get"]["responses"]["200"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/WorkflowProgress"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/dag"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowDag"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowDag"]["required"],
+        serde_json::json!([
+            "id",
+            "objective",
+            "priority",
+            "nodes",
+            "edges",
+            "external_dependencies",
+            "progress"
+        ])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowDagEdge"]["required"],
+        serde_json::json!(["from", "to", "from_task_id", "to_task_id"])
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/tasks"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowAddTaskRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/tasks"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowAddTaskResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/link"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowEdgeRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/unlink"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowEdgeResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/pause"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowTransitionResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/resume"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkflowNoteRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workflows/{id}/retry"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowAddTaskRequest"]["required"],
+        serde_json::json!(["stage", "title"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowAddTaskRequest"]["properties"]["stage"]["pattern"],
+        r"^[^\u0000-\u001F/\\]*\S[^\u0000-\u001F/\\]*$"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowTransitionResponse"]["properties"]["action"]["enum"],
+        serde_json::json!(["paused", "resumed", "retried"])
+    );
+    assert_eq!(
+        schema["paths"]["/approvals"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["items"]["$ref"],
+        "#/components/schemas/ApprovalRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/approvals/{id}/approve"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ApprovalResolveRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/approvals/{id}/approve"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/approvals/{id}/deny"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ApprovalResolveResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ApprovalResolveRequest"]["properties"]["by"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["ApprovalResolveResponse"]["properties"]["approval"]["$ref"],
+        "#/components/schemas/ApprovalRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workers"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/WorkerRegisterRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workers"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/WorkerMutationResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}/heartbeat"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkerHeartbeatRequest"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkerHeartbeatRequest"]["properties"]["lease_seconds"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}/claim"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ClaimTaskRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}/claim"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkerClaimResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}/report"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkerReportRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}/report"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkerReportResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/workers/{id}"]["delete"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/WorkerDeleteResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/evals"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EvalRecordRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/evals"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/EvalMutationResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/evals/run"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/EvalRunRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/evals/run"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/EvalRunResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunResponse"]["properties"]["timed_out"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunResponse"]["properties"]["output_schema_valid"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunResponse"]["properties"]["output_schema_error"]["anyOf"]
+            [1]["type"],
+        "null"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRecord"]["properties"]["run"]["anyOf"][0]["$ref"],
+        "#/components/schemas/EvalRunDetails"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRecord"]["properties"]["run"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunDetails"]["required"],
+        serde_json::json!([
+            "command",
+            "cwd",
+            "status",
+            "stdout",
+            "stderr",
+            "success_pattern",
+            "success_pattern_matched",
+            "output_schema",
+            "output_schema_valid",
+            "output_schema_error",
+            "timed_out"
+        ])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunDetails"]["properties"]["success_pattern"]["anyOf"]
+            [1]["type"],
+        "null"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunDetails"]["properties"]["output_schema"]["anyOf"]
+            [0]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunDetails"]["properties"]["output_schema"]["anyOf"]
+            [1]["type"],
+        "null"
+    );
+    assert_eq!(
+        schema["paths"]["/evals/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/EvalRecord"
+    );
+    assert_eq!(
+        schema["paths"]["/git/status"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/GitCommandResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["GitCommandResponse"]["required"],
+        serde_json::json!(["command", "cwd", "status", "stdout", "stderr", "dry_run"])
+    );
+    assert_eq!(
+        schema["paths"]["/git/status"]["get"]["parameters"][0]["name"],
+        "cwd"
+    );
+    assert_eq!(
+        schema["paths"]["/git/review-task"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/GitReviewTaskRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/git/review-task"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/TaskMutationResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["GitReviewTaskRequest"]["properties"]["base"]["default"],
+        "main"
+    );
+    assert_eq!(
+        schema["paths"]["/registry"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/RegistryResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/templates/{id}/workflows"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/TemplateWorkflowRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/templates/{id}/workflows"]["post"]["responses"]["201"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TemplateWorkflowResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/marketplace-import"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/MarketplaceImportRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/marketplace-import"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/MarketplaceImportResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/mcp-servers"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/RegisterMcpServerRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/mcp-servers"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/McpServerMutationResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/mcp-servers/{id}"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/UpdateMcpServerRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/mcp-servers/{id}"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/McpServerMutationResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/registry/mcp-servers/{id}"]["delete"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/McpServerDeleteResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RegisterMcpServerRequest"]["required"],
+        serde_json::json!(["id", "command"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RegisterMcpServerRequest"]["properties"]["enabled"]["default"],
+        true
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UpdateMcpServerRequest"]["properties"]["env"]["propertyNames"]
+            ["pattern"],
+        r"^[A-Za-z_][A-Za-z0-9_]*$"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowTemplate"]["required"],
+        serde_json::json!(["id", "name", "description", "stages", "tasks", "edges"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowTemplate"]["properties"]["tasks"]["items"]["$ref"],
+        "#/components/schemas/WorkflowTemplateTask"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkflowTemplate"]["properties"]["edges"]["items"]["$ref"],
+        "#/components/schemas/WorkflowTemplateEdge"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["TemplateWorkflowResponse"]["properties"]["dag"]["$ref"],
+        "#/components/schemas/WorkflowDag"
+    );
+    assert_eq!(
+        schema["paths"]["/secrets"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/SecretsRegisterRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/secrets"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/SecretsMutationResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/secrets/check"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SecretCheckReport"
+    );
+    assert_eq!(
+        schema["paths"]["/secrets/{id}"]["delete"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/SecretsDeleteResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["WorkerRegisterRequest"]["required"],
+        serde_json::json!(["id", "endpoint"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRecordRequest"]["required"],
+        serde_json::json!(["target", "success"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunRequest"]["required"],
+        serde_json::json!(["target", "command"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["EvalRunRequest"]["properties"]["output_schema"]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SecretsRegisterRequest"]["required"],
+        serde_json::json!(["id", "kind"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SecretsRegisterRequest"]["properties"]["kind"]["enum"],
+        serde_json::json!([
+            "environment",
+            "env",
+            "one-password",
+            "1password",
+            "1-password",
+            "op",
+            "os-keychain",
+            "keychain",
+            "macos-keychain",
+            "env-vault",
+            "envvault"
+        ])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SecretsBackend"]["properties"]["kind"]["enum"],
+        serde_json::json!(["environment", "one-password", "os-keychain", "env-vault"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SecretCheckReport"]["required"],
+        serde_json::json!(["total", "present", "missing", "invalid", "references"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["SecretCheckReference"]["required"],
+        serde_json::json!([
+            "task_id",
+            "task_title",
+            "tool_id",
+            "arg",
+            "env",
+            "valid_env",
+            "present"
+        ])
     );
     assert_eq!(
         schema["paths"]["/workflows/{id}/run"]["post"]["responses"]["200"]["content"]["application/json"]
@@ -12781,7 +17626,7 @@ fn api_schema_command_prints_contract() {
         serde_json::json!(["title"])
     );
     assert_eq!(
-        schema["components"]["schemas"]["UpdateTaskRequest"]["anyOf"][9]["properties"]["clear_tool"]
+        schema["components"]["schemas"]["UpdateTaskRequest"]["anyOf"][10]["properties"]["clear_tool"]
             ["const"],
         true
     );
@@ -12988,6 +17833,56 @@ fn api_schema_command_prints_contract() {
         schema["paths"]["/runs/{id}/replay"]["get"]["responses"]["404"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/ErrorResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/debug"]["get"]["parameters"][1]["name"],
+        "tail_bytes"
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/debug"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/RunDebugResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RunDebugResponse"]["properties"]["agent"]["anyOf"][0]["$ref"],
+        "#/components/schemas/Agent"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RunDebugResponse"]["properties"]["artifact_status"]["items"]
+            ["properties"]["exists"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RunDebugResponse"]["properties"]["diagnostics"]["properties"]
+            ["related_events"]["minimum"],
+        0
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/artifacts"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/RunArtifactsResponse"
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/artifacts/{artifact_id}"]["get"]["parameters"][1]["name"],
+        "artifact_id"
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/artifacts/{artifact_id}"]["get"]["parameters"][2]["name"],
+        "tail_bytes"
+    );
+    assert_eq!(
+        schema["paths"]["/runs/{id}/artifacts/{artifact_id}"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        "#/components/schemas/RunArtifactReadResponse"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RunArtifactsResponse"]["properties"]["artifacts"]["items"]
+            ["properties"]["checksum"]["anyOf"][0]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RunArtifactReadResponse"]["properties"]["body"]["type"],
+        serde_json::json!(["string", "null"])
     );
     assert_eq!(
         schema["paths"]["/runs/{id}/cancel"]["post"]["responses"]["200"]["content"]["application/json"]
@@ -13217,6 +18112,14 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["Task"]["properties"]["created_at"]["format"],
         "date-time"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["Task"]["properties"]["attempts"]["minimum"],
+        0
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["Task"]["properties"]["max_attempts"]["minimum"],
+        1
     );
     assert_eq!(
         schema["paths"]["/tasks"]["get"]["parameters"][0]["name"],
@@ -13523,6 +18426,10 @@ fn api_schema_command_prints_contract() {
         slug_pattern
     );
     assert_eq!(
+        schema["components"]["schemas"]["RunRecord"]["properties"]["trace_id"]["pattern"],
+        slug_pattern
+    );
+    assert_eq!(
         schema["components"]["schemas"]["RunRecord"]["properties"]["command"]["pattern"],
         non_empty_pattern
     );
@@ -13559,7 +18466,7 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["ToolInvocation"]["properties"]["secret_env_args"]["additionalProperties"]
             ["pattern"],
-        r"^[A-Za-z_][A-Za-z0-9_]*$"
+        r"^(?:[A-Za-z_][A-Za-z0-9_]*|[A-Za-z0-9][A-Za-z0-9_-]*:[^\s\u0000][^\u0000]*)$"
     );
     assert_eq!(
         schema["paths"]["/tools"]["get"]["parameters"][0]["name"],
@@ -13701,6 +18608,14 @@ fn api_schema_command_prints_contract() {
         ".*[A-Za-z0-9-].*"
     );
     assert_eq!(
+        schema["components"]["schemas"]["CreateTaskRequest"]["properties"]["max_attempts"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UpdateTaskRequest"]["properties"]["max_attempts"]["minimum"],
+        1
+    );
+    assert_eq!(
         schema["components"]["schemas"]["CreateToolRequest"]["properties"]["name"]["pattern"],
         ".*[A-Za-z0-9-].*"
     );
@@ -13722,8 +18637,24 @@ fn api_schema_command_prints_contract() {
         "string"
     );
     assert_eq!(
+        schema["components"]["schemas"]["MemoryRecord"]["properties"]["visibility"]["enum"],
+        serde_json::json!(["shared", "private"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryRecord"]["properties"]["scope"]["anyOf"][0]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryRecord"]["properties"]["scope"]["anyOf"][1]["type"],
+        "null"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["CreateMemoryRequest"]["properties"]["tags"]["items"]["pattern"],
         r"^\s*[^,\s][^,]*(?:,\s*[^,\s][^,]*)*\s*$"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["CreateMemoryRequest"]["properties"]["visibility"]["default"],
+        "shared"
     );
     assert_eq!(
         schema["components"]["schemas"]["MemoryRecord"]["properties"]["updated_at"]["format"],
@@ -13839,6 +18770,7 @@ fn api_schema_command_prints_contract() {
             "dry_run",
             "removed_runs",
             "removed_log_paths",
+            "removed_artifact_paths",
             "removed_events"
         ])
     );
@@ -13894,6 +18826,32 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["RuntimeReport"]["properties"]["expired_agents"]["items"]["type"],
         "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RuntimeReport"]["properties"]["deadlocked_tasks"]["items"]
+            ["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RuntimeReport"]["properties"]["unscheduled_tasks"]["items"]
+            ["$ref"],
+        "#/components/schemas/UnscheduledTask"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UnscheduledTask"]["required"],
+        serde_json::json!(["task_id", "reason"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UnscheduledTask"]["properties"]["reason"]["pattern"],
+        r".*\S.*"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RuntimeReport"]["properties"]["recovered_runs"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RuntimeReport"]["properties"]["recovered_daemon"]["type"],
+        "boolean"
     );
     assert_eq!(
         schema["components"]["schemas"]["RunRecord"]["properties"]["status"]["enum"],
@@ -14042,6 +19000,27 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/MemoryRecord"
     );
     assert_eq!(
+        schema["paths"]["/memory/recall"]["get"]["parameters"][0]["name"],
+        "query"
+    );
+    assert_eq!(
+        schema["paths"]["/memory/recall"]["get"]["parameters"][0]["required"],
+        true
+    );
+    assert_eq!(
+        schema["paths"]["/memory/recall"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["items"]["$ref"],
+        "#/components/schemas/MemoryRecallHit"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryRecallHit"]["properties"]["record"]["$ref"],
+        "#/components/schemas/MemoryRecord"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["MemoryRecallHit"]["properties"]["score"]["minimum"],
+        0
+    );
+    assert_eq!(
         schema["paths"]["/memory/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
             ["$ref"],
         "#/components/schemas/MemoryRecord"
@@ -14062,8 +19041,38 @@ fn api_schema_command_prints_contract() {
         "#/components/schemas/UpdateMemoryRequest"
     );
     assert_eq!(
+        schema["paths"]["/memory/prune"]["post"]["requestBody"]["required"],
+        false
+    );
+    assert_eq!(
+        schema["paths"]["/memory/prune"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/PruneMemoryRequest"
+    );
+    assert_eq!(
+        schema["paths"]["/memory/prune"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/PruneMemoryResponse"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["MemoryDeleteResponse"]["required"],
         serde_json::json!(["id", "removed", "memory"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["PruneMemoryRequest"]["properties"]["max_age_days"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["PruneMemoryRequest"]["properties"]["dry_run"]["default"],
+        false
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["PruneMemoryResponse"]["required"],
+        serde_json::json!(["dry_run", "max_age_days", "removed", "expired"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["PruneMemoryResponse"]["properties"]["removed"]["items"]["$ref"],
+        "#/components/schemas/MemoryRecord"
     );
     assert_eq!(
         schema["components"]["schemas"]["UpdateMemoryRequest"]["properties"]["tags"]["type"],
@@ -14074,6 +19083,14 @@ fn api_schema_command_prints_contract() {
         r"^\s*[^,\s][^,]*(?:,\s*[^,\s][^,]*)*\s*$"
     );
     assert_eq!(
+        schema["components"]["schemas"]["UpdateMemoryRequest"]["properties"]["visibility"]["enum"],
+        serde_json::json!(["shared", "private"])
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UpdateMemoryRequest"]["properties"]["clear_scope"]["type"],
+        "boolean"
+    );
+    assert_eq!(
         schema["components"]["schemas"]["UpdateMemoryRequest"]["properties"]["clear_tags"]["type"],
         "boolean"
     );
@@ -14082,7 +19099,12 @@ fn api_schema_command_prints_contract() {
         serde_json::json!(["topic"])
     );
     assert_eq!(
-        schema["components"]["schemas"]["UpdateMemoryRequest"]["anyOf"][3]["properties"]["clear_tags"]
+        schema["components"]["schemas"]["UpdateMemoryRequest"]["anyOf"][5]["properties"]["clear_tags"]
+            ["const"],
+        true
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["UpdateMemoryRequest"]["anyOf"][6]["properties"]["clear_scope"]
             ["const"],
         true
     );
@@ -14108,26 +19130,42 @@ fn api_schema_command_prints_contract() {
     );
     assert_eq!(
         schema["paths"]["/memory"]["get"]["parameters"][2]["name"],
-        "since"
+        "visibility"
     );
     assert_eq!(
-        schema["paths"]["/memory"]["get"]["parameters"][2]["schema"]["format"],
-        "date-time"
+        schema["paths"]["/memory"]["get"]["parameters"][2]["schema"]["enum"],
+        serde_json::json!(["shared", "private"])
     );
     assert_eq!(
         schema["paths"]["/memory"]["get"]["parameters"][3]["name"],
-        "until"
+        "scope"
     );
     assert_eq!(
-        schema["paths"]["/memory"]["get"]["parameters"][3]["schema"]["format"],
-        "date-time"
+        schema["paths"]["/memory"]["get"]["parameters"][3]["schema"]["pattern"],
+        r".*\S.*"
     );
     assert_eq!(
         schema["paths"]["/memory"]["get"]["parameters"][4]["name"],
+        "since"
+    );
+    assert_eq!(
+        schema["paths"]["/memory"]["get"]["parameters"][4]["schema"]["format"],
+        "date-time"
+    );
+    assert_eq!(
+        schema["paths"]["/memory"]["get"]["parameters"][5]["name"],
+        "until"
+    );
+    assert_eq!(
+        schema["paths"]["/memory"]["get"]["parameters"][5]["schema"]["format"],
+        "date-time"
+    );
+    assert_eq!(
+        schema["paths"]["/memory"]["get"]["parameters"][6]["name"],
         "limit"
     );
     assert_eq!(
-        schema["paths"]["/memory"]["get"]["parameters"][4]["schema"]["minimum"],
+        schema["paths"]["/memory"]["get"]["parameters"][6]["schema"]["minimum"],
         1
     );
     assert_eq!(
@@ -14148,7 +19186,7 @@ fn api_schema_command_prints_contract() {
     assert_eq!(
         schema["components"]["schemas"]["CreateTaskRequest"]["properties"]["secret_args"]["additionalProperties"]
             ["pattern"],
-        r"^[A-Za-z_][A-Za-z0-9_]*$"
+        r"^(?:[A-Za-z_][A-Za-z0-9_]*|[A-Za-z0-9][A-Za-z0-9_-]*:[^\s\u0000][^\u0000]*)$"
     );
     assert_eq!(
         schema["components"]["schemas"]["HeartbeatRequest"]["properties"]["lease_seconds"]["minimum"],
@@ -14177,6 +19215,15 @@ fn api_schema_command_prints_contract() {
             ["default"],
         1800
     );
+    assert_eq!(
+        schema["components"]["schemas"]["RecoverTasksResponse"]["properties"]["recovered_runs"]["items"]
+            ["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["RecoverTasksResponse"]["properties"]["recovered_daemon"]["type"],
+        "boolean"
+    );
 }
 
 #[test]
@@ -14187,7 +19234,7 @@ fn api_serve_can_require_bearer_token() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14252,6 +19299,119 @@ fn api_serve_can_require_bearer_token() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
+        .env("AGENT_OS_SHORT_TOKEN", "short")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-env",
+            "AGENT_OS_SHORT_TOKEN",
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "API token from token_env must be at least 8 bytes",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-file",
+            " ",
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("token_file must not be empty"));
+
+    let empty_token_file = dir.path().join("empty-token.txt");
+    std::fs::write(&empty_token_file, "  \n").expect("empty token file");
+    make_private_file(&empty_token_file);
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-file",
+            empty_token_file.to_str().expect("empty token path"),
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "API token from token_file must not be empty",
+        ));
+
+    let whitespace_token_file = dir.path().join("whitespace-token.txt");
+    std::fs::write(&whitespace_token_file, "file token\n").expect("whitespace token file");
+    make_private_file(&whitespace_token_file);
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-file",
+            whitespace_token_file
+                .to_str()
+                .expect("whitespace token path"),
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "API token from token_file must not contain whitespace or control characters",
+        ));
+
+    let token_file = dir.path().join("api-token.txt");
+    std::fs::write(&token_file, "file-token\n").expect("token file");
+    make_private_file(&token_file);
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_API_TOKEN", "test-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-env",
+            "AGENT_OS_API_TOKEN",
+            "--token-file",
+            token_file.to_str().expect("token path"),
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "use either --token-env or --token-file, not both",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
         .args([
             "--state",
             state_arg,
@@ -14265,8 +19425,105 @@ fn api_serve_can_require_bearer_token() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "non-loopback addresses requires --token-env or --unsafe-no-token",
+            "non-loopback addresses requires --token-env, --token-file, --read-token-env, --read-token-file, --write-token-env, --write-token-file, or --unsafe-no-token",
         ));
+
+    #[cfg(unix)]
+    {
+        let group_readable_token_file = dir.path().join("group-readable-token.txt");
+        std::fs::write(&group_readable_token_file, "group-token\n")
+            .expect("group readable token file");
+        make_group_readable_file(&group_readable_token_file);
+
+        Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args([
+                "--state",
+                state_arg,
+                "api",
+                "serve",
+                "--addr",
+                "127.0.0.1:0",
+                "--token-file",
+                group_readable_token_file
+                    .to_str()
+                    .expect("group readable token path"),
+                "--max-requests",
+                "1",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "API token file token_file must not be accessible by group or others",
+            ));
+
+        let symlink_target_token_file = dir.path().join("symlink-target-token.txt");
+        std::fs::write(&symlink_target_token_file, "symlink-token\n")
+            .expect("symlink target token file");
+        make_private_file(&symlink_target_token_file);
+        let symlink_token_file = dir.path().join("symlink-token.txt");
+        std::os::unix::fs::symlink(&symlink_target_token_file, &symlink_token_file)
+            .expect("token file symlink");
+
+        Command::cargo_bin("agent-os")
+            .expect("binary")
+            .args([
+                "--state",
+                state_arg,
+                "api",
+                "serve",
+                "--addr",
+                "127.0.0.1:0",
+                "--token-file",
+                symlink_token_file.to_str().expect("symlink token path"),
+                "--max-requests",
+                "1",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "API token file token_file must be a regular file, not a symlink",
+            ));
+    }
+
+    let mut file_child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-file",
+            token_file.to_str().expect("token path"),
+            "--max-requests",
+            "2",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn token file api");
+
+    let stdout = file_child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let unauthorized = http_get(addr, "/status", &[]);
+    assert!(
+        unauthorized.contains("HTTP/1.1 401 Unauthorized"),
+        "{unauthorized}"
+    );
+    let authorized = http_get(addr, "/status", &[("authorization", "Bearer file-token")]);
+    assert!(authorized.contains("HTTP/1.1 200 OK"), "{authorized}");
+    wait_for_api_success(&mut file_child);
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
         .env("AGENT_OS_API_TOKEN", "test-token")
@@ -14280,7 +19537,7 @@ fn api_serve_can_require_bearer_token() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "4",
+            "5",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -14323,6 +19580,23 @@ fn api_serve_can_require_bearer_token() {
         "unauthorized"
     );
 
+    let duplicate_auth = http_get(
+        addr,
+        "/status",
+        &[
+            ("authorization", "Bearer test-token"),
+            ("authorization", "Bearer test-token"),
+        ],
+    );
+    assert!(
+        duplicate_auth.contains("HTTP/1.1 401 Unauthorized"),
+        "{duplicate_auth}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(http_body(&duplicate_auth)).expect("duplicate auth json")["error"],
+        "unauthorized"
+    );
+
     let authorized = http_get(addr, "/status", &[("Authorization", "Bearer test-token")]);
     assert!(authorized.contains("HTTP/1.1 200 OK"), "{authorized}");
     assert!(authorized.contains("\"tasks_pending\""), "{authorized}");
@@ -14340,6 +19614,238 @@ fn api_serve_can_require_bearer_token() {
 }
 
 #[test]
+fn api_serve_supports_scoped_read_and_write_tokens() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    let read_token_file = dir.path().join("read-token.txt");
+    let write_token_file = dir.path().join("write-token.txt");
+    let empty_scoped_token_file = dir.path().join("empty-scoped-token.txt");
+    std::fs::write(&read_token_file, "file-read-token\n").expect("read token file");
+    std::fs::write(&write_token_file, "file-write-token\n").expect("write token file");
+    std::fs::write(&empty_scoped_token_file, " \n").expect("empty scoped token file");
+    make_private_file(&read_token_file);
+    make_private_file(&write_token_file);
+    make_private_file(&empty_scoped_token_file);
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_READ_TOKEN", "read-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--read-token-env",
+            "AGENT_OS_READ_TOKEN",
+            "--read-token-file",
+            read_token_file.to_str().expect("read token path"),
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "use either --read-token-env or --read-token-file, not both",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--write-token-file",
+            empty_scoped_token_file
+                .to_str()
+                .expect("empty scoped token path"),
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "API token from write_token_file must not be empty",
+        ));
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_READ_TOKEN", "same-token")
+        .env("AGENT_OS_WRITE_TOKEN", "same-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--read-token-env",
+            "AGENT_OS_READ_TOKEN",
+            "--write-token-env",
+            "AGENT_OS_WRITE_TOKEN",
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "read and write API tokens must be distinct",
+        ));
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("AGENT_OS_READ_TOKEN", "read-token")
+        .env("AGENT_OS_WRITE_TOKEN", "write-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--read-token-env",
+            "AGENT_OS_READ_TOKEN",
+            "--write-token-env",
+            "AGENT_OS_WRITE_TOKEN",
+            "--max-requests",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn scoped api");
+
+    let stdout = child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let missing = http_get(addr, "/status", &[]);
+    assert!(missing.contains("HTTP/1.1 401 Unauthorized"), "{missing}");
+
+    let read = [("authorization", "Bearer read-token")];
+    let write = [("authorization", "Bearer write-token")];
+
+    let status = http_get(addr, "/status", &read);
+    assert!(status.contains("HTTP/1.1 200 OK"), "{status}");
+    assert!(status.contains("\"tasks_pending\""), "{status}");
+
+    let read_mutation = http_request(addr, "POST", "/tasks", r#"{"title":"blocked"}"#, &read);
+    assert!(
+        read_mutation.contains("HTTP/1.1 403 Forbidden"),
+        "{read_mutation}"
+    );
+    let read_mutation_body: Value =
+        serde_json::from_str(http_body(&read_mutation)).expect("read mutation json");
+    assert_eq!(read_mutation_body["error"], "forbidden");
+
+    let write_mutation = http_request(
+        addr,
+        "POST",
+        "/tasks",
+        r#"{"title":"scoped token task"}"#,
+        &write,
+    );
+    assert!(
+        write_mutation.contains("HTTP/1.1 201 Created"),
+        "{write_mutation}"
+    );
+
+    let write_read = http_get(addr, "/status", &write);
+    assert!(
+        write_read.contains("HTTP/1.1 403 Forbidden"),
+        "{write_read}"
+    );
+
+    wait_for_api_success(&mut child);
+
+    let mut file_child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--read-token-file",
+            read_token_file.to_str().expect("read token path"),
+            "--write-token-file",
+            write_token_file.to_str().expect("write token path"),
+            "--max-requests",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn scoped file api");
+
+    let stdout = file_child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let missing = http_get(addr, "/status", &[]);
+    assert!(missing.contains("HTTP/1.1 401 Unauthorized"), "{missing}");
+
+    let read = [("authorization", "Bearer file-read-token")];
+    let write = [("authorization", "Bearer file-write-token")];
+
+    let status = http_get(addr, "/status", &read);
+    assert!(status.contains("HTTP/1.1 200 OK"), "{status}");
+
+    let read_mutation = http_request(addr, "POST", "/tasks", r#"{"title":"blocked"}"#, &read);
+    assert!(
+        read_mutation.contains("HTTP/1.1 403 Forbidden"),
+        "{read_mutation}"
+    );
+
+    let write_mutation = http_request(
+        addr,
+        "POST",
+        "/tasks",
+        r#"{"title":"scoped file token task"}"#,
+        &write,
+    );
+    assert!(
+        write_mutation.contains("HTTP/1.1 201 Created"),
+        "{write_mutation}"
+    );
+
+    let write_read = http_get(addr, "/status", &write);
+    assert!(
+        write_read.contains("HTTP/1.1 403 Forbidden"),
+        "{write_read}"
+    );
+
+    wait_for_api_success(&mut file_child);
+}
+
+#[test]
 fn api_serve_allows_browser_preflight() {
     let dir = workspace_tempdir().expect("tempdir");
     let state = dir.path().join("agent-os");
@@ -14347,7 +19853,7 @@ fn api_serve_allows_browser_preflight() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14363,7 +19869,7 @@ fn api_serve_allows_browser_preflight() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "1",
+            "3",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -14402,9 +19908,146 @@ fn api_serve_allows_browser_preflight() {
         "{response}"
     );
     assert!(
+        response.contains("access-control-allow-origin: http://localhost:3000"),
+        "{response}"
+    );
+    assert!(
         response.contains("access-control-allow-headers: authorization, content-type"),
         "{response}"
     );
+
+    let rejected = http_request(
+        addr,
+        "OPTIONS",
+        "/tasks",
+        "",
+        &[
+            ("origin", "https://evil.example"),
+            ("access-control-request-method", "POST"),
+        ],
+    );
+    assert!(rejected.contains("HTTP/1.1 403 Forbidden"), "{rejected}");
+    assert!(
+        !rejected.contains("access-control-allow-origin: https://evil.example"),
+        "{rejected}"
+    );
+
+    let repeated_origin = http_request(
+        addr,
+        "OPTIONS",
+        "/tasks",
+        "",
+        &[
+            ("origin", "http://localhost:3000"),
+            ("origin", "https://evil.example"),
+            ("access-control-request-method", "POST"),
+        ],
+    );
+    assert!(
+        repeated_origin.contains("HTTP/1.1 400 Bad Request"),
+        "{repeated_origin}"
+    );
+    assert!(
+        repeated_origin.contains("origin must not be repeated"),
+        "{repeated_origin}"
+    );
+
+    wait_for_api_success(&mut child);
+}
+
+#[test]
+fn api_serve_supports_explicit_cors_origin_allowlist() {
+    let dir = workspace_tempdir().expect("tempdir");
+    let state = dir.path().join("agent-os");
+    let state_arg = state.to_str().expect("state");
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("agent-os")
+        .expect("binary")
+        .env("AGENT_OS_API_TOKEN", "browser-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--allow-origin",
+            "https://dashboard.example/path",
+            "--token-env",
+            "AGENT_OS_API_TOKEN",
+            "--max-requests",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "allow_origin must be an http(s) origin",
+        ));
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("agent-os"))
+        .env("AGENT_OS_API_TOKEN", "browser-token")
+        .args([
+            "--state",
+            state_arg,
+            "api",
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--token-env",
+            "AGENT_OS_API_TOKEN",
+            "--allow-origin",
+            "https://dashboard.example",
+            "--max-requests",
+            "2",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn api");
+
+    let stdout = child.stdout.take().expect("api stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut listening = String::new();
+    stdout
+        .read_line(&mut listening)
+        .expect("read api listening line");
+    let addr = listening
+        .trim()
+        .strip_prefix("API listening on http://")
+        .expect("listening prefix")
+        .parse::<SocketAddr>()
+        .expect("listening addr");
+
+    let allowed = http_request(
+        addr,
+        "OPTIONS",
+        "/tasks",
+        "",
+        &[
+            ("origin", "https://dashboard.example"),
+            ("access-control-request-method", "POST"),
+        ],
+    );
+    assert!(allowed.contains("HTTP/1.1 204 No Content"), "{allowed}");
+    assert!(
+        allowed.contains("access-control-allow-origin: https://dashboard.example"),
+        "{allowed}"
+    );
+
+    let rejected = http_request(
+        addr,
+        "OPTIONS",
+        "/tasks",
+        "",
+        &[
+            ("origin", "https://other.example"),
+            ("access-control-request-method", "POST"),
+        ],
+    );
+    assert!(rejected.contains("HTTP/1.1 403 Forbidden"), "{rejected}");
 
     wait_for_api_success(&mut child);
 }
@@ -14417,7 +20060,7 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14430,7 +20073,7 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "9",
+            "12",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -14499,6 +20142,42 @@ fn api_serve_rejects_malformed_request_framing_without_exiting() {
     assert!(
         malformed_line.contains("malformed http request line"),
         "{malformed_line}"
+    );
+
+    let malformed_header = http_raw_request(addr, "GET /status HTTP/1.1\r\nhost localhost\r\n\r\n");
+    assert!(
+        malformed_header.contains("HTTP/1.1 400 Bad Request"),
+        "{malformed_header}"
+    );
+    assert!(
+        malformed_header.contains("malformed http header line"),
+        "{malformed_header}"
+    );
+
+    let duplicate_host = http_raw_request(
+        addr,
+        "GET /status HTTP/1.1\r\nhost: localhost\r\nhost: 127.0.0.1\r\n\r\n",
+    );
+    assert!(
+        duplicate_host.contains("HTTP/1.1 400 Bad Request"),
+        "{duplicate_host}"
+    );
+    assert!(
+        duplicate_host.contains("duplicate host header"),
+        "{duplicate_host}"
+    );
+
+    let transfer_encoding = http_raw_request(
+        addr,
+        "POST /tasks HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\n\r\n0\r\n\r\n",
+    );
+    assert!(
+        transfer_encoding.contains("HTTP/1.1 400 Bad Request"),
+        "{transfer_encoding}"
+    );
+    assert!(
+        transfer_encoding.contains("unsupported transfer-encoding header"),
+        "{transfer_encoding}"
     );
 
     let unsupported_method = http_raw_request(
@@ -14586,7 +20265,7 @@ fn api_path_ids_must_be_valid() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14691,7 +20370,7 @@ fn api_can_validate_and_repair_state() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14803,7 +20482,7 @@ fn api_state_repair_reports_conflict_for_unrepairable_state() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14899,7 +20578,7 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -14915,7 +20594,7 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
             "--token-env",
             "AGENT_OS_API_TOKEN",
             "--max-requests",
-            "99",
+            "104",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -16118,6 +21797,14 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
         "{memory_search}"
     );
 
+    let memory_recall = http_get(addr, "/memory/recall?query=mutating&tag=ops", &auth);
+    assert!(memory_recall.contains("HTTP/1.1 200 OK"), "{memory_recall}");
+    assert!(memory_recall.contains("\"score\":"), "{memory_recall}");
+    assert!(
+        memory_recall.contains("\"snippet\":\"mutating routes work\""),
+        "{memory_recall}"
+    );
+
     let memory_detail = http_get(addr, &format!("/memory/{memory_id}"), &auth);
     assert!(memory_detail.contains("HTTP/1.1 200 OK"), "{memory_detail}");
     assert!(
@@ -16153,6 +21840,61 @@ fn api_mutating_routes_create_and_update_state_with_auth() {
     assert!(
         conflicting_memory_update.contains("use either tags or clear_tags, not both"),
         "{conflicting_memory_update}"
+    );
+
+    let prune_memory = http_request(
+        addr,
+        "POST",
+        "/memory",
+        r#"{"topic":"old-api-prune","body":"api prune target"}"#,
+        &auth,
+    );
+    assert!(
+        prune_memory.contains("HTTP/1.1 201 Created"),
+        "{prune_memory}"
+    );
+    let prune_memory_body: Value =
+        serde_json::from_str(http_body(&prune_memory)).expect("prune memory body");
+    let prune_memory_id = prune_memory_body["id"].as_str().expect("prune memory id");
+    rewrite_memory_timestamp(&state, "old-api-prune", "2020-01-01T00:00:00Z");
+
+    let prune_dry_run = http_request(
+        addr,
+        "POST",
+        "/memory/prune",
+        r#"{"max_age_days":1,"dry_run":true}"#,
+        &auth,
+    );
+    assert!(prune_dry_run.contains("HTTP/1.1 200 OK"), "{prune_dry_run}");
+    let prune_dry_run_body: Value =
+        serde_json::from_str(http_body(&prune_dry_run)).expect("prune dry run body");
+    assert_eq!(prune_dry_run_body["dry_run"], true);
+    assert_eq!(prune_dry_run_body["expired"][0]["id"], prune_memory_id);
+    assert_eq!(
+        prune_dry_run_body["removed"]
+            .as_array()
+            .expect("dry run removed")
+            .len(),
+        0
+    );
+
+    let prune_memory = http_request(
+        addr,
+        "POST",
+        "/memory/prune",
+        r#"{"max_age_days":1}"#,
+        &auth,
+    );
+    assert!(prune_memory.contains("HTTP/1.1 200 OK"), "{prune_memory}");
+    let prune_memory_body: Value =
+        serde_json::from_str(http_body(&prune_memory)).expect("prune response body");
+    assert_eq!(prune_memory_body["dry_run"], false);
+    assert_eq!(prune_memory_body["removed"][0]["id"], prune_memory_id);
+
+    let pruned_memory_detail = http_get(addr, &format!("/memory/{prune_memory_id}"), &auth);
+    assert!(
+        pruned_memory_detail.contains("HTTP/1.1 404 Not Found"),
+        "{pruned_memory_detail}"
     );
 
     let delete_memory = http_request(addr, "DELETE", &format!("/memory/{memory_id}"), "", &auth);
@@ -16244,7 +21986,7 @@ fn api_run_endpoint_schedules_and_executes_work() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -16459,7 +22201,7 @@ fn api_run_endpoint_respects_expired_agent_lease() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -16574,7 +22316,7 @@ fn api_exposes_run_logs_and_replay_with_explicit_missing_log_errors() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -16622,7 +22364,7 @@ fn api_exposes_run_logs_and_replay_with_explicit_missing_log_errors() {
             "--addr",
             "127.0.0.1:0",
             "--max-requests",
-            "8",
+            "15",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -16696,6 +22438,79 @@ fn api_exposes_run_logs_and_replay_with_explicit_missing_log_errors() {
         "{tailed_replay}"
     );
 
+    let debug = http_get(addr, &format!("/runs/{run_id}/debug?tail_bytes=3"), &[]);
+    assert!(debug.contains("HTTP/1.1 200 OK"), "{debug}");
+    assert!(debug.contains("\"artifact_status\""), "{debug}");
+    assert!(debug.contains("\"diagnostics\""), "{debug}");
+    assert!(debug.contains("\"log_tail_bytes\":3"), "{debug}");
+    assert!(debug.contains("\"log\":\"log\""), "{debug}");
+    assert!(debug.contains("\"agent\""), "{debug}");
+
+    let artifacts = http_get(addr, &format!("/runs/{run_id}/artifacts"), &[]);
+    assert!(artifacts.contains("HTTP/1.1 200 OK"), "{artifacts}");
+    assert!(artifacts.contains("\"id\":\"stdout\""), "{artifacts}");
+    assert!(artifacts.contains("\"checksum\":\"fnv1a64:"), "{artifacts}");
+
+    let stdout_artifact = http_get(
+        addr,
+        &format!("/runs/{run_id}/artifacts/stdout?tail_bytes=3"),
+        &[],
+    );
+    assert!(
+        stdout_artifact.contains("HTTP/1.1 200 OK"),
+        "{stdout_artifact}"
+    );
+    assert!(
+        stdout_artifact.contains("\"artifact_id\":\"stdout\""),
+        "{stdout_artifact}"
+    );
+    assert!(
+        stdout_artifact.contains("\"tail_bytes\":3"),
+        "{stdout_artifact}"
+    );
+    assert!(
+        stdout_artifact.contains("\"body\":\"log\""),
+        "{stdout_artifact}"
+    );
+    assert!(
+        stdout_artifact.contains("\"checksum\":\"fnv1a64:"),
+        "{stdout_artifact}"
+    );
+
+    let invalid_artifact_tail = http_get(
+        addr,
+        &format!("/runs/{run_id}/artifacts/stdout?tail_bytes=0"),
+        &[],
+    );
+    assert!(
+        invalid_artifact_tail.contains("HTTP/1.1 400 Bad Request"),
+        "{invalid_artifact_tail}"
+    );
+    assert!(
+        invalid_artifact_tail.contains("tail_bytes must be greater than 0"),
+        "{invalid_artifact_tail}"
+    );
+
+    let missing_artifact = http_get(addr, &format!("/runs/{run_id}/artifacts/missing"), &[]);
+    assert!(
+        missing_artifact.contains("HTTP/1.1 404 Not Found"),
+        "{missing_artifact}"
+    );
+    assert!(
+        missing_artifact.contains("run artifact not found"),
+        "{missing_artifact}"
+    );
+
+    let invalid_debug_tail = http_get(addr, &format!("/runs/{run_id}/debug?tail_bytes=0"), &[]);
+    assert!(
+        invalid_debug_tail.contains("HTTP/1.1 400 Bad Request"),
+        "{invalid_debug_tail}"
+    );
+    assert!(
+        invalid_debug_tail.contains("tail_bytes must be greater than 0"),
+        "{invalid_debug_tail}"
+    );
+
     let invalid_replay_tail = http_get(addr, &format!("/runs/{run_id}/replay?tail_bytes=0"), &[]);
     assert!(
         invalid_replay_tail.contains("HTTP/1.1 400 Bad Request"),
@@ -16717,6 +22532,13 @@ fn api_exposes_run_logs_and_replay_with_explicit_missing_log_errors() {
         missing_replay.contains("\"log_error\":\"could not read run log:"),
         "{missing_replay}"
     );
+    let missing_debug = http_get(addr, &format!("/runs/{run_id}/debug"), &[]);
+    assert!(missing_debug.contains("HTTP/1.1 200 OK"), "{missing_debug}");
+    assert!(missing_debug.contains("\"log\":null"), "{missing_debug}");
+    assert!(
+        missing_debug.contains("\"log_error\":\"could not read run log:"),
+        "{missing_debug}"
+    );
 
     wait_for_api_success(&mut child);
 }
@@ -16729,7 +22551,7 @@ fn runs_log_commands_fall_back_to_canonical_log_path() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -16872,7 +22694,7 @@ fn runs_cancel_stops_running_shell_command() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -16934,7 +22756,7 @@ fn concurrent_cli_and_api_mutations_survive_running_execution() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -17042,7 +22864,7 @@ fn runs_tail_reads_shell_log_before_completion() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -17104,7 +22926,7 @@ fn api_can_cancel_running_shell_command() {
 
     Command::cargo_bin("agent-os")
         .expect("binary")
-        .args(["--state", state_arg, "init", "--force"])
+        .args(["--state", state_arg, "init", "--force", "--profile", "dev"])
         .assert()
         .success();
 
@@ -17907,11 +23729,15 @@ fn assert_parameters_are_documented(schema: &Value) {
                     parameter["schema"].is_object(),
                     "{method} {path} parameter {name} missing schema"
                 );
-                assert_eq!(
-                    parameter["required"].as_bool(),
-                    Some(location == "path"),
-                    "{method} {path} parameter {name} has incorrect required flag"
-                );
+                let required = parameter["required"].as_bool().unwrap_or_else(|| {
+                    panic!("{method} {path} parameter {name} missing required flag")
+                });
+                if location == "path" {
+                    assert!(
+                        required,
+                        "{method} {path} parameter {name} path parameter must be required"
+                    );
+                }
             }
         }
     }
@@ -17980,10 +23806,43 @@ fn assert_query_parameters_match_runtime_filters(schema: &Value) {
             &["priority", "task", "since", "until", "query", "limit"][..],
         ),
         (
+            "/workers",
+            &["status", "since", "until", "query", "limit"][..],
+        ),
+        (
+            "/evals",
+            &["target", "success", "since", "until", "query", "limit"][..],
+        ),
+        ("/git/status", &["cwd"][..]),
+        ("/secrets", &["kind", "query", "limit"][..]),
+        (
             "/tools",
             &["kind", "capability", "since", "until", "query", "limit"][..],
         ),
-        ("/memory", &["query", "tag", "since", "until", "limit"][..]),
+        (
+            "/memory",
+            &[
+                "query",
+                "tag",
+                "visibility",
+                "scope",
+                "since",
+                "until",
+                "limit",
+            ][..],
+        ),
+        (
+            "/memory/recall",
+            &[
+                "query",
+                "tag",
+                "visibility",
+                "scope",
+                "since",
+                "until",
+                "limit",
+            ][..],
+        ),
         (
             "/runs",
             &[
@@ -17992,6 +23851,9 @@ fn assert_query_parameters_match_runtime_filters(schema: &Value) {
         ),
         ("/runs/{id}/logs", &["tail_bytes"][..]),
         ("/runs/{id}/replay", &["tail_bytes"][..]),
+        ("/runs/{id}/debug", &["tail_bytes"][..]),
+        ("/runs/{id}/artifacts", &[][..]),
+        ("/runs/{id}/artifacts/{artifact_id}", &["tail_bytes"][..]),
     ];
     let paths = schema["paths"].as_object().expect("OpenAPI paths");
     for (path, endpoint) in paths {
@@ -18067,6 +23929,9 @@ fn assert_success_responses_have_json_schemas(schema: &Value) {
     for (path, endpoint) in paths {
         let operations = endpoint.as_object().expect("OpenAPI path item");
         for (method, operation) in operations {
+            if matches!(path.as_str(), "/metrics/prometheus" | "/dashboard.html") {
+                continue;
+            }
             if !matches!(method.as_str(), "get" | "post" | "delete") {
                 continue;
             }
@@ -18091,6 +23956,9 @@ fn assert_error_responses_have_json_schemas(schema: &Value) {
     for (path, endpoint) in paths {
         let operations = endpoint.as_object().expect("OpenAPI path item");
         for (method, operation) in operations {
+            if matches!(path.as_str(), "/metrics/prometheus" | "/dashboard.html") {
+                continue;
+            }
             if !matches!(method.as_str(), "get" | "post" | "delete") {
                 continue;
             }
@@ -18187,6 +24055,16 @@ fn assert_content_media_types(content: &Value, context: &str) {
         return;
     };
     let media_types = content.keys().cloned().collect::<BTreeSet<_>>();
+    if context.starts_with("get /metrics/prometheus response ")
+        && media_types == BTreeSet::from(["text/plain; version=0.0.4".to_owned()])
+    {
+        return;
+    }
+    if context.starts_with("get /dashboard.html response ")
+        && media_types == BTreeSet::from(["text/html".to_owned()])
+    {
+        return;
+    }
     assert!(
         media_types.is_empty() || media_types == BTreeSet::from(["application/json".to_owned()]),
         "{context} advertises unsupported media types: {media_types:?}"
@@ -18247,23 +24125,42 @@ fn assert_request_body_requirements(schema: &Value) {
         ("/agents/{id}", "post", true),
         ("/agents/{id}/claim", "post", false),
         ("/agents/{id}/heartbeat", "post", false),
+        ("/approvals/{id}/approve", "post", false),
+        ("/approvals/{id}/deny", "post", false),
         ("/config", "post", false),
+        ("/evals", "post", true),
+        ("/evals/run", "post", true),
+        ("/git/review-task", "post", false),
         ("/init", "post", false),
         ("/memory", "post", true),
+        ("/memory/prune", "post", false),
         ("/memory/{id}", "post", true),
+        ("/registry/mcp-servers", "post", true),
+        ("/registry/mcp-servers/{id}", "post", true),
+        ("/registry/marketplace-import", "post", true),
+        ("/registry/profiles/{id}/agents", "post", false),
+        ("/registry/templates/{id}/workflows", "post", true),
         ("/run", "post", false),
+        ("/secrets", "post", true),
         ("/service/launchd", "post", false),
         ("/service/launchd/install", "post", false),
         ("/service/launchd/start", "post", false),
         ("/service/launchd/status", "post", false),
         ("/service/launchd/stop", "post", false),
         ("/service/launchd/uninstall", "post", false),
+        ("/service/systemd", "post", false),
+        ("/service/systemd/install", "post", false),
+        ("/service/systemd/start", "post", false),
+        ("/service/systemd/status", "post", false),
+        ("/service/systemd/stop", "post", false),
+        ("/service/systemd/uninstall", "post", false),
         ("/state/backup", "post", false),
         ("/state/export", "post", true),
         ("/state/import", "post", true),
         ("/state/migrate", "post", false),
         ("/state/prune", "post", false),
         ("/state/repair", "post", false),
+        ("/state/sqlite", "post", false),
         ("/tasks", "post", true),
         ("/tasks/recover", "post", false),
         ("/tasks/{id}", "post", true),
@@ -18279,9 +24176,19 @@ fn assert_request_body_requirements(schema: &Value) {
         ("/tasks/{id}/unblock", "post", false),
         ("/tools", "post", true),
         ("/tools/{id}", "post", true),
+        ("/workers", "post", true),
+        ("/workers/{id}/claim", "post", false),
+        ("/workers/{id}/heartbeat", "post", false),
+        ("/workers/{id}/report", "post", true),
         ("/workflows", "post", true),
         ("/workflows/{id}/cancel", "post", false),
+        ("/workflows/{id}/link", "post", true),
+        ("/workflows/{id}/pause", "post", false),
+        ("/workflows/{id}/resume", "post", false),
+        ("/workflows/{id}/retry", "post", false),
         ("/workflows/{id}/run", "post", false),
+        ("/workflows/{id}/tasks", "post", true),
+        ("/workflows/{id}/unlink", "post", true),
     ]
     .into_iter()
     .map(|(path, method, required)| (path.to_owned(), method.to_owned(), required))
@@ -18518,6 +24425,7 @@ fn assert_standard_response_headers_declared(schema: &Value) {
                     "Allow",
                     "Cache-Control",
                     "X-Content-Type-Options",
+                    "X-Trace-Id",
                     "Access-Control-Allow-Origin",
                     "Access-Control-Allow-Methods",
                     "Access-Control-Allow-Headers",

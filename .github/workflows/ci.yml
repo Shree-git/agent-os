@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust
+    name: Rust Linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,3 +39,57 @@ jobs:
 
       - name: Run CI
         run: ./scripts/ci.sh
+
+  windows:
+    name: Rust Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Check Windows build
+        run: cargo check --locked --all-targets
+
+      - name: Test Windows library
+        run: cargo test --locked --lib
+
+  macos:
+    name: Rust macOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Check macOS build
+        run: cargo check --locked --all-targets
+
+      - name: Test macOS library
+        run: cargo test --locked --lib

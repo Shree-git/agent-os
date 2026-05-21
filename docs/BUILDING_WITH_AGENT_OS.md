@@ -48,6 +48,8 @@ Then call the API with bearer auth:
 curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7373/status
 ```
 
+For supervised local services, `--token-file ./api.token` can be used instead of `--token-env`; scoped clients can use `--read-token-file` and `--write-token-file` instead of scoped env vars. Token files are read once at startup, trimmed, and rejected if empty.
+
 Use `agent-os api schema` or `GET /openapi.json` to generate clients or validate your integration.
 
 ### Daemon Backend
@@ -58,14 +60,14 @@ Use daemon mode when Agent OS should keep processing work without a human runnin
 agent-os --state ./.agent-os daemon run --execute --limit 2 --interval-ms 1000
 ```
 
-On macOS, use the `service launchd`, `service install`, `service start`, and `service status` commands to run the daemon as a LaunchAgent.
+On macOS, use the `service launchd`, `service install`, `service start`, and `service status` commands to run the daemon as a LaunchAgent. On Linux, use `service systemd`, `service install-systemd`, `service start-systemd`, and `service status-systemd` to run the daemon as a systemd user service. On Windows, use `service windows-task` to render a PowerShell `Register-ScheduledTask` script, inspect it, then run it from an elevated PowerShell session or your preferred endpoint-management tool.
 
 ## Product Ideas
 
 - Coding agent CLI: queue tasks, let an LLM provider plan work, and execute safe tools through Agent OS.
-- Local dashboard: show agents, tasks, workflows, runs, logs, events, health, and metrics.
+- Local dashboard: show agents, tasks, workflows, DAG editing forms, runs, logs, events, health, and metrics.
 - Automation daemon: keep project maintenance tasks moving with recovery and replay.
-- Worker fleet on one machine: have separate processes heartbeat, claim tasks, and execute work based on capabilities.
+- Worker fleet on one machine: have separate processes heartbeat, claim tasks, execute work based on capabilities, and report task results with run/artifact metadata.
 - Agent framework adapter: use another framework for reasoning and Agent OS for persistence, scheduling, policy, and logs.
 
 ## State And Safety
@@ -74,5 +76,4 @@ State is intentionally local and portable. A state directory contains the JSON s
 
 Execution is policy-aware. Shell commands, file reads, and file writes are checked before running. Configure allowed workspaces, denied command patterns, environment inheritance, and redaction in `agent-os.toml`.
 
-Use `agent-os doctor` and `agent-os state validate` before running critical automation. Use `agent-os state backup` before migrations, pruning, or public demos.
-
+Use `agent-os doctor` and `agent-os state validate` before running critical automation. Doctor output includes platform-specific service guidance and shell-execution support, which is useful when deciding between launchd, systemd, or a manual supervisor. Use `agent-os state backup` before migrations, pruning, or public demos.

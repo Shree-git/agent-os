@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const DEFAULT_LAUNCHD_LABEL: &str = "com.infinite-apps.agent-os";
+pub const DEFAULT_SYSTEMD_UNIT: &str = "agent-os.service";
+pub const DEFAULT_WINDOWS_TASK_NAME: &str = "Agent OS Daemon";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchdServiceOptions {
@@ -15,6 +17,54 @@ pub struct LaunchdServiceOptions {
     pub recover_stale_seconds: Option<i64>,
     pub no_logs: bool,
     pub plist_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemdServiceOptions {
+    pub unit_name: String,
+    pub program: Option<PathBuf>,
+    pub interval_ms: u64,
+    pub limit: usize,
+    pub execute: bool,
+    pub recover_stale_seconds: Option<i64>,
+    pub unit_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsScheduledTaskOptions {
+    pub task_name: String,
+    pub program: Option<PathBuf>,
+    pub interval_ms: u64,
+    pub limit: usize,
+    pub execute: bool,
+    pub recover_stale_seconds: Option<i64>,
+}
+
+impl Default for SystemdServiceOptions {
+    fn default() -> Self {
+        Self {
+            unit_name: DEFAULT_SYSTEMD_UNIT.into(),
+            program: None,
+            interval_ms: 1000,
+            limit: 1,
+            execute: false,
+            recover_stale_seconds: None,
+            unit_path: None,
+        }
+    }
+}
+
+impl Default for WindowsScheduledTaskOptions {
+    fn default() -> Self {
+        Self {
+            task_name: DEFAULT_WINDOWS_TASK_NAME.into(),
+            program: None,
+            interval_ms: 1000,
+            limit: 1,
+            execute: false,
+            recover_stale_seconds: None,
+        }
+    }
 }
 
 impl Default for LaunchdServiceOptions {
@@ -80,7 +130,50 @@ pub struct LaunchdService {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemdService {
+    pub unit_name: String,
+    pub program: String,
+    pub state_path: String,
+    pub interval_ms: u64,
+    pub limit: usize,
+    pub execute: bool,
+    pub recover_stale_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WindowsScheduledTask {
+    pub task_name: String,
+    pub program: String,
+    pub state_path: String,
+    pub interval_ms: u64,
+    pub limit: usize,
+    pub execute: bool,
+    pub recover_stale_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemdServiceInstall {
+    pub service: SystemdService,
+    pub unit_path: PathBuf,
+    pub installed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemdServiceUninstall {
+    pub unit_path: PathBuf,
+    pub removed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchctlCommandOutput {
+    pub success: bool,
+    pub status: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemctlCommandOutput {
     pub success: bool,
     pub status: Option<i32>,
     pub stdout: String,
@@ -154,6 +247,180 @@ impl LaunchdService {
         body.push_str("</dict>\n</plist>\n");
         body
     }
+}
+
+impl SystemdService {
+    pub fn exec_start(&self) -> String {
+        let mut args = vec![
+            escape_systemd_arg(&self.program),
+            "--state".into(),
+            escape_systemd_arg(&self.state_path),
+            "daemon".into(),
+            "run".into(),
+            "--interval-ms".into(),
+            self.interval_ms.to_string(),
+            "--limit".into(),
+            self.limit.to_string(),
+        ];
+        if self.execute {
+            args.push("--execute".into());
+        }
+        if let Some(seconds) = self.recover_stale_seconds {
+            args.push("--recover-stale-seconds".into());
+            args.push(seconds.to_string());
+        }
+        args.join(" ")
+    }
+
+    pub fn render_unit(&self) -> String {
+        format!(
+            "[Unit]\nDescription=Agent OS daemon ({})\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            self.unit_name,
+            self.exec_start()
+        )
+    }
+}
+
+impl WindowsScheduledTask {
+    pub fn arguments(&self) -> Vec<String> {
+        let mut args = vec![
+            "--state".into(),
+            self.state_path.clone(),
+            "daemon".into(),
+            "run".into(),
+            "--interval-ms".into(),
+            self.interval_ms.to_string(),
+            "--limit".into(),
+            self.limit.to_string(),
+        ];
+        if self.execute {
+            args.push("--execute".into());
+        }
+        if let Some(seconds) = self.recover_stale_seconds {
+            args.push("--recover-stale-seconds".into());
+            args.push(seconds.to_string());
+        }
+        args
+    }
+
+    pub fn render_powershell(&self) -> String {
+        let arguments = self
+            .arguments()
+            .iter()
+            .map(|arg| quote_windows_command_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "$Action = New-ScheduledTaskAction -Execute '{}' -Argument '{}'\n$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Milliseconds {})\n$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries\nRegister-ScheduledTask -TaskName '{}' -Action $Action -Trigger $Trigger -Settings $Settings -Description 'Agent OS daemon scheduler loop' -Force\n",
+            escape_powershell_single_quoted(&self.program),
+            escape_powershell_single_quoted(&arguments),
+            self.interval_ms,
+            escape_powershell_single_quoted(&self.task_name),
+        )
+    }
+}
+
+pub fn build_systemd_service(
+    state_path: &Path,
+    options: SystemdServiceOptions,
+) -> Result<(SystemdService, PathBuf), ServiceError> {
+    validate_service_label(&options.unit_name)?;
+    validate_optional_path("bin_path", options.program.as_deref())?;
+    validate_optional_path("unit_path", options.unit_path.as_deref())?;
+    if options.interval_ms == 0 {
+        return Err(ServiceError::InvalidInterval);
+    }
+    if options.limit == 0 {
+        return Err(ServiceError::InvalidLimit);
+    }
+    if matches!(options.recover_stale_seconds, Some(seconds) if seconds < 0) {
+        return Err(ServiceError::InvalidRecoverStaleSeconds);
+    }
+    let program = match options.program {
+        Some(program) => program,
+        None => std::env::current_exe().map_err(|source| ServiceError::CurrentExe { source })?,
+    };
+    let unit_path = options
+        .unit_path
+        .unwrap_or_else(|| default_systemd_unit_path(&options.unit_name));
+    Ok((
+        SystemdService {
+            unit_name: options.unit_name,
+            program: program.display().to_string(),
+            state_path: state_path.display().to_string(),
+            interval_ms: options.interval_ms,
+            limit: options.limit,
+            execute: options.execute,
+            recover_stale_seconds: options.recover_stale_seconds,
+        },
+        unit_path,
+    ))
+}
+
+pub fn build_windows_scheduled_task(
+    state_path: &Path,
+    options: WindowsScheduledTaskOptions,
+) -> Result<WindowsScheduledTask, ServiceError> {
+    validate_optional_text("windows task name", Some(&options.task_name))?;
+    validate_optional_path("bin_path", options.program.as_deref())?;
+    if options.interval_ms == 0 {
+        return Err(ServiceError::InvalidInterval);
+    }
+    if options.limit == 0 {
+        return Err(ServiceError::InvalidLimit);
+    }
+    if matches!(options.recover_stale_seconds, Some(seconds) if seconds < 0) {
+        return Err(ServiceError::InvalidRecoverStaleSeconds);
+    }
+    let program = match options.program {
+        Some(program) => program,
+        None => std::env::current_exe().map_err(|source| ServiceError::CurrentExe { source })?,
+    };
+    Ok(WindowsScheduledTask {
+        task_name: options.task_name,
+        program: program.display().to_string(),
+        state_path: state_path.display().to_string(),
+        interval_ms: options.interval_ms,
+        limit: options.limit,
+        execute: options.execute,
+        recover_stale_seconds: options.recover_stale_seconds,
+    })
+}
+
+pub fn install_systemd_service(
+    state_path: &Path,
+    options: SystemdServiceOptions,
+) -> Result<SystemdServiceInstall, ServiceError> {
+    let (service, unit_path) = build_systemd_service(state_path, options)?;
+    durable_io::write_file_atomic_creating_parent(&unit_path, service.render_unit().as_bytes())
+        .map_err(|error| ServiceError::Io {
+            path: error.path,
+            source: error.source,
+        })?;
+    Ok(SystemdServiceInstall {
+        service,
+        unit_path,
+        installed: true,
+    })
+}
+
+pub fn uninstall_systemd_service(
+    unit_name: &str,
+    unit_path: Option<PathBuf>,
+) -> Result<SystemdServiceUninstall, ServiceError> {
+    validate_service_label(unit_name)?;
+    validate_optional_path("unit_path", unit_path.as_deref())?;
+    let unit_path = unit_path.unwrap_or_else(|| default_systemd_unit_path(unit_name));
+    let removed = if unit_path.exists() {
+        std::fs::remove_file(&unit_path).map_err(|source| ServiceError::Io {
+            path: unit_path.clone(),
+            source,
+        })?;
+        true
+    } else {
+        false
+    };
+    Ok(SystemdServiceUninstall { unit_path, removed })
 }
 
 pub fn build_launchd_service(
@@ -252,6 +519,16 @@ pub fn default_launchd_plist_path(label: &str) -> PathBuf {
         .join(format!("{label}.plist"))
 }
 
+pub fn default_systemd_unit_path(unit_name: &str) -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(unit_name)
+}
+
 pub fn default_launchd_log_paths(state_path: &Path) -> (String, String) {
     let directory = if state_path.extension().is_some() {
         state_path.parent().unwrap_or_else(|| Path::new("."))
@@ -307,6 +584,14 @@ pub fn validate_service_control_inputs(
     validate_optional_path("launchctl_path", Some(launchctl_path))
 }
 
+pub fn validate_systemd_control_inputs(
+    unit_name: &str,
+    systemctl_path: &Path,
+) -> Result<(), ServiceError> {
+    validate_service_label(unit_name)?;
+    validate_optional_path("systemctl_path", Some(systemctl_path))
+}
+
 pub fn run_launchctl(
     launchctl_path: &Path,
     args: &[&str],
@@ -319,6 +604,25 @@ pub fn run_launchctl(
             source,
         })?;
     Ok(LaunchctlCommandOutput {
+        success: output.status.success(),
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+pub fn run_systemctl(
+    systemctl_path: &Path,
+    args: &[&str],
+) -> Result<SystemctlCommandOutput, ServiceError> {
+    let output = std::process::Command::new(systemctl_path)
+        .args(args)
+        .output()
+        .map_err(|source| ServiceError::CommandIo {
+            path: systemctl_path.to_path_buf(),
+            source,
+        })?;
+    Ok(SystemctlCommandOutput {
         success: output.status.success(),
         status: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -372,6 +676,32 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn escape_systemd_arg(value: &str) -> String {
+    let value = value.replace('%', "%%");
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | ':'))
+    {
+        return value;
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn escape_powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn quote_windows_command_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            !ch.is_ascii_whitespace() && !matches!(ch, '"' | '\'' | '&' | '|' | '<' | '>' | '^')
+        })
+    {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +726,80 @@ mod tests {
         assert!(plist.contains("/tmp/agent&amp;os/state.json"));
         assert!(plist.contains("--recover-stale-seconds"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn render_systemd_unit_escapes_specifiers_and_quotes_arguments() {
+        let service = SystemdService {
+            unit_name: "agent-os.service".into(),
+            program: "/tmp/agent os/%bin/agent-os".into(),
+            state_path: "/tmp/state 100%/state.json".into(),
+            interval_ms: 1000,
+            limit: 1,
+            execute: true,
+            recover_stale_seconds: Some(30),
+        };
+
+        let unit = service.render_unit();
+
+        assert!(unit.contains("'/tmp/agent os/%%bin/agent-os'"));
+        assert!(unit.contains("'/tmp/state 100%%/state.json'"));
+        assert!(unit.contains("--execute"));
+        assert!(unit.contains("--recover-stale-seconds 30"));
+    }
+
+    #[test]
+    fn render_windows_scheduled_task_quotes_program_and_arguments() {
+        let task = WindowsScheduledTask {
+            task_name: "Agent OS John's Daemon".into(),
+            program: r"C:\Program Files\Agent OS\agent-os.exe".into(),
+            state_path: r"C:\Agent OS\state path\state.json".into(),
+            interval_ms: 2500,
+            limit: 2,
+            execute: true,
+            recover_stale_seconds: Some(60),
+        };
+
+        let script = task.render_powershell();
+
+        assert!(script.contains("New-ScheduledTaskAction"));
+        assert!(script.contains(r"-Execute 'C:\Program Files\Agent OS\agent-os.exe'"));
+        assert!(script.contains("-RepetitionInterval (New-TimeSpan -Milliseconds 2500)"));
+        assert!(script.contains(r#""C:\\Agent OS\\state path\\state.json""#));
+        assert!(script.contains("--execute"));
+        assert!(script.contains("--recover-stale-seconds 60"));
+        assert!(script.contains("Register-ScheduledTask -TaskName 'Agent OS John''s Daemon'"));
+    }
+
+    #[test]
+    fn build_windows_scheduled_task_applies_defaults_and_validates_inputs() {
+        let state_path = Path::new(r"C:\agent-os\state.json");
+        let task = build_windows_scheduled_task(
+            state_path,
+            WindowsScheduledTaskOptions {
+                task_name: "Agent OS Test".into(),
+                program: Some(PathBuf::from(r"C:\agent-os\agent-os.exe")),
+                interval_ms: 1000,
+                limit: 1,
+                execute: true,
+                recover_stale_seconds: Some(30),
+            },
+        )
+        .expect("task");
+
+        assert_eq!(task.task_name, "Agent OS Test");
+        assert_eq!(task.program, r"C:\agent-os\agent-os.exe");
+        assert_eq!(task.state_path, r"C:\agent-os\state.json");
+
+        let error = build_windows_scheduled_task(
+            state_path,
+            WindowsScheduledTaskOptions {
+                task_name: " ".into(),
+                ..WindowsScheduledTaskOptions::default()
+            },
+        )
+        .expect_err("empty task name should fail");
+        assert_eq!(error.to_string(), "windows task name must not be empty");
     }
 
     #[test]

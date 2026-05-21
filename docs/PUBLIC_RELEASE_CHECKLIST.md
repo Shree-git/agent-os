@@ -22,11 +22,14 @@ Use this before making the repository public.
 ```bash
 ./scripts/ci.sh
 AGENT_OS_RELEASE_CHECK=1 ./scripts/ci.sh
+./scripts/package-release.sh
 ```
 
 ## Release
 
-- Tag the first public release after CI passes.
+- Tag the first public release after CI passes. Tags matching `v*` run `.github/workflows/release.yml`.
+- Confirm the GitHub release contains platform archives, `.sha256` checksum files, Sigstore `.sig`/`.pem` signature files, and build provenance attestations.
+- Confirm Windows release archives contain `bin/agent-os.exe`; the packaging script infers the executable suffix from the target triple.
 - Publish the crate only after the repository URL, README, license, and package metadata are final.
+- Update `packaging/homebrew/agent-os.rb` with the released macOS Apple Silicon, macOS Intel, and Linux x86_64 archive URLs and SHA-256 values, then open the tap PR. Keep the bundled elvish and PowerShell completions in `pkgshare` for users whose shells are not installed through Homebrew's native completion directories.
 - Announce Agent OS as a local-first control plane for building durable AI agent systems.
-

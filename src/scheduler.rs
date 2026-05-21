@@ -1,6 +1,10 @@
-use crate::models::{AgentId, EventKind, OperatingSystem, TaskId, TaskStatus};
-use chrono::Utc;
+use crate::models::{
+    Agent, AgentId, EventKind, OperatingSystem, Priority, Task, TaskId, TaskStatus,
+};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+const PRIORITY_AGING_STEP_SECONDS: i64 = 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Assignment {
@@ -13,14 +17,14 @@ pub struct Scheduler;
 
 impl Scheduler {
     pub fn next(os: &OperatingSystem) -> Option<Assignment> {
-        let task = next_ready_task(os)?;
         let now = Utc::now();
+        let task = next_ready_task(os, now)?;
 
         let agent = os
             .agents
             .values()
             .filter(|agent| agent.can_accept_at(&task.required_capabilities, now))
-            .min_by_key(|agent| (agent.current_tasks.len(), agent.created_at))?;
+            .min_by_key(|agent| agent_fairness_key(agent))?;
 
         Some(Assignment {
             task_id: task.id.clone(),
@@ -48,7 +52,7 @@ impl Scheduler {
             .agents
             .values()
             .filter(|agent| agent.can_accept_at(&task.required_capabilities, now))
-            .min_by_key(|agent| (agent.current_tasks.len(), agent.created_at))?;
+            .min_by_key(|agent| agent_fairness_key(agent))?;
         assign(
             os,
             Assignment {
@@ -71,11 +75,7 @@ impl Scheduler {
         let now = Utc::now();
         let task = next_ready_tasks(os)
             .filter(|task| agent.can_accept_at(&task.required_capabilities, now))
-            .max_by(|left, right| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| right.created_at.cmp(&left.created_at))
-            })?;
+            .max_by(|left, right| compare_tasks_for_schedule(left, right, now))?;
         assign(
             os,
             Assignment {
@@ -91,28 +91,59 @@ impl Scheduler {
     }
 }
 
-fn next_ready_task(os: &OperatingSystem) -> Option<&crate::models::Task> {
-    next_ready_tasks(os).max_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then_with(|| right.created_at.cmp(&left.created_at))
-    })
+fn next_ready_task(os: &OperatingSystem, now: DateTime<Utc>) -> Option<&Task> {
+    next_ready_tasks(os).max_by(|left, right| compare_tasks_for_schedule(left, right, now))
 }
 
-fn next_ready_tasks(os: &OperatingSystem) -> impl Iterator<Item = &crate::models::Task> {
+fn next_ready_tasks(os: &OperatingSystem) -> impl Iterator<Item = &Task> {
     os.tasks
         .values()
         .filter(|task| task.status == TaskStatus::Pending)
         .filter(|task| dependencies_complete(os, task))
 }
 
-fn dependencies_complete(os: &OperatingSystem, task: &crate::models::Task) -> bool {
+fn dependencies_complete(os: &OperatingSystem, task: &Task) -> bool {
     task.dependencies.iter().all(|dependency| {
         os.tasks
             .get(dependency)
             .map(|task| task.status == TaskStatus::Complete)
             .unwrap_or(false)
     })
+}
+
+fn compare_tasks_for_schedule(left: &Task, right: &Task, now: DateTime<Utc>) -> std::cmp::Ordering {
+    effective_priority_rank(left, now)
+        .cmp(&effective_priority_rank(right, now))
+        .then_with(|| left.priority.cmp(&right.priority))
+        .then_with(|| right.created_at.cmp(&left.created_at))
+}
+
+fn effective_priority_rank(task: &Task, now: DateTime<Utc>) -> i64 {
+    let base = priority_rank(task.priority);
+    let waited_seconds = now
+        .signed_duration_since(task.created_at)
+        .num_seconds()
+        .max(0);
+    let age_boost = waited_seconds / PRIORITY_AGING_STEP_SECONDS;
+    (base + age_boost).min(priority_rank(Priority::Critical))
+}
+
+fn priority_rank(priority: Priority) -> i64 {
+    match priority {
+        Priority::Low => 0,
+        Priority::Normal => 1,
+        Priority::High => 2,
+        Priority::Critical => 3,
+    }
+}
+
+fn agent_fairness_key(agent: &Agent) -> (usize, DateTime<Utc>, DateTime<Utc>, AgentId) {
+    (
+        agent.current_tasks.len(),
+        agent.updated_at,
+        agent.created_at,
+        agent.id.clone(),
+    )
 }
 
 fn assign(os: &mut OperatingSystem, assignment: Assignment) -> Option<Assignment> {
@@ -138,6 +169,7 @@ fn assign(os: &mut OperatingSystem, assignment: Assignment) -> Option<Assignment
     if let Some(task) = os.tasks.get_mut(&assignment.task_id) {
         task.status = TaskStatus::Running;
         task.assigned_to = Some(assignment.agent_id.clone());
+        task.attempts = task.attempts.saturating_add(1);
         task.updated_at = now;
     }
 
@@ -193,6 +225,7 @@ mod tests {
             os.tasks.get(&expected_id).expect("task").status,
             TaskStatus::Running
         );
+        assert_eq!(os.tasks.get(&expected_id).expect("task").attempts, 1);
     }
 
     #[test]
@@ -221,6 +254,133 @@ mod tests {
             os.tasks.get(&dependent_id).expect("dependent").status,
             TaskStatus::Pending
         );
+    }
+
+    #[test]
+    fn priority_aging_promotes_old_ready_work_without_persisting_priority() {
+        let mut os = OperatingSystem::new("test");
+        os.register_agent(Agent::new(
+            "Builder",
+            AgentKind::Builder,
+            None,
+            vec!["code".into()],
+            1,
+        ));
+        let mut old_normal = Task::new(
+            "Old normal task",
+            "waited long enough",
+            Priority::Normal,
+            vec!["code".into()],
+        );
+        let old_normal_id = old_normal.id.clone();
+        old_normal.created_at = Utc::now() - chrono::Duration::hours(3);
+        old_normal.updated_at = old_normal.created_at;
+        os.create_task(old_normal);
+        os.create_task(Task::new(
+            "New high task",
+            "recent high priority work",
+            Priority::High,
+            vec!["code".into()],
+        ));
+
+        let assignment = Scheduler::assign_next(&mut os).expect("assignment");
+
+        assert_eq!(assignment.task_id, old_normal_id);
+        assert_eq!(
+            os.tasks.get(&old_normal_id).expect("old task").priority,
+            Priority::Normal
+        );
+    }
+
+    #[test]
+    fn priority_aging_keeps_critical_work_ahead_of_aged_lower_priority_work() {
+        let mut os = OperatingSystem::new("test");
+        os.register_agent(Agent::new(
+            "Builder",
+            AgentKind::Builder,
+            None,
+            vec!["code".into()],
+            1,
+        ));
+        let mut old_low = Task::new(
+            "Old low task",
+            "waited for a long time",
+            Priority::Low,
+            vec!["code".into()],
+        );
+        old_low.created_at = Utc::now() - chrono::Duration::hours(12);
+        old_low.updated_at = old_low.created_at;
+        os.create_task(old_low);
+        let critical = Task::new(
+            "Critical task",
+            "must still win",
+            Priority::Critical,
+            vec!["code".into()],
+        );
+        let critical_id = critical.id.clone();
+        os.create_task(critical);
+
+        let assignment = Scheduler::assign_next(&mut os).expect("assignment");
+
+        assert_eq!(assignment.task_id, critical_id);
+    }
+
+    #[test]
+    fn equal_load_agent_selection_rotates_to_least_recently_updated_agent() {
+        let mut os = OperatingSystem::new("test");
+        let base = Utc::now() - chrono::Duration::minutes(10);
+        let mut first = Agent::new(
+            "First Builder",
+            AgentKind::Builder,
+            None,
+            vec!["code".into()],
+            1,
+        );
+        let first_id = first.id.clone();
+        first.created_at = base;
+        first.updated_at = base;
+        os.register_agent(first);
+        let mut second = Agent::new(
+            "Second Builder",
+            AgentKind::Builder,
+            None,
+            vec!["code".into()],
+            1,
+        );
+        let second_id = second.id.clone();
+        second.created_at = base + chrono::Duration::seconds(1);
+        second.updated_at = base;
+        os.register_agent(second);
+
+        let first_task = Task::new(
+            "First task",
+            "run first",
+            Priority::Normal,
+            vec!["code".into()],
+        );
+        let first_task_id = first_task.id.clone();
+        os.create_task(first_task);
+        os.create_task(Task::new(
+            "Second task",
+            "run second",
+            Priority::Normal,
+            vec!["code".into()],
+        ));
+
+        let first_assignment = Scheduler::assign_next(&mut os).expect("first assignment");
+        assert_eq!(first_assignment.agent_id, first_id);
+        if let Some(task) = os.tasks.get_mut(&first_task_id) {
+            task.status = TaskStatus::Complete;
+        }
+        os.agents
+            .get_mut(&first_id)
+            .expect("first agent")
+            .current_tasks
+            .clear();
+
+        let second_assignment = Scheduler::assign_next(&mut os).expect("second assignment");
+
+        assert_eq!(second_assignment.agent_id, second_id);
     }
 
     #[test]
