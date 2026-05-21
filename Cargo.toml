@@ -28,7 +28,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 tabled = "0.16"
 thiserror = "1"
 toml = "0.8"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
