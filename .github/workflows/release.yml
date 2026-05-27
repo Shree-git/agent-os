@@ -49,7 +49,7 @@ jobs:
         run: ./scripts/package-release.sh ${{ matrix.target }}
 
       - name: Attest release archive provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/dist/*.tar.gz
 
